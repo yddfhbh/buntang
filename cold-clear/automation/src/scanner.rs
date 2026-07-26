@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use libtetris::{Piece, RotationState};
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category as JsonErrorCategory;
+use serde_json::Value;
 
 use crate::browser_source::BrowserSnapshotWire;
 
@@ -253,6 +254,7 @@ impl SnapshotScanner for JsonFileScanner {
 #[serde(untagged)]
 enum SnapshotWire {
     Browser(BrowserSnapshotWire),
+    Compatible(CompatibleSnapshotWire),
     Game(GameSnapshot),
 }
 
@@ -261,6 +263,9 @@ fn parse_snapshot_json(raw: &str) -> Result<GameSnapshot> {
         SnapshotWire::Browser(wire) => wire
             .into_game_snapshot()?
             .context("browser snapshot was not ready"),
+        SnapshotWire::Compatible(wire) => wire
+            .into_game_snapshot()?
+            .context("compatible snapshot was not ready"),
         SnapshotWire::Game(snapshot) => Ok(snapshot),
     }
 }
@@ -383,6 +388,185 @@ impl From<PieceToken> for Piece {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CompatibleSnapshotWire {
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(default)]
+    ready: Option<bool>,
+    #[serde(default = "default_snapshot_source")]
+    source: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    round_id: Option<String>,
+    #[serde(default, alias = "roundId")]
+    round_id_alias: Option<String>,
+    #[serde(default)]
+    board: Option<Vec<Vec<Value>>>,
+    #[serde(default)]
+    field: Option<Vec<Vec<Value>>>,
+    #[serde(default)]
+    current: Option<PieceToken>,
+    #[serde(default)]
+    queue: Vec<PieceToken>,
+    #[serde(default)]
+    hold: Option<PieceToken>,
+    #[serde(default)]
+    combo: u32,
+    #[serde(default)]
+    b2b: bool,
+    #[serde(default)]
+    incoming: u32,
+    #[serde(default)]
+    piece_counter: Option<u32>,
+    #[serde(default, alias = "pieceCounter")]
+    piece_counter_alias: Option<u32>,
+    #[serde(default)]
+    lines_cleared: Option<u32>,
+    #[serde(default, alias = "linesCleared", alias = "lines")]
+    lines_cleared_alias: Option<u32>,
+    #[serde(default = "default_true")]
+    playing: bool,
+    #[serde(default)]
+    countdown: bool,
+    #[serde(default)]
+    active: Option<ActivePieceState>,
+}
+
+impl CompatibleSnapshotWire {
+    fn into_game_snapshot(self) -> Result<Option<GameSnapshot>> {
+        if matches!(self.ok, Some(false)) || matches!(self.ready, Some(false)) || !self.playing {
+            return Ok(None);
+        }
+
+        let field = normalize_compatible_field(self.field.as_deref(), self.board.as_deref())?;
+
+        let mut queue = Vec::with_capacity(self.queue.len() + usize::from(self.current.is_some()));
+        if let Some(current) = self.current {
+            queue.push(current);
+        }
+        queue.extend(self.queue);
+        if queue.is_empty() {
+            anyhow::bail!("compatible snapshot queue was empty");
+        }
+
+        Ok(Some(GameSnapshot {
+            source: self.source,
+            token: self.token.unwrap_or_else(|| {
+                default_compatible_token(queue[0], self.piece_counter.or(self.piece_counter_alias))
+            }),
+            round_id: self.round_id.or(self.round_id_alias),
+            field,
+            queue,
+            hold: self.hold,
+            combo: self.combo,
+            b2b: self.b2b,
+            incoming: self.incoming,
+            piece_counter: self.piece_counter.or(self.piece_counter_alias),
+            lines_cleared: self.lines_cleared.or(self.lines_cleared_alias),
+            playing: self.playing,
+            countdown: self.countdown,
+            active: self.active,
+        }))
+    }
+}
+
+fn normalize_compatible_field(
+    raw_field: Option<&[Vec<Value>]>,
+    raw_board: Option<&[Vec<Value>]>,
+) -> Result<Vec<[bool; 10]>> {
+    if let Some(field) = raw_field {
+        return normalize_bottom_up_rows(field);
+    }
+    if let Some(board) = raw_board {
+        return normalize_top_down_board(board);
+    }
+    anyhow::bail!("compatible snapshot did not contain board or field");
+}
+
+fn normalize_bottom_up_rows(rows: &[Vec<Value>]) -> Result<Vec<[bool; 10]>> {
+    match rows.len() {
+        20 | 40 => {}
+        height => anyhow::bail!("unsupported bottom-up field height: {height}"),
+    }
+
+    let mut normalized = Vec::with_capacity(40);
+    for row in rows.iter().take(40) {
+        normalized.push(normalize_row(row)?);
+    }
+    while normalized.len() < 40 {
+        normalized.push([false; 10]);
+    }
+    Ok(normalized)
+}
+
+fn normalize_top_down_board(rows: &[Vec<Value>]) -> Result<Vec<[bool; 10]>> {
+    match rows.len() {
+        20 | 40 => {}
+        height => anyhow::bail!("unsupported top-down board height: {height}"),
+    }
+
+    let visible_rows = if rows.len() == 40 { &rows[20..] } else { rows };
+
+    let mut normalized = Vec::with_capacity(40);
+    for row in visible_rows.iter().rev() {
+        normalized.push(normalize_row(row)?);
+    }
+    while normalized.len() < 40 {
+        normalized.push([false; 10]);
+    }
+    Ok(normalized)
+}
+
+fn normalize_row(row: &[Value]) -> Result<[bool; 10]> {
+    if row.len() != 10 {
+        anyhow::bail!("snapshot row width was {}, expected 10", row.len());
+    }
+    let mut normalized = [false; 10];
+    for (index, cell) in row.iter().enumerate() {
+        normalized[index] = snapshot_cell_filled(cell);
+    }
+    Ok(normalized)
+}
+
+fn snapshot_cell_filled(cell: &Value) -> bool {
+    match cell {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(number) => number.as_i64().map(|value| value != 0).unwrap_or(true),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            !trimmed.is_empty()
+                && trimmed != "."
+                && trimmed != "0"
+                && !trimmed.eq_ignore_ascii_case("empty")
+                && !trimmed.eq_ignore_ascii_case("false")
+                && !trimmed.eq_ignore_ascii_case("null")
+        }
+        Value::Object(map) => {
+            if let Some(empty) = map.get("empty").and_then(Value::as_bool) {
+                return !empty;
+            }
+            if let Some(value) = map.get("type") {
+                return snapshot_cell_filled(value);
+            }
+            if let Some(value) = map.get("mino") {
+                return snapshot_cell_filled(value);
+            }
+            true
+        }
+        Value::Array(values) => values.iter().any(snapshot_cell_filled),
+    }
+}
+
+fn default_compatible_token(current: PieceToken, piece_counter: Option<u32>) -> String {
+    match piece_counter {
+        Some(piece_counter) => format!("compatible-{piece_counter}-{current:?}"),
+        None => format!("compatible-{current:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +670,44 @@ mod tests {
         assert_eq!(snapshot.queue[0], PieceToken::T);
         assert_eq!(snapshot.piece_counter, Some(123));
         assert_eq!(snapshot.lines_cleared, None);
+    }
+
+    #[test]
+    fn parses_compatible_top_down_board_and_prepends_current_to_queue() {
+        let raw = r#"{
+          "source": "browser_cdp",
+          "ready": true,
+          "playing": true,
+          "token": "session-1:8",
+          "board": [[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,true,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,true,false,false]],
+          "current": "L",
+          "hold": "I",
+          "queue": ["T","S","Z","O","J"],
+          "pieceCounter": 8
+        }"#;
+
+        let snapshot = parse_snapshot_json(raw).unwrap();
+        assert_eq!(snapshot.queue[0], PieceToken::L);
+        assert_eq!(snapshot.queue[1], PieceToken::T);
+        assert!(snapshot.field[0][7]);
+        assert!(snapshot.field[1][2]);
+        assert_eq!(snapshot.piece_counter, Some(8));
+    }
+
+    #[test]
+    fn parses_compatible_bottom_up_20_row_field() {
+        let raw = r#"{
+          "ready": true,
+          "playing": true,
+          "field": [[false,false,false,true,false,false,false,false,false,false],[false,false,false,false,true,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false],[false,false,false,false,false,false,false,false,false,false]],
+          "queue": ["T","I","O"]
+        }"#;
+
+        let snapshot = parse_snapshot_json(raw).unwrap();
+        assert_eq!(snapshot.queue, vec![PieceToken::T, PieceToken::I, PieceToken::O]);
+        assert!(snapshot.field[0][3]);
+        assert!(snapshot.field[1][4]);
+        assert_eq!(snapshot.field.len(), 40);
     }
 
     #[test]

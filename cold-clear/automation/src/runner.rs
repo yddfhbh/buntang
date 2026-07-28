@@ -2359,9 +2359,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn plan_move_works_for_a_basic_queue() {
-        let snapshot = GameSnapshot {
+    fn basic_queue_snapshot() -> GameSnapshot {
+        GameSnapshot {
             source: "test".to_owned(),
             token: "t1".to_owned(),
             round_id: None,
@@ -2376,9 +2375,160 @@ mod tests {
             playing: true,
             countdown: false,
             active: None,
+        }
+    }
+
+    fn basic_queue_board_summary(snapshot: &GameSnapshot) -> String {
+        let board = board_from_snapshot(snapshot).expect("basic queue snapshot should build a board");
+        let heights = board.column_heights();
+        if heights.iter().all(|&height| height == 0) {
+            "empty".to_owned()
+        } else {
+            format!("heights={:?}", heights)
+        }
+    }
+
+    fn basic_queue_plan_diagnostic(
+        iteration: usize,
+        config: &AutomationConfig,
+        snapshot: &GameSnapshot,
+        planned_move: Option<&Move>,
+        info: Option<&Info>,
+        execution_result: Option<&std::result::Result<ExecutionPlanBuildResult, BuildExecutionError>>,
+        spawn_equivalent: Option<bool>,
+        note: &str,
+    ) -> String {
+        let current = snapshot
+            .queue
+            .first()
+            .map(|piece| format!("{:?}", piece))
+            .unwrap_or_else(|| "None".to_owned());
+        let queue = snapshot
+            .queue
+            .iter()
+            .map(|piece| format!("{:?}", piece))
+            .collect::<Vec<_>>()
+            .join(",");
+        let hold_piece = snapshot
+            .hold
+            .as_ref()
+            .map(|piece| format!("{:?}", piece))
+            .unwrap_or_else(|| "None".to_owned());
+        let placement = planned_move
+            .map(|mv| format!("{:?}", mv.expected_location))
+            .unwrap_or_else(|| "None".to_owned());
+        let inputs_len = planned_move
+            .map(|mv| mv.inputs.len().to_string())
+            .unwrap_or_else(|| "None".to_owned());
+        let hold = planned_move
+            .map(|mv| mv.hold.to_string())
+            .unwrap_or_else(|| "None".to_owned());
+        let planner = info
+            .map(format_planner_info)
+            .unwrap_or_else(|| "None".to_owned());
+        let execution = execution_result
+            .map(|result| match result {
+                Ok(plan) => format!(
+                    "ok route_kind={} actions={} hard_drop={}",
+                    plan.route_selection.route_kind,
+                    plan.execution_plan.movement_actions.len(),
+                    plan.execution_plan.hard_drop
+                ),
+                Err(error) => format!("err {:?}", error),
+            })
+            .unwrap_or_else(|| "None".to_owned());
+        let spawn_equivalent = spawn_equivalent
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "None".to_owned());
+        format!(
+            "[plan-test] iteration={} note={} board={} current={} queue={} hold_piece={} movement_mode={} spawn_rule={} placement={} inputs_len={} hold={} planner={} execution={} spawn_equivalent={}",
+            iteration,
+            note,
+            basic_queue_board_summary(snapshot),
+            current,
+            queue,
+            hold_piece,
+            movement_mode_label(config.bot.movement_mode),
+            spawn_rule_label(config.bot.spawn_rule),
+            placement,
+            inputs_len,
+            hold,
+            planner,
+            execution,
+            spawn_equivalent
+        )
+    }
+
+    fn assert_basic_queue_plan_valid(iteration: usize) {
+        let snapshot = basic_queue_snapshot();
+        let config = AutomationConfig::default();
+        let sprint_state = SprintState::default();
+        let planned = plan_move_for_mode(&config, &snapshot, config.bot.movement_mode, &sprint_state)
+            .expect("basic queue planning should succeed");
+        let Some((planned_move, info)) = planned else {
+            panic!(
+                "{}",
+                basic_queue_plan_diagnostic(
+                    iteration,
+                    &config,
+                    &snapshot,
+                    None,
+                    None,
+                    None,
+                    None,
+                    "planner_returned_none"
+                )
+            );
         };
-        let (result, _mode) = plan_move(&AutomationConfig::default(), &snapshot).unwrap();
-        assert!(!result.inputs.is_empty() || result.hold);
+
+        let execution_result =
+            build_execution_plan(&config, &snapshot, &planned_move, config.bot.movement_mode);
+        let spawn_equivalent = if planned_move.hold {
+            false
+        } else {
+            let board = board_from_snapshot(&snapshot).expect("basic queue snapshot should build");
+            let active_piece =
+                execution_piece(&snapshot, false).expect("basic queue snapshot should have active");
+            let mut spawned = active_piece_for_execution(&snapshot, false, active_piece)
+                .map(Ok)
+                .unwrap_or_else(|| spawn_for_execution(&board, active_piece, config.bot.spawn_rule))
+                .expect("basic queue snapshot should spawn");
+            spawned.sonic_drop(&board);
+            planned_move.expected_location.same_location(&spawned)
+        };
+        let is_valid = !planned_move.inputs.is_empty()
+            || planned_move.hold
+            || execution_result.as_ref().is_ok_and(|plan| {
+                spawn_equivalent
+                    && plan.execution_plan.hard_drop
+                    && plan.execution_plan.movement_actions.is_empty()
+            });
+        assert!(
+            is_valid,
+            "{}",
+            basic_queue_plan_diagnostic(
+                iteration,
+                &config,
+                &snapshot,
+                Some(&planned_move),
+                Some(&info),
+                Some(&execution_result),
+                Some(spawn_equivalent),
+                "expected movement inputs, hold, or spawn-equivalent hard drop"
+            )
+        );
+    }
+
+    #[test]
+    fn plan_move_works_for_a_basic_queue() {
+        assert_basic_queue_plan_valid(1);
+    }
+
+    #[test]
+    fn plan_move_basic_queue_is_stable_over_100_runs() {
+        for iteration in 1..=100 {
+            assert_basic_queue_plan_valid(iteration);
+        }
     }
 
     #[test]

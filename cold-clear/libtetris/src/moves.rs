@@ -208,7 +208,83 @@ pub fn find_moves(board: &Board, mut spawned: FallingPiece, mode: MovementMode) 
         lock_check(position, &mut locks, moves);
     }
 
-    locks.into_iter().map(|(_, v)| v).collect()
+    let mut placements: Vec<_> = locks.into_iter().map(|(_, v)| v).collect();
+    placements.sort_by(compare_placement_output);
+    placements
+}
+
+fn compare_placement_output(left: &Placement, right: &Placement) -> Ordering {
+    left.inputs
+        .time
+        .cmp(&right.inputs.time)
+        .then(
+            left.inputs
+                .movements
+                .len()
+                .cmp(&right.inputs.movements.len()),
+        )
+        .then(compare_falling_piece(&left.location, &right.location))
+        .then(compare_piece_movements(
+            &left.inputs.movements,
+            &right.inputs.movements,
+        ))
+}
+
+fn compare_falling_piece(left: &FallingPiece, right: &FallingPiece) -> Ordering {
+    piece_rank(left.kind.0)
+        .cmp(&piece_rank(right.kind.0))
+        .then(rotation_rank(left.kind.1).cmp(&rotation_rank(right.kind.1)))
+        .then(left.x.cmp(&right.x))
+        .then(left.y.cmp(&right.y))
+        .then(tspin_rank(left.tspin).cmp(&tspin_rank(right.tspin)))
+}
+
+fn compare_piece_movements(
+    left: &ArrayVec<[PieceMovement; 32]>,
+    right: &ArrayVec<[PieceMovement; 32]>,
+) -> Ordering {
+    left.iter()
+        .map(|movement| movement_rank(*movement))
+        .cmp(right.iter().map(|movement| movement_rank(*movement)))
+}
+
+fn piece_rank(piece: Piece) -> u8 {
+    match piece {
+        Piece::I => 0,
+        Piece::O => 1,
+        Piece::T => 2,
+        Piece::L => 3,
+        Piece::J => 4,
+        Piece::S => 5,
+        Piece::Z => 6,
+    }
+}
+
+fn rotation_rank(rotation: RotationState) -> u8 {
+    match rotation {
+        RotationState::North => 0,
+        RotationState::East => 1,
+        RotationState::South => 2,
+        RotationState::West => 3,
+    }
+}
+
+fn tspin_rank(status: TspinStatus) -> u8 {
+    match status {
+        TspinStatus::None => 0,
+        TspinStatus::Mini => 1,
+        TspinStatus::Full => 2,
+    }
+}
+
+fn movement_rank(movement: PieceMovement) -> u8 {
+    match movement {
+        PieceMovement::Left => 0,
+        PieceMovement::Right => 1,
+        PieceMovement::Cw => 2,
+        PieceMovement::Ccw => 3,
+        PieceMovement::SonicDrop => 4,
+    }
 }
 
 fn lock_check(piece: FallingPiece, locks: &mut HashMap<FallingPiece, Placement>, moves: InputList) {

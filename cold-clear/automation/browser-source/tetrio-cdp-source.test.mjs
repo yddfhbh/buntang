@@ -1312,7 +1312,39 @@ test("locator hint failure falls back to the paused scope scan", async () => {
       "Runtime.callFunctionOn"
     ]
   );
-  assert.ok(logs.includes("[browser] fast closure locator failed; falling back to scan"));
+  assert.ok(
+    logs.includes(
+      "[browser] fast closure locator miss; retaining locator cache and falling back to scan"
+    )
+  );
+});
+
+test("cached locator is invalidated only after an actual property lookup failure", async () => {
+  const closureCaptureState = createClosureCaptureState();
+  closureCaptureState.lastSuccessfulLocator = "Ai";
+  const cdp = {
+    async send(method) {
+      if (method === "Debugger.evaluateOnCallFrame") {
+        return {
+          result: {
+            value: { ok: false, reason: "cached_locator_property_lookup_failed" }
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [{ callFrameId: "frame-1", scopeChain: [] }]
+  }, {
+    closureCaptureState,
+    allowBroadScan: false,
+    log: () => {}
+  });
+
+  assert.equal(result.outcome, "targeted_only_miss");
+  assert.equal(closureCaptureState.lastSuccessfulLocator, "");
 });
 
 test("targeted paused-location hint hits before the broad full scan", async () => {
@@ -1436,6 +1468,219 @@ test("targeted paused-location hint miss falls back to the broad full scan", asy
     logs.includes("[browser] targeted paused locator miss frame=0 scope=0 candidate=0")
   );
   assert.ok(logs.includes("[browser] full closure scan attempt=1/2"));
+});
+
+test("first full scan prioritizes the main/default TETR.IO context", async () => {
+  const visitedScopes = [];
+  const closureCaptureState = createClosureCaptureState();
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        visitedScopes.push(params.objectId);
+        return {
+          result: params.objectId === "scope-main"
+            ? [{ name: "Ai", value: { objectId: "candidate-main" } }]
+            : [{ name: "noise", value: { objectId: "candidate-child" } }]
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        return {
+          result: {
+            value: params.objectId === "candidate-main"
+              ? { ok: true, source: "closure:Ai", locator: "Ai" }
+              : { ok: false }
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [
+      {
+        callFrameId: "child-frame",
+        frameId: "child",
+        url: "https://example.test/child.js",
+        scopeChain: [{ object: { objectId: "scope-child" } }]
+      },
+      {
+        callFrameId: "main-frame",
+        frameId: "main",
+        url: "https://tetr.io/res/game.js",
+        auxData: { isDefault: true },
+        scopeChain: [{ object: { objectId: "scope-main" } }]
+      }
+    ]
+  }, {
+    closureCaptureState,
+    targetUrl: "https://tetr.io/",
+    mainFrameId: "main",
+    log: () => {}
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.progress.frameIndex, 1);
+  assert.deepEqual(visitedScopes, ["scope-main"]);
+});
+
+test("cold start does not postpone a likely gameplay frame until scan attempt two", async () => {
+  const logs = [];
+  const closureCaptureState = createClosureCaptureState();
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        return {
+          result: params.objectId === "scope-gameplay"
+            ? [{ name: "Ai", value: { objectId: "candidate-gameplay" } }]
+            : Array.from({ length: 80 }, (_, index) => ({
+                name: `noise${index}`,
+                value: { objectId: `candidate-noise-${index}` }
+              }))
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        return {
+          result: {
+            value: params.objectId === "candidate-gameplay"
+              ? { ok: true, source: "closure:Ai", locator: "Ai" }
+              : { ok: false }
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  const result = await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [
+      {
+        callFrameId: "timer-frame",
+        functionName: "setTimeout",
+        url: "https://example.test/timer.js",
+        scopeChain: [{ object: { objectId: "scope-timer" } }]
+      },
+      {
+        callFrameId: "game-frame",
+        functionName: "gameLoop",
+        url: "https://tetr.io/res/game.js",
+        scopeChain: Array.from({ length: 5 }, (_, index) => ({
+          type: index === 4 ? "script" : "closure",
+          object: { objectId: index === 4 ? "scope-gameplay" : `scope-${index}` }
+        }))
+      }
+    ]
+  }, {
+    closureCaptureState,
+    targetUrl: "https://tetr.io/",
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.progress.frameIndex, 1);
+  assert.equal(closureCaptureState.fullScanAttemptsInWindow, 1);
+  assert.equal(logs.some((line) => line.includes("attempt=2/2")), false);
+});
+
+test("trace disabled performs no candidate trace serialization", async () => {
+  const logs = [];
+  const cdp = {
+    async send(method) {
+      if (method === "Runtime.getProperties") {
+        return { result: [{ name: "Ai", value: { objectId: "candidate-1" } }] };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        return { result: { value: { ok: false } } };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  await exposeTetrioGameFromPausedCallFrames(cdp, {
+    callFrames: [{
+      callFrameId: "frame-1",
+      scopeChain: [{ object: { objectId: "scope-1" } }]
+    }]
+  }, {
+    closureCaptureState: createClosureCaptureState(),
+    candidateTraceEnabled: false,
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(logs.some((line) => line.includes("closure candidate trace")), false);
+});
+
+test("successful locator survives Bot Off and is reused on the next Bot On", () => {
+  const closureCaptureState = createClosureCaptureState();
+  const controlState = createBrowserControlState();
+  closureCaptureState.lastSuccessfulLocator = "Ai";
+  controlState.botEnabled = true;
+
+  applyBrowserControlMessage({
+    message: { type: "bot_enabled", enabled: false },
+    controlState,
+    closureCaptureState,
+    now: 10_000,
+    log: () => {}
+  });
+  applyBrowserControlMessage({
+    message: { type: "bot_enabled", enabled: true },
+    controlState,
+    closureCaptureState,
+    now: 10_100,
+    log: () => {}
+  });
+
+  assert.equal(closureCaptureState.lastSuccessfulLocator, "Ai");
+});
+
+test("closure exhaustion cannot schedule a third full scan", async () => {
+  let captureCalls = 0;
+  const closureCaptureState = createClosureCaptureState();
+  const controlState = createBrowserControlState();
+  controlState.botEnabled = true;
+  armClosureCaptureWindow(closureCaptureState, {
+    reason: "bot_on",
+    now: 30_000,
+    log: () => {}
+  });
+  const captureGameFn = async (_cdp, { closureCaptureState: state }) => {
+    captureCalls += 1;
+    state.fullScanAttemptsInWindow = captureCalls;
+    return {
+      ok: false,
+      reason: "TETR.IO active game variable was not in paused scopes",
+      outcome: "completed_not_found",
+      windowBudgetExhausted: false
+    };
+  };
+  const options = {
+    probePageState: true,
+    suppressClosureCapture: false,
+    useSeedSimulationFallback: false,
+    network: { lastPageProbeAt: 0, seed: null },
+    probeState: { lastCaptureAt: 0, lastGameplayPhase: "inactive" },
+    bootstrapState: readyBootstrapState(30_000),
+    browserControlState: controlState,
+    closureCaptureState,
+    now: 30_000,
+    log: () => {},
+    captureGameFn
+  };
+
+  await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, playing: true, countdown: false, reason: "not captured" }
+  ]), options);
+  await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, playing: true, countdown: false, reason: "not captured" }
+  ]), { ...options, now: 30_150 });
+  await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, playing: true, countdown: false, reason: "not captured" }
+  ]), { ...options, now: 30_300 });
+
+  assert.equal(captureCalls, 2);
+  assert.equal(closureCaptureState.fullScanAttemptsInWindow, 0);
+  assert.equal(isClosureCaptureArmed(closureCaptureState, 30_301), false);
 });
 
 test("first solo full scan resumes from the saved cursor without rechecking candidates", async () => {
@@ -1689,7 +1934,10 @@ test("preflight retries do not prevent the first full scan attempt", async () =>
   assert.equal(closureCaptureState.captureAttemptsInWindow, 3);
   assert.equal(closureCaptureState.fullScanAttemptsInWindow, 1);
   assert.equal(
-    logs.filter((line) => line === "[browser] fast closure locator failed; falling back to scan").length,
+    logs.filter((line) =>
+      line ===
+        "[browser] fast closure locator miss; retaining locator cache and falling back to scan"
+    ).length,
     1
   );
   assert.equal(
@@ -4156,7 +4404,7 @@ test("same interaction generation does not rearm or reset the interaction window
   );
 });
 
-test("interaction fallback waits 800ms before the second full scan continuation", async () => {
+test("interaction fallback waits 150ms before the second full scan continuation", async () => {
   const closureCaptureState = createClosureCaptureState();
   const nextGameReacquireState = createNextGameReacquireState();
   const browserControlState = createBrowserControlState();
@@ -4209,10 +4457,10 @@ test("interaction fallback waits 800ms before the second full scan continuation"
     }
   });
 
-  assert.equal(closureCaptureState.nextAttemptAt, 96_100);
+  assert.equal(closureCaptureState.nextAttemptAt, 95_450);
 });
 
-test("completed_not_found waits 800ms and follow-up capture uses the short fast timeout", async () => {
+test("completed_not_found uses a bounded continuation before the follow-up full scan", async () => {
   let captureCalls = 0;
   const pauseTimeouts = [];
   const closureCaptureState = createClosureCaptureState();
@@ -4289,7 +4537,7 @@ test("completed_not_found waits 800ms and follow-up capture uses the short fast 
   });
 
   assert.equal(captureCalls, 2);
-  assert.deepEqual(pauseTimeouts, [900, 100]);
+  assert.deepEqual(pauseTimeouts, [900, 900]);
 });
 
 test("reacquire inactive ignores interaction generations and keeps heavy scan at zero", async () => {

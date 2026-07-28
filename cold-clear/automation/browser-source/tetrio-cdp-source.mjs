@@ -21,6 +21,7 @@ const DEFAULT_CAPTURE_RETRY_SCHEDULE_MS = [750, 1000, 1500, 1500];
 const DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS = 350;
 const DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS = 700;
 const DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS = 100;
+const DEFAULT_FIRST_FULL_SCAN_CONTINUATION_BACKOFF_MS = 150;
 const DEFAULT_BOOTSTRAP_BLOCKED_LOG_INTERVAL_MS = 5000;
 const DEFAULT_GAME_START_SIGNAL_OVERLAP_MS = 10000;
 const DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS = 350;
@@ -148,8 +149,113 @@ export function createClosureCaptureState() {
     windowArmedAt: 0,
     windowFirstInteractionAt: 0,
     windowTargetedProbeAt: 0,
-    provisionalNonHeavyAttemptConsumed: false
+    provisionalNonHeavyAttemptConsumed: false,
+    captureTiming: createClosureCaptureTimingState()
   };
+}
+
+function createClosureCaptureTimingState() {
+  return {
+    armedAt: 0,
+    retryWaitActive: false,
+    retryWaitStartAt: 0,
+    firstFastProbeStartAt: 0,
+    firstFastProbeEndAt: 0,
+    firstFullScanStartAt: 0,
+    firstFullScanEndAt: 0,
+    secondFullScanStartAt: 0,
+    secondFullScanEndAt: 0,
+    captureSuccessAt: 0
+  };
+}
+
+function resetClosureCaptureTiming(closureCaptureState, armedAt = 0) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.captureTiming = {
+    ...createClosureCaptureTimingState(),
+    armedAt: Math.max(0, Number(armedAt ?? 0))
+  };
+  return true;
+}
+
+function logClosureTimingStage(
+  closureCaptureState,
+  stage,
+  {
+    phase = "end",
+    startAt = 0,
+    endAt = Date.now(),
+    log = console.log,
+    details = null
+  } = {}
+) {
+  if (typeof log !== "function" || !closureCaptureState) {
+    return;
+  }
+  const timing = closureCaptureState.captureTiming ?? createClosureCaptureTimingState();
+  const armedAt = Math.max(
+    0,
+    Number(timing.armedAt ?? closureCaptureState.windowArmedAt ?? 0)
+  );
+  const normalizedStart = Math.max(0, Number(startAt ?? 0));
+  const normalizedEnd = Math.max(0, Number(endAt ?? Date.now()));
+  const elapsedFromArm = Math.max(0, normalizedEnd - armedAt);
+  const duration = normalizedStart > 0
+    ? Math.max(0, normalizedEnd - normalizedStart)
+    : null;
+  const detailText = details && typeof details === "object"
+    ? Object.entries(details)
+        .filter(([, value]) => value !== undefined && value !== null)
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(" ")
+    : "";
+  log(
+    `[browser] closure timing stage=${stage} phase=${phase} elapsed_from_arm_ms=${elapsedFromArm}` +
+      (duration === null ? "" : ` duration_ms=${duration}`) +
+      (detailText ? ` ${detailText}` : "")
+  );
+}
+
+function markClosureRetryWaitStart(
+  closureCaptureState,
+  now,
+  delayMs,
+  log = console.log
+) {
+  const timing = closureCaptureState?.captureTiming;
+  if (!timing || timing.retryWaitActive) {
+    return false;
+  }
+  const startAt = Math.max(0, Number(now ?? Date.now()));
+  timing.retryWaitActive = true;
+  timing.retryWaitStartAt = startAt;
+  logClosureTimingStage(closureCaptureState, "retry_wait", {
+    phase: "start",
+    startAt,
+    endAt: startAt,
+    log,
+    details: { delay_ms: Math.max(0, Number(delayMs ?? 0)) }
+  });
+  return true;
+}
+
+function markClosureRetryWaitEnd(closureCaptureState, now, log = console.log) {
+  const timing = closureCaptureState?.captureTiming;
+  if (!timing?.retryWaitActive) {
+    return false;
+  }
+  const endAt = Math.max(0, Number(now ?? Date.now()));
+  const startAt = timing.retryWaitStartAt;
+  timing.retryWaitActive = false;
+  logClosureTimingStage(closureCaptureState, "retry_wait", {
+    phase: "end",
+    startAt,
+    endAt,
+    log
+  });
+  return true;
 }
 
 function hasActiveClosureCaptureWindowState(closureCaptureState) {
@@ -223,6 +329,7 @@ export function initializeFreshClosureCaptureWindow(
   closureCaptureState.windowFirstInteractionAt = 0;
   closureCaptureState.windowTargetedProbeAt = 0;
   closureCaptureState.provisionalNonHeavyAttemptConsumed = false;
+  resetClosureCaptureTiming(closureCaptureState);
   resetClosureCaptureScanWindowState(closureCaptureState, {
     nextAttemptAt: 0,
     cursor: createPausedScopeScanCursor()
@@ -892,6 +999,8 @@ export function armClosureCaptureWindow(
   if (!wasArmed || reasonChanged || restartWindow) {
     closureCaptureState.retryCount = 0;
     closureCaptureState.captureAttemptsInWindow = 0;
+    closureCaptureState.windowArmedAt = now;
+    resetClosureCaptureTiming(closureCaptureState, now);
     resetClosureCaptureScanWindowState(closureCaptureState, {
       nextAttemptAt: now,
       cursor: createPausedScopeScanCursor()
@@ -1835,7 +1944,8 @@ function isClosureCaptureWindowExhausted(closureCaptureState) {
 export function scheduleNextClosureCaptureAttempt(
   closureCaptureState,
   now = Date.now(),
-  retryScheduleMs = DEFAULT_CAPTURE_RETRY_SCHEDULE_MS
+  retryScheduleMs = DEFAULT_CAPTURE_RETRY_SCHEDULE_MS,
+  log = null
 ) {
   if (!closureCaptureState) {
     return 0;
@@ -1847,19 +1957,22 @@ export function scheduleNextClosureCaptureAttempt(
   const delayMs = Math.max(0, retryScheduleMs[index] ?? DEFAULT_CAPTURE_COOLDOWN_MS);
   closureCaptureState.retryCount += 1;
   closureCaptureState.nextAttemptAt = now + delayMs;
+  markClosureRetryWaitStart(closureCaptureState, now, delayMs, log ?? (() => {}));
   return delayMs;
 }
 
 export function scheduleClosureCaptureContinuation(
   closureCaptureState,
   now = Date.now(),
-  delayMs = DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS
+  delayMs = DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS,
+  log = null
 ) {
   if (!closureCaptureState) {
     return 0;
   }
   const nextDelayMs = Math.max(0, delayMs);
   closureCaptureState.nextAttemptAt = now + nextDelayMs;
+  markClosureRetryWaitStart(closureCaptureState, now, nextDelayMs, log ?? (() => {}));
   return nextDelayMs;
 }
 
@@ -1910,12 +2023,86 @@ function formatClosureCaptureCursorLabel(cursor = null) {
   return `${formatted.frameIndex}:${formatted.scopeIndex}:${formatted.candidateIndex}`;
 }
 
-function getPausedScopeScanFrameOrder(callFrames = []) {
-  return Array.from({ length: callFrames.length }, (_, index) => callFrames.length - 1 - index);
+function normalizeFrameUrl(value = "") {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  try {
+    return new URL(text).href.toLowerCase();
+  } catch {
+    return text.toLowerCase();
+  }
 }
 
-function nextPausedScopeScanFrameIndex(callFrames = [], frameIndex = 0) {
-  const order = getPausedScopeScanFrameOrder(callFrames);
+function getFramePriority(
+  callFrame,
+  {
+    targetUrl = "",
+    mainFrameId = "",
+    preferredLocators = []
+  } = {}
+) {
+  let score = 0;
+  const auxData = callFrame?.auxData ?? callFrame?.executionContext?.auxData ?? null;
+  const executionContext = callFrame?.executionContext ?? null;
+  const frameId = String(callFrame?.frameId ?? "");
+  const normalizedTargetUrl = normalizeFrameUrl(targetUrl);
+  const targetOrigin = normalizedTargetUrl
+    ? normalizedTargetUrl.match(/^(https?:\/\/[^/]+)/)?.[1] ?? ""
+    : "";
+  const urls = [
+    callFrame?.documentURL,
+    callFrame?.url,
+    callFrame?.executionContext?.origin,
+    executionContext?.origin
+  ].map(normalizeFrameUrl).filter(Boolean);
+  const functionLabel = String(
+    callFrame?.functionName ?? callFrame?.functionLocation?.name ?? ""
+  ).toLowerCase();
+  if (auxData?.isDefault === true || executionContext?.isDefault === true) {
+    score += 10000;
+  }
+  if (mainFrameId && frameId === String(mainFrameId)) {
+    score += 9000;
+  }
+  if (targetOrigin && urls.some((url) => url === normalizedTargetUrl || url.startsWith(`${targetOrigin}/`))) {
+    score += 4000;
+  }
+  if (urls.some((url) => /(^|[.:/])tetr\.io(?:[/:]|$)/.test(url))) {
+    score += 2500;
+  }
+  if (/(game|tetr|play|battle|requestanimationframe|settimeout|update|tick|render)/.test(functionLabel)) {
+    score += 100;
+  }
+  score += Math.min(12, Array.isArray(callFrame?.scopeChain) ? callFrame.scopeChain.length : 0) * 150;
+  return score;
+}
+
+function formatPausedFrameDiagnostic(callFrame, index, options = {}) {
+  const functionLabel = String(callFrame?.functionName ?? "").trim() || "anonymous";
+  const url = String(callFrame?.url ?? callFrame?.documentURL ?? "").trim() || "-";
+  const scopeCount = Array.isArray(callFrame?.scopeChain)
+    ? callFrame.scopeChain.length
+    : 0;
+  return `${index}(score=${getFramePriority(callFrame, options)} function=${functionLabel} url=${url} scopes=${scopeCount})`;
+}
+
+function getPausedScopeScanFrameOrder(
+  callFrames = [],
+  options = {}
+) {
+  return callFrames
+    .map((callFrame, index) => ({
+      index,
+      score: getFramePriority(callFrame, options)
+    }))
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .map(({ index }) => index);
+}
+
+function nextPausedScopeScanFrameIndex(callFrames = [], frameIndex = 0, options = {}) {
+  const order = getPausedScopeScanFrameOrder(callFrames, options);
   const currentOrderIndex = order.indexOf(frameIndex);
   if (currentOrderIndex < 0) {
     return null;
@@ -1930,7 +2117,8 @@ function computePausedScopeScanResumeCursor(
     scopeIndex = 0,
     propertyIndex = 0,
     descriptorsLength = 0,
-    advancePastCurrentProperty = false
+    advancePastCurrentProperty = false,
+    frameOrderOptions = {}
   } = {}
 ) {
   const currentFrame = callFrames[frameIndex];
@@ -1951,7 +2139,11 @@ function computePausedScopeScanResumeCursor(
       propertyIndex: 0
     };
   }
-  const nextFrameIndex = nextPausedScopeScanFrameIndex(callFrames, frameIndex);
+  const nextFrameIndex = nextPausedScopeScanFrameIndex(
+    callFrames,
+    frameIndex,
+    frameOrderOptions
+  );
   if (nextFrameIndex === null || nextFrameIndex === undefined) {
     return null;
   }
@@ -2092,7 +2284,7 @@ function logPausedScopeScanProgress(log, progress) {
     return;
   }
   log(
-    `[browser] full closure scan progress attempt=${progress.attempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW} frame=${progress.frameIndex} scope=${progress.scopeIndex} candidate=${progress.candidateIndex} inspected_objects=${progress.inspectedObjects} paused_ms=${progress.pausedMs}`
+    `[browser] full closure scan progress attempt=${progress.attempt}/${MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW} frame=${progress.frameIndex} scope=${progress.scopeIndex} candidate=${progress.candidateIndex} inspected_objects=${progress.inspectedObjects} paused_ms=${progress.pausedMs} frames_scanned=${progress.framesScanned ?? 0} scopes_scanned=${progress.scopesScanned ?? 0}`
   );
 }
 
@@ -2106,12 +2298,19 @@ function logPausedScopeScanContinuation(log, cursor) {
   );
 }
 
-function scorePausedScopeDescriptor(descriptor) {
+function scorePausedScopeDescriptor(descriptor, preferredLocators = []) {
   const locator = String(descriptor?.name ?? "").trim().toLowerCase();
   if (!locator) {
     return Number.NEGATIVE_INFINITY;
   }
+  const preferred = new Set(
+    Array.isArray(preferredLocators)
+      ? preferredLocators.map((value) => String(value ?? "").trim().toLowerCase()).filter(Boolean)
+      : []
+  );
   let score = 0;
+  if (preferred.has(locator)) score += 10000;
+  if (locator === "ai") score += 5000;
   if (locator === "game") score += 200;
   if (locator.includes("game")) score += 120;
   if (locator.includes("field")) score += 50;
@@ -2396,6 +2595,8 @@ async function main() {
   );
   const vsWsSimEnabled = isVsWsSimEnvEnabled();
   const browserPerfEnabled = process.env.FUSION_BROWSER_PERF === "1";
+  const closureCandidateTraceEnabled =
+    process.env.FUSION_CLOSURE_CANDIDATE_TRACE === "1";
   const chromePath = process.env.CHROME_PATH || "";
   const msgpack = await loadOptionalMsgpack();
 
@@ -2656,7 +2857,9 @@ async function main() {
         endedGameCandidate,
         waitingForNextGame,
         suppressedReason: DEFAULT_SUPPRESSED_REASON,
-        perfEnabled: browserPerfEnabled
+        perfEnabled: browserPerfEnabled,
+        targetUrl: target.url ?? "",
+        candidateTraceEnabled: closureCandidateTraceEnabled
       });
 
       if (
@@ -4386,6 +4589,7 @@ export async function readTetrioState(cdp, options) {
   });
   const shouldCaptureWithWindow =
     shouldCapture &&
+    isClosureCaptureArmed(closureCaptureState, now) &&
     !skipCaptureThisPoll &&
     !isClosureCaptureWindowExhausted(closureCaptureState);
   if (shouldCaptureWithWindow) {
@@ -4425,8 +4629,6 @@ export async function readTetrioState(cdp, options) {
     );
     const isAgainButtonProvisionalCapture =
       isProvisionalCapture && isAgainButtonProvisionalInteraction(nextGameReacquireState);
-    const isFollowupFastCapture =
-      closureCaptureState.pendingFollowupFastCapture === true;
     const allowBroadScan =
       !isAgainButtonProvisionalCapture ||
       nextGameReacquireState.provisionalTransitionReady === true;
@@ -4449,21 +4651,36 @@ export async function readTetrioState(cdp, options) {
       log,
       requireActiveGame: isProvisionalCapture,
       pauseTimeoutMs:
-        isFollowupFastCapture || (isAgainButtonProvisionalCapture && !allowBroadScan)
+        (isAgainButtonProvisionalCapture && !allowBroadScan)
           ? DEFAULT_FOLLOWUP_FAST_CAPTURE_TIMEOUT_MS
           : 900,
-      allowBroadScan
+      allowBroadScan,
+      targetUrl: options.targetUrl ?? "",
+      mainFrameId: options.mainFrameId ?? "",
+      candidateTraceEnabled: options.candidateTraceEnabled === true
     }).catch((error) => ({
       ok: false,
       reason: error?.message ?? String(error)
     }));
     closureCaptureState.pendingFollowupFastCapture = false;
+    closureCaptureState.pendingFollowupFullScan = false;
     if (options.perfEnabled) {
       console.log(
         `[browser-perf] closure_capture elapsed_ms=${Math.max(0, Date.now() - captureStartedAt)}`
       );
     }
     if (capture.ok) {
+      if (closureCaptureState.captureTiming) {
+        const successAt = Date.now();
+        closureCaptureState.captureTiming.captureSuccessAt = successAt;
+        logClosureTimingStage(closureCaptureState, "capture_success", {
+          phase: "end",
+          startAt: successAt,
+          endAt: successAt,
+          log,
+          details: { source: capture.source }
+        });
+      }
       if (capture.locator) {
         closureCaptureState.lastSuccessfulLocator = String(capture.locator);
       }
@@ -4549,7 +4766,8 @@ export async function readTetrioState(cdp, options) {
         scheduleClosureCaptureContinuation(
           closureCaptureState,
           now,
-          continuationDelayMs
+          continuationDelayMs,
+          log
         );
         log(
           `[browser] full closure scan continuation resume cursor=${formatClosureCaptureCursorLabel(
@@ -4585,11 +4803,12 @@ export async function readTetrioState(cdp, options) {
         closureCaptureState.fullScanAttemptsInWindow < MAX_FULL_SCAN_ATTEMPTS_PER_WINDOW &&
         isClosureCaptureArmed(closureCaptureState, now)
       ) {
-        closureCaptureState.pendingFollowupFastCapture = true;
+        closureCaptureState.pendingFollowupFullScan = true;
         scheduleClosureCaptureContinuation(
           closureCaptureState,
           now,
-          DEFAULT_TARGETED_PAUSED_PROBE_BACKOFF_MS
+          DEFAULT_FIRST_FULL_SCAN_CONTINUATION_BACKOFF_MS,
+          log
         );
       } else if (
         capture.reason === "TETR.IO full closure scan cumulative budget exhausted" ||
@@ -4608,7 +4827,7 @@ export async function readTetrioState(cdp, options) {
           log
         });
       } else {
-        scheduleNextClosureCaptureAttempt(closureCaptureState, now);
+        scheduleNextClosureCaptureAttempt(closureCaptureState, now, undefined, log);
       }
       state = {
         ...state,
@@ -4643,13 +4862,30 @@ export async function captureTetrioGame(
     log = console.log,
     requireActiveGame = false,
     pauseTimeoutMs = 900,
-    allowBroadScan = true
+    allowBroadScan = true,
+    targetUrl = "",
+    mainFrameId = "",
+    candidateTraceEnabled = false
   } = {}
 ) {
   const breakpointIds = [];
   let paused = false;
 
   try {
+    const probeStartedAt = Date.now();
+    markClosureRetryWaitEnd(closureCaptureState, probeStartedAt, log);
+    if (closureCaptureState?.captureTiming) {
+      const timing = closureCaptureState.captureTiming;
+      if (timing.firstFastProbeStartAt === 0) {
+        timing.firstFastProbeStartAt = probeStartedAt;
+        logClosureTimingStage(closureCaptureState, "first_fast_probe", {
+          phase: "start",
+          startAt: probeStartedAt,
+          endAt: probeStartedAt,
+          log
+        });
+      }
+    }
     if (closureCaptureState) {
       closureCaptureState.captureAttemptsInWindow += 1;
     }
@@ -4685,6 +4921,19 @@ export async function captureTetrioGame(
       event = null;
     }
     if (!event) {
+      if (
+        closureCaptureState?.captureTiming &&
+        closureCaptureState.captureTiming.firstFastProbeEndAt === 0
+      ) {
+        const probeEndedAt = Date.now();
+        closureCaptureState.captureTiming.firstFastProbeEndAt = probeEndedAt;
+        logClosureTimingStage(closureCaptureState, "first_fast_probe", {
+          phase: "end",
+          startAt: closureCaptureState.captureTiming.firstFastProbeStartAt,
+          endAt: probeEndedAt,
+          log
+        });
+      }
       return {
         ok: false,
         reason: "TETR.IO game closure not visible yet",
@@ -4693,11 +4942,27 @@ export async function captureTetrioGame(
     }
 
     paused = true;
+    if (
+      closureCaptureState?.captureTiming &&
+      closureCaptureState.captureTiming.firstFastProbeEndAt === 0
+    ) {
+      const probeEndedAt = Date.now();
+      closureCaptureState.captureTiming.firstFastProbeEndAt = probeEndedAt;
+      logClosureTimingStage(closureCaptureState, "first_fast_probe", {
+        phase: "end",
+        startAt: closureCaptureState.captureTiming.firstFastProbeStartAt,
+        endAt: probeEndedAt,
+        log
+      });
+    }
     const exposed = await exposeTetrioGameFromPausedCallFrames(cdp, event, {
       closureCaptureState,
       log,
       requireActiveGame,
-      allowBroadScan
+      allowBroadScan,
+      targetUrl,
+      mainFrameId,
+      candidateTraceEnabled
     });
     await cdp.send("Debugger.resume").catch(() => undefined);
     paused = false;
@@ -4753,7 +5018,10 @@ export async function exposeTetrioGameFromPausedCallFrames(
     closureCaptureState = null,
     log = console.log,
     requireActiveGame = false,
-    allowBroadScan = true
+    allowBroadScan = true,
+    targetUrl = "",
+    mainFrameId = "",
+    candidateTraceEnabled = false
   } = {}
 ) {
   const locatorHint = String(closureCaptureState?.lastSuccessfulLocator ?? "").trim();
@@ -4769,10 +5037,12 @@ export async function exposeTetrioGameFromPausedCallFrames(
       log(`[browser] fast closure locator succeeded locator=${locatorHint}`);
       return hinted;
     }
-    if (closureCaptureState) {
+    if (hinted.reason === "cached_locator_property_lookup_failed") {
       closureCaptureState.lastSuccessfulLocator = "";
+      log("[browser] fast closure locator property lookup failed; invalidating locator cache");
+    } else {
+      log("[browser] fast closure locator miss; retaining locator cache and falling back to scan");
     }
-    log("[browser] fast closure locator failed; falling back to scan");
   }
   if (closureCaptureState?.lastSuccessfulPausedLocation) {
     const hinted = await probeTargetedPausedLocation(cdp, pausedEvent, closureCaptureState, {
@@ -4812,10 +5082,45 @@ export async function exposeTetrioGameFromPausedCallFrames(
     closureCaptureState.fullScanAttemptsInWindow = nextFullScanAttempt;
   }
   const scanStartedAt = Date.now();
+  const scanStage = nextFullScanAttempt === 1 ? "first_full_scan" : "second_full_scan";
+  if (closureCaptureState) {
+    const timing = closureCaptureState.captureTiming ?? createClosureCaptureTimingState();
+    timing[`${scanStage}StartAt`] = scanStartedAt;
+    logClosureTimingStage(closureCaptureState, scanStage, {
+      phase: "start",
+      startAt: scanStartedAt,
+      endAt: scanStartedAt,
+      log,
+      details: { attempt: nextFullScanAttempt }
+    });
+  }
   const scanned = await exposeTetrioGameViaPausedScopeScan(cdp, pausedEvent, {
     closureCaptureState,
-    requireActiveGame
+    requireActiveGame,
+    targetUrl,
+    mainFrameId,
+    preferredLocators: [locatorHint, "Ai"],
+    candidateTraceEnabled,
+    log
   });
+  if (closureCaptureState) {
+    const timing = closureCaptureState.captureTiming ?? createClosureCaptureTimingState();
+    const scanEndedAt = Date.now();
+    timing[`${scanStage}EndAt`] = scanEndedAt;
+    logClosureTimingStage(closureCaptureState, scanStage, {
+      phase: "end",
+      startAt: timing[`${scanStage}StartAt`],
+      endAt: scanEndedAt,
+      log,
+      details: {
+        attempt: nextFullScanAttempt,
+        frames_scanned: scanned.progress?.framesScanned,
+        scopes_scanned: scanned.progress?.scopesScanned,
+        inspected_objects: scanned.progress?.inspectedObjects,
+        paused_ms: scanned.progress?.pausedMs
+      }
+    });
+  }
   logPausedScopeScanProgress(log, scanned.progress ?? null);
   if (!scanned.ok && scanned.outcome === "continuation_required") {
     if (scanned.resumeCursor) {
@@ -4835,6 +5140,7 @@ export async function exposeTetrioGameFromPausedCallFrames(
 }
 
 export async function exposeTetrioGameViaLocatorHint(cdp, pausedEvent, locatorName) {
+  let failureReason = "";
   for (const callFrame of pausedEvent.callFrames ?? []) {
     const result = await cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: callFrame.callFrameId,
@@ -4846,8 +5152,14 @@ export async function exposeTetrioGameViaLocatorHint(cdp, pausedEvent, locatorNa
     if (value?.ok) {
       return value;
     }
+    if (value?.reason) {
+      failureReason = String(value.reason);
+    }
   }
-  return { ok: false, reason: `TETR.IO locator ${locatorName} was not visible in paused scopes` };
+  return {
+    ok: false,
+    reason: failureReason || `TETR.IO locator ${locatorName} was not visible in paused scopes`
+  };
 }
 
 export async function exposeTetrioGameViaPausedScopeScan(
@@ -4857,11 +5169,30 @@ export async function exposeTetrioGameViaPausedScopeScan(
     closureCaptureState = null,
     perScanBudgetMs = DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS,
     cumulativeBudgetMs = DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS,
-    requireActiveGame = false
+    requireActiveGame = false,
+    targetUrl = "",
+    mainFrameId = "",
+    preferredLocators = [],
+    candidateTraceEnabled = false,
+    log = console.log
   } = {}
 ) {
   const callFrames = pausedEvent?.callFrames ?? [];
-  const frameOrder = getPausedScopeScanFrameOrder(callFrames);
+  const frameOrderOptions = {
+    targetUrl,
+    mainFrameId,
+    preferredLocators
+  };
+  const frameOrder = getPausedScopeScanFrameOrder(callFrames, frameOrderOptions);
+  if (typeof log === "function") {
+    log(
+      `[browser] full closure scan frame_order=${frameOrder
+        .map((frameIndex) =>
+          formatPausedFrameDiagnostic(callFrames[frameIndex], frameIndex, frameOrderOptions)
+        )
+        .join(",")}`
+    );
+  }
   const persistedCursor =
     closureCaptureState?.pausedScopeScanCursor ?? {
       ...createPausedScopeScanCursor(),
@@ -4888,7 +5219,9 @@ export async function exposeTetrioGameViaPausedScopeScan(
         attempt: Math.max(1, Number(closureCaptureState?.fullScanAttemptsInWindow ?? 1)),
         ...formatScanCursor(persistedCursor),
         inspectedObjects: seenCandidateKeys.size,
-        pausedMs: 0
+        pausedMs: 0,
+        framesScanned: 0,
+        scopesScanned: 0
       },
       resumeCursor: formatScanCursor(persistedCursor)
     };
@@ -4900,6 +5233,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
     Math.min(Math.max(1, perScanBudgetMs), remainingWindowBudgetMs)
   );
   let candidatesVisited = 0;
+  let framesScanned = 0;
+  let scopesScanned = 0;
 
   const updateBudgetUsed = () => {
     if (closureCaptureState) {
@@ -4926,7 +5261,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
       scopeIndex,
       propertyIndex,
       descriptorsLength,
-      advancePastCurrentProperty
+      advancePastCurrentProperty,
+      frameOrderOptions
     });
     if (!resumeCursor && !windowBudgetExhausted) {
       if (closureCaptureState) {
@@ -4943,7 +5279,9 @@ export async function exposeTetrioGameViaPausedScopeScan(
           scopeIndex,
           candidateIndex: propertyIndex,
           inspectedObjects: seenCandidateKeys.size,
-          pausedMs: Math.max(0, Date.now() - scanStartedAt)
+          pausedMs: Math.max(0, Date.now() - scanStartedAt),
+          framesScanned,
+          scopesScanned
         }
       };
     }
@@ -4973,7 +5311,9 @@ export async function exposeTetrioGameViaPausedScopeScan(
         scopeIndex,
         candidateIndex: propertyIndex,
         inspectedObjects: seenCandidateKeys.size,
-        pausedMs: Math.max(0, Date.now() - scanStartedAt)
+        pausedMs: Math.max(0, Date.now() - scanStartedAt),
+        framesScanned,
+        scopesScanned
       },
       resumeCursor: resumeCursor ? formatScanCursor(resumeCursor) : null
     };
@@ -4989,6 +5329,7 @@ export async function exposeTetrioGameViaPausedScopeScan(
     const frameIndex = frameOrder[frameOrderIndex];
     const callFrame = callFrames[frameIndex];
     const scopeChain = callFrame?.scopeChain ?? [];
+    framesScanned += 1;
     const initialScopeIndex =
       frameIndex === (persistedCursor.frameIndex ?? 0)
         ? persistedCursor.scopeIndex ?? 0
@@ -5000,6 +5341,7 @@ export async function exposeTetrioGameViaPausedScopeScan(
       if (!scopeObjectId || completedScopeKeys.has(scopeKey)) {
         continue;
       }
+      scopesScanned += 1;
       const initialPropertyIndex =
         frameIndex === (persistedCursor.frameIndex ?? 0) &&
         scopeIndex === (persistedCursor.scopeIndex ?? 0)
@@ -5025,8 +5367,8 @@ export async function exposeTetrioGameViaPausedScopeScan(
         .map((descriptor, index) => ({ descriptor, index }))
         .sort((left, right) => {
           const scoreDelta =
-            scorePausedScopeDescriptor(right.descriptor) -
-            scorePausedScopeDescriptor(left.descriptor);
+            scorePausedScopeDescriptor(right.descriptor, preferredLocators) -
+            scorePausedScopeDescriptor(left.descriptor, preferredLocators);
           return scoreDelta !== 0 ? scoreDelta : left.index - right.index;
         })
         .map(({ descriptor }) => descriptor);
@@ -5070,6 +5412,16 @@ export async function exposeTetrioGameViaPausedScopeScan(
           });
         }
         seenCandidateKeys.add(candidateKey);
+        if (candidateTraceEnabled && typeof log === "function") {
+          log(
+            `[browser] closure candidate trace ${JSON.stringify({
+              frame: frameIndex,
+              scope: scopeIndex,
+              candidate: propertyIndex,
+              locator
+            })}`
+          );
+        }
         const exposed = await exposeTetrioCandidateObjectWithOptions(
           cdp,
           valueObjectId,
@@ -5091,7 +5443,9 @@ export async function exposeTetrioGameViaPausedScopeScan(
               scopeIndex,
               candidateIndex: propertyIndex,
               inspectedObjects: seenCandidateKeys.size,
-              pausedMs: Math.max(0, Date.now() - scanStartedAt)
+              pausedMs: Math.max(0, Date.now() - scanStartedAt),
+              framesScanned,
+              scopesScanned
             }
           };
         }
@@ -5115,7 +5469,9 @@ export async function exposeTetrioGameViaPausedScopeScan(
       scopeIndex: 0,
       candidateIndex: 0,
       inspectedObjects: seenCandidateKeys.size,
-      pausedMs: Math.max(0, Date.now() - scanStartedAt)
+      pausedMs: Math.max(0, Date.now() - scanStartedAt),
+      framesScanned,
+      scopesScanned
     }
   };
 }
@@ -5235,10 +5591,10 @@ export function pausedFrameExposureExpression(locatorName = "Ai") {
                 ? exported.game
                 : exported;
             if (state?.destroyed || state?.dead || state?.gameover) {
-              return { ok: false };
+              return { ok: false, reason: "cached_locator_property_lookup_failed" };
             }
           } catch {
-            return { ok: false };
+            return { ok: false, reason: "cached_locator_property_lookup_failed" };
           }
 
           delete window.__fusionEndedTetrioGame;
@@ -5254,8 +5610,11 @@ export function pausedFrameExposureExpression(locatorName = "Ai") {
         };
         return window.__fusionTetrioBridge;
       }
+      if (candidate !== undefined) {
+        return { ok: false, reason: "cached_locator_property_lookup_failed" };
+      }
     } catch {}
-    return { ok: false };
+    return { ok: false, reason: "cached_locator_not_visible" };
   })()`;
 }
 

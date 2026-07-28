@@ -28,6 +28,7 @@ const DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS = 350;
 const DEFAULT_NEXT_GAME_FAST_LOCATOR_MISS_LOG_INTERVAL_MS = 5000;
 const DEFAULT_NEXT_GAME_INTERACTION_POLL_MS = 75;
 const DEFAULT_NEXT_GAME_INTERACTION_BURST_DEDUPE_MS = 150;
+const DEFAULT_INITIAL_GAMEPLAY_SIGNAL_INTERVAL_MS = 350;
 const DEFAULT_NEXT_GAME_INTERACTION_CAPTURE_DELAY_MS = 300;
 const DEFAULT_TARGETED_PAUSED_PROBE_DELAY_MS = 450;
 const DEFAULT_TARGETED_PAUSED_PROBE_BACKOFF_MS = 800;
@@ -150,8 +151,23 @@ export function createClosureCaptureState() {
     windowFirstInteractionAt: 0,
     windowTargetedProbeAt: 0,
     provisionalNonHeavyAttemptConsumed: false,
+    initialGameplayProbeAt: 0,
+    initialGameplaySignalActive: false,
+    initialGameplaySignalLabel: "",
+    initialGameplaySignalRearmConsumed: false,
     captureTiming: createClosureCaptureTimingState()
   };
+}
+
+function resetInitialGameplayCaptureProbeState(closureCaptureState) {
+  if (!closureCaptureState) {
+    return false;
+  }
+  closureCaptureState.initialGameplayProbeAt = 0;
+  closureCaptureState.initialGameplaySignalActive = false;
+  closureCaptureState.initialGameplaySignalLabel = "";
+  closureCaptureState.initialGameplaySignalRearmConsumed = false;
+  return true;
 }
 
 function createClosureCaptureTimingState() {
@@ -1025,6 +1041,9 @@ export function disarmClosureCaptureWindow(
   if (!closureCaptureState) {
     return false;
   }
+  if (reason === "bot_off") {
+    resetInitialGameplayCaptureProbeState(closureCaptureState);
+  }
   const hadPending = Boolean(closureCaptureState.pendingCaptureArm);
   if (clearPending) {
     clearPendingClosureCaptureArm(closureCaptureState);
@@ -1217,6 +1236,7 @@ export function resetClosureCaptureLocatorHint(closureCaptureState) {
   }
   closureCaptureState.lastSuccessfulLocator = "";
   closureCaptureState.lastSuccessfulPausedLocation = null;
+  resetInitialGameplayCaptureProbeState(closureCaptureState);
   return true;
 }
 
@@ -2858,6 +2878,7 @@ async function main() {
         waitingForNextGame,
         suppressedReason: DEFAULT_SUPPRESSED_REASON,
         perfEnabled: browserPerfEnabled,
+        initialCaptureSignalProbe: true,
         targetUrl: target.url ?? "",
         candidateTraceEnabled: closureCandidateTraceEnabled
       });
@@ -4212,6 +4233,54 @@ export async function readTetrioState(cdp, options) {
   };
 
   let state = await read();
+  if (
+    options.initialCaptureSignalProbe === true &&
+    options.probePageState &&
+    !options.suppressClosureCapture &&
+    bootstrapReady &&
+    browserControlState.botEnabled &&
+    !state.ok &&
+    !nextGameReacquireState.active &&
+    !postGameInteractionWatchState.active &&
+    (!isClosureCaptureArmed(closureCaptureState, now) ||
+      isClosureCaptureWindowExhausted(closureCaptureState)) &&
+    now - Number(closureCaptureState.initialGameplayProbeAt ?? 0) >=
+      DEFAULT_INITIAL_GAMEPLAY_SIGNAL_INTERVAL_MS
+  ) {
+    closureCaptureState.initialGameplayProbeAt = now;
+    const signalFn = options.readCheapGameSignalFn ?? readCheapGameSignal;
+    const cheapSignal = await signalFn(cdp, {
+      transientState: options.transientState,
+      log
+    }).catch(() => ({ active: false, label: "inactive" }));
+    const signalActive = cheapSignal?.active === true;
+    const previousSignalActive = closureCaptureState.initialGameplaySignalActive === true;
+    closureCaptureState.initialGameplaySignalActive = signalActive;
+    closureCaptureState.initialGameplaySignalLabel = String(
+      cheapSignal?.label ?? "inactive"
+    );
+    if (
+      signalActive &&
+      !previousSignalActive &&
+      !closureCaptureState.initialGameplaySignalRearmConsumed
+    ) {
+      initializeFreshClosureCaptureWindow(closureCaptureState, {
+        reason: "bot_on_gameplay_signal",
+        log
+      });
+      requestClosureCaptureArm(closureCaptureState, {
+        reason: "bot_on_gameplay_signal",
+        now,
+        bootstrapReady,
+        log
+      });
+      closureCaptureState.nextAttemptAt = now;
+      closureCaptureState.initialGameplaySignalRearmConsumed = true;
+      log(
+        `[browser] initial gameplay signal reopened closure capture label=${closureCaptureState.initialGameplaySignalLabel}`
+      );
+    }
+  }
   let skipCaptureThisPoll = false;
   const shouldPollInteraction =
     options.probePageState &&

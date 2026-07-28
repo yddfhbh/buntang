@@ -3827,6 +3827,109 @@ test("Bot On arming opens the solo bootstrap capture window", async () => {
   assert.equal(state.ok, true);
 });
 
+test("initial gameplay signal reopens an exhausted Bot On capture window once", async () => {
+  const logs = [];
+  const closureCaptureState = armedClosureCaptureState(20_000, { reason: "bot_on" });
+  closureCaptureState.fullScanAttemptsInWindow = 2;
+  closureCaptureState.scanBudgetExhausted = true;
+  const browserControlState = createBrowserControlState();
+  browserControlState.botEnabled = true;
+  let captureCalls = 0;
+
+  const state = await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },
+    {
+      ok: true,
+      ready: true,
+      playing: true,
+      countdown: false,
+      pieceCounter: 0,
+      current: "t",
+      hold: null,
+      queue: ["i", "o"]
+    }
+  ]), {
+    probePageState: true,
+    initialCaptureSignalProbe: true,
+    suppressClosureCapture: false,
+    network: { lastCaptureAt: 0, lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(20_000),
+    browserControlState,
+    closureCaptureState,
+    now: 20_000,
+    readCheapGameSignalFn: async () => ({
+      active: true,
+      source: "countdown_dom",
+      label: "countdown"
+    }),
+    captureGameFn: async () => {
+      captureCalls += 1;
+      return { ok: true, source: "closure:Ai", locator: "Ai" };
+    },
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(captureCalls, 1);
+  assert.equal(state.ok, true);
+  assert.equal(closureCaptureState.initialGameplaySignalRearmConsumed, true);
+  assert.ok(logs.includes(
+    "[browser] initial gameplay signal reopened closure capture label=countdown"
+  ));
+});
+
+test("initial gameplay signal cannot repeatedly rearm after the follow-up scan is exhausted", async () => {
+  const closureCaptureState = armedClosureCaptureState(21_000, { reason: "bot_on" });
+  closureCaptureState.fullScanAttemptsInWindow = 2;
+  closureCaptureState.scanBudgetExhausted = true;
+  const browserControlState = createBrowserControlState();
+  browserControlState.botEnabled = true;
+  let captureCalls = 0;
+  const captureGameFn = async () => {
+    captureCalls += 1;
+    closureCaptureState.fullScanAttemptsInWindow = 2;
+    return {
+      ok: false,
+      reason: "TETR.IO active game variable was not in paused scopes",
+      outcome: "completed_not_found"
+    };
+  };
+  const baseOptions = {
+    probePageState: true,
+    initialCaptureSignalProbe: true,
+    suppressClosureCapture: false,
+    network: { lastCaptureAt: 0, lastPageProbeAt: 0 },
+    probeState: { lastCaptureAt: 0 },
+    bootstrapState: readyBootstrapState(21_000),
+    browserControlState,
+    closureCaptureState,
+    readCheapGameSignalFn: async () => ({
+      active: true,
+      source: "gameplay_dom",
+      label: "playing"
+    }),
+    captureGameFn,
+    log: () => {}
+  };
+
+  await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" }
+  ]), {
+    ...baseOptions,
+    now: 21_000
+  });
+  await readTetrioState(createReadStateCdp([
+    { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" }
+  ]), {
+    ...baseOptions,
+    now: 21_500
+  });
+
+  assert.equal(captureCalls, 1);
+  assert.equal(closureCaptureState.initialGameplaySignalRearmConsumed, true);
+  assert.equal(closureCaptureState.armedUntil, 0);
+});
+
 test("VS sim ON but round inactive still probes after cooldown", async () => {
   const cdp = createReadStateCdp([
     { ok: false, ready: false, reason: "TETR.IO game instance not captured yet" },

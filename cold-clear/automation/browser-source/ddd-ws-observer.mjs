@@ -3,9 +3,13 @@ import path from "node:path";
 import {
   DEFAULT_BRIDGE_PATH,
   createVsBridgeState,
+  ingestVsBridgeSessionSelfIdentity,
+  ingestVsBridgeOptionsCandidate,
   ingestVsBridgeRoot,
+  isZenithBagtype,
   isVsWsSimEnabled,
   markVsBridgeInactive,
+  resetVsBridgeZenithAccumulator,
 } from "./vs-ws-bridge.mjs";
 
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -17,6 +21,13 @@ const MAX_TRACE_RECORD_BYTES = 32 * 1024;
 const OPTIONS_SIGNATURE_DEDUPE_WINDOW_MS = 2000;
 const DEFAULT_TRACE_FILE_PATH = path.join("automation", "ws-live-candidates.jsonl");
 const DEFAULT_VS_BRIDGE_PATH = DEFAULT_BRIDGE_PATH;
+const DEFAULT_SESSION_SELF_PROBE_RETRY_MS = 250;
+const DEFAULT_SESSION_SELF_PROBE_MAX_ATTEMPTS = 5;
+const PREBUFFER_MAX_AGE_MS = 10_000;
+const PREBUFFER_MAX_ITEMS = 500;
+const MODE_SOLO = "solo";
+const MODE_ZENITH = "zenith";
+const MODE_FRIENDLY_VS = "friendly_vs";
 const SENSITIVE_KEYS = new Set([
   "token",
   "auth",
@@ -110,7 +121,14 @@ const CONTEXT_KEYS = [
   "username",
   "name",
   "userid",
+  "user_id",
   "gameid",
+  "game_id",
+  "session",
+  "sessionid",
+  "session_id",
+  "roomid",
+  "room_id",
   "slot",
   "index",
   "local",
@@ -169,10 +187,17 @@ export async function installDddWsObserver(
     traceEnabled = process.env.FUSION_DDD_WS_TRACE === "1",
     traceFilePath = DEFAULT_TRACE_FILE_PATH,
     vsSimEnabled = isVsWsSimEnabled(),
+    vsBridgeEnabled = true,
     vsBridgePath = DEFAULT_VS_BRIDGE_PATH,
     onVsRoundStatus = null,
     onGameOptions = null,
-    perfEnabled = process.env.FUSION_BROWSER_PERF === "1"
+    perfEnabled = process.env.FUSION_BROWSER_PERF === "1",
+    resolveSessionSelfIdentity = null,
+    sessionSelfProbeRetryMs = DEFAULT_SESSION_SELF_PROBE_RETRY_MS,
+    sessionSelfProbeMaxAttempts = DEFAULT_SESSION_SELF_PROBE_MAX_ATTEMPTS,
+    now: nowFn = () => Date.now(),
+    setTimeoutFn = setTimeout,
+    clearTimeoutFn = clearTimeout
   } = {}
 ) {
   const logger = (message) => safeLog(log, message);
@@ -183,9 +208,13 @@ export async function installDddWsObserver(
   }
 
   let vsBridge = null;
-  if (vsSimEnabled) {
+  if (vsBridgeEnabled) {
     try {
       vsBridge = createVsBridgeState(vsBridgePath, logger);
+      safeLog(
+        log,
+        `[vs-bridge] observer attached mode=${vsSimEnabled ? "simulation" : "passive"}`
+      );
     } catch (error) {
       safeLog(
         log,
@@ -204,6 +233,15 @@ export async function installDddWsObserver(
     optionsCaptureSequence: 0,
     trace: null,
     vsBridge,
+    modeController: createModeControllerState(),
+    resolveSessionSelfIdentity,
+    sessionSelfProbe: createSessionSelfProbeState({
+      retryMs: sessionSelfProbeRetryMs,
+      maxAttempts: sessionSelfProbeMaxAttempts,
+      now: nowFn,
+      setTimeoutFn,
+      clearTimeoutFn
+    }),
     lastVsRoundStatusKey: "",
     perf: perfEnabled
       ? {
@@ -237,6 +275,11 @@ export async function installDddWsObserver(
       }
       observerState.requestUrls.set(requestId, url);
       safeLog(log, `[ws-observer] websocket opened host=${safeUrlHost(url)}`);
+      if (isZenithModeActive(observerState)) {
+        notifySessionSelfProbeTrigger(observerState, cdp, logger, onVsRoundStatus, {
+          reason: "websocket_open"
+        });
+      }
     } catch {}
   });
 
@@ -275,28 +318,40 @@ export async function installDddWsObserver(
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
+        recordSelectedModePrebuffer(observerState, {
+          requestId: event?.requestId ?? null,
+          urlHost,
+          capturedAt: timestamp,
+          candidates,
+          decodedRoots
+        });
         logCapturedCandidates(
           candidates,
           event?.requestId,
           observerState,
           log,
-          onGameOptions
+          onGameOptions,
+          cdp,
+          logger,
+          onVsRoundStatus,
+          {
+            allowBridgeIngest: isBridgeIngestActive(observerState),
+            allowSoloSignals: isSoloModeActive(observerState)
+          }
         );
-        for (const decodedRoot of decodedRoots) {
-          try {
-            ingestVsBridgeRoot(
-              observerState.vsBridge,
-              decodedRoot,
-              {
-                timestamp,
-                urlHost,
-                requestId: event?.requestId ?? null
-              },
-              logger
-            );
-          } catch {}
+        if (isBridgeIngestActive(observerState)) {
+          ingestZenithDecodedRoots(
+            observerState,
+            decodedRoots,
+            {
+              timestamp,
+              urlHost,
+              requestId: event?.requestId ?? null
+            },
+            logger,
+            onVsRoundStatus
+          );
         }
-        emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
         traceDecodedRoots(decodedRoots, event, observerState, log);
         recordPerfFrame(observerState, frameStartedAt, logger);
         return;
@@ -319,35 +374,48 @@ export async function installDddWsObserver(
         const candidates = collectOptionCandidates(decodedRoots);
         const timestamp = Date.now();
         const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
+        recordSelectedModePrebuffer(observerState, {
+          requestId: event?.requestId ?? null,
+          urlHost,
+          capturedAt: timestamp,
+          candidates,
+          decodedRoots
+        });
         logCapturedCandidates(
           candidates,
           event?.requestId,
           observerState,
           log,
-          onGameOptions
+          onGameOptions,
+          cdp,
+          logger,
+          onVsRoundStatus,
+          {
+            allowBridgeIngest: isBridgeIngestActive(observerState),
+            allowSoloSignals: isSoloModeActive(observerState)
+          }
         );
-        for (const decodedRoot of decodedRoots) {
-          try {
-            ingestVsBridgeRoot(
-              observerState.vsBridge,
-              decodedRoot,
-              {
-                timestamp,
-                urlHost,
-                requestId: event?.requestId ?? null
-              },
-              logger
-            );
-          } catch {}
+        if (isBridgeIngestActive(observerState)) {
+          ingestZenithDecodedRoots(
+            observerState,
+            decodedRoots,
+            {
+              timestamp,
+              urlHost,
+              requestId: event?.requestId ?? null
+            },
+            logger,
+            onVsRoundStatus
+          );
         }
-        emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
         traceDecodedRoots(decodedRoots, event, observerState, log);
       }
       recordPerfFrame(observerState, frameStartedAt, logger);
     } catch {}
   });
 
-  return () => {
+  const cleanup = () => {
+    cancelSessionSelfProbeLoop(observerState, { shutdown: true });
     markVsBridgeInactive(observerState.vsBridge, logger);
     emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
     offCreated();
@@ -356,6 +424,29 @@ export async function installDddWsObserver(
     observerState.requestUrls.clear();
     finalizeTrace(observerState, logger);
   };
+  cleanup.notifyTargetReset = (reason = "target_reset") => {
+    notifySessionSelfProbeTargetReset(observerState, logger, reason);
+  };
+  cleanup.notifyBootstrapReady = () => {
+    notifySessionSelfProbeBootstrapReady(
+      observerState,
+      cdp,
+      logger,
+      onVsRoundStatus
+    );
+  };
+  cleanup.notifyZenithOptionsObserved = () => {
+    notifySessionSelfProbeTrigger(observerState, cdp, logger, onVsRoundStatus, {
+      reason: "zenith_options_missing_self"
+    });
+  };
+  cleanup.setModeControl = (control) => {
+    setModeControlState(observerState, control, cdp, logger, onVsRoundStatus);
+  };
+  cleanup.cancelSessionProbe = () => {
+    cancelSessionSelfProbeLoop(observerState);
+  };
+  return cleanup;
 }
 
 function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
@@ -381,6 +472,739 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
       seed
     });
   } catch {}
+}
+
+function normalizeModeValue(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (normalized === MODE_ZENITH) {
+    return MODE_ZENITH;
+  }
+  if (normalized === MODE_FRIENDLY_VS) {
+    return MODE_FRIENDLY_VS;
+  }
+  return MODE_SOLO;
+}
+
+function createModeControllerState() {
+  return {
+    selectedMode: MODE_SOLO,
+    botEnabled: false,
+    modeGeneration: 0,
+    zenithPrebuffer: [],
+    friendlyVsPrebuffer: [],
+    lastPassiveMode: "",
+    lastLoggedActivationKey: ""
+  };
+}
+
+function isZenithModeActive(observerState) {
+  return Boolean(observerState?.modeController?.botEnabled) &&
+    normalizeModeValue(observerState?.modeController?.selectedMode) === MODE_ZENITH;
+}
+
+function isFriendlyVsModeActive(observerState) {
+  return Boolean(observerState?.modeController?.botEnabled) &&
+    normalizeModeValue(observerState?.modeController?.selectedMode) ===
+      MODE_FRIENDLY_VS;
+}
+
+function isBridgeIngestActive(observerState) {
+  return isZenithModeActive(observerState) || isFriendlyVsModeActive(observerState);
+}
+
+function isSoloModeActive(observerState) {
+  return Boolean(observerState?.modeController?.botEnabled) &&
+    normalizeModeValue(observerState?.modeController?.selectedMode) === MODE_SOLO;
+}
+
+function selectedPrebufferForMode(observerState, mode = null) {
+  const selectedMode = normalizeModeValue(
+    mode ?? observerState?.modeController?.selectedMode
+  );
+  if (selectedMode === MODE_ZENITH) {
+    return observerState?.modeController?.zenithPrebuffer ?? [];
+  }
+  if (selectedMode === MODE_FRIENDLY_VS) {
+    return observerState?.modeController?.friendlyVsPrebuffer ?? [];
+  }
+  return null;
+}
+
+function clearAllModePrebuffers(observerState) {
+  observerState?.modeController?.zenithPrebuffer?.splice?.(0);
+  observerState?.modeController?.friendlyVsPrebuffer?.splice?.(0);
+}
+
+function pruneModePrebuffer(buffer, now = Date.now()) {
+  if (!Array.isArray(buffer)) {
+    return 0;
+  }
+  while (buffer.length > 0) {
+    const first = buffer[0];
+    const firstAt = Math.max(0, Number(first?.capturedAt ?? 0));
+    if (now - firstAt <= PREBUFFER_MAX_AGE_MS) {
+      break;
+    }
+    buffer.shift();
+  }
+  while (buffer.length > PREBUFFER_MAX_ITEMS) {
+    buffer.shift();
+  }
+  return buffer.length;
+}
+
+function recordSelectedModePrebuffer(observerState, entry) {
+  const buffer = selectedPrebufferForMode(observerState);
+  if (!buffer) {
+    return 0;
+  }
+  buffer.push({
+    requestId: entry?.requestId ?? null,
+    urlHost: entry?.urlHost ?? "",
+    capturedAt: Math.max(0, Number(entry?.capturedAt ?? Date.now())),
+    candidates: Array.isArray(entry?.candidates) ? entry.candidates : [],
+    decodedRoots: Array.isArray(entry?.decodedRoots) ? entry.decodedRoots : []
+  });
+  return pruneModePrebuffer(buffer, Date.now());
+}
+
+function clearVsRuntimeState(observerState, log, onVsRoundStatus) {
+  cancelSessionSelfProbeLoop(observerState);
+  observerState.sessionSelfProbe.shutdown = false;
+  if (observerState?.vsBridge?.current?.active) {
+    markVsBridgeInactive(observerState.vsBridge, log);
+  } else {
+    resetVsBridgeZenithAccumulator(observerState.vsBridge);
+  }
+  emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
+}
+
+function ingestZenithDecodedRoots(
+  observerState,
+  decodedRoots,
+  context,
+  logger,
+  onVsRoundStatus
+) {
+  let changed = false;
+  for (const decodedRoot of decodedRoots) {
+    try {
+      const previousSignature = observerState?.vsBridge?.currentSignature ?? "";
+      ingestVsBridgeRoot(observerState.vsBridge, decodedRoot, context, logger);
+      changed =
+        changed ||
+        previousSignature !== String(observerState?.vsBridge?.currentSignature ?? "");
+    } catch {}
+  }
+  if (changed) {
+    emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
+  }
+}
+
+function replayModePrebuffer(observerState, logger, onVsRoundStatus) {
+  const buffer = [...(selectedPrebufferForMode(observerState) ?? [])];
+  let candidateCount = 0;
+  for (const entry of buffer) {
+    const requestId = entry?.requestId ?? null;
+    const capturedAt = Math.max(0, Number(entry?.capturedAt ?? Date.now()));
+    const urlHost = String(entry?.urlHost ?? "");
+    for (const candidate of entry?.candidates ?? []) {
+      candidateCount += 1;
+      try {
+        ingestVsBridgeOptionsCandidate(
+          observerState.vsBridge,
+          {
+            ...candidate,
+            requestId,
+            capturedAt
+          },
+          logger
+        );
+      } catch {}
+    }
+    ingestZenithDecodedRoots(
+      observerState,
+      entry?.decodedRoots ?? [],
+      { requestId, capturedAt, urlHost, timestamp: capturedAt },
+      logger,
+      onVsRoundStatus
+    );
+  }
+  safeLog(
+    logger,
+    `[${normalizeModeValue(observerState?.modeController?.selectedMode)}] prebuffer replayed candidates=${candidateCount}`
+  );
+}
+
+function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) {
+  const modeController = observerState?.modeController;
+  if (!modeController) {
+    return false;
+  }
+  const nextMode = normalizeModeValue(control?.selectedMode);
+  const nextBotEnabled = control?.botEnabled === true;
+  const nextGeneration = Math.max(0, Number(control?.modeGeneration ?? 0));
+  const previousMode = normalizeModeValue(modeController.selectedMode);
+  const previousBotEnabled = modeController.botEnabled === true;
+  const previousGeneration = Math.max(0, Number(modeController.modeGeneration ?? 0));
+  const modeChanged = previousMode !== nextMode;
+  const activationChanged =
+    previousBotEnabled !== nextBotEnabled || previousGeneration !== nextGeneration;
+  if (modeController.lastPassiveMode !== nextMode) {
+    modeController.lastPassiveMode = nextMode;
+    safeLog(log, `[mode] passive websocket listener active mode=${nextMode}`);
+  }
+  if (!modeChanged && !activationChanged) {
+    return false;
+  }
+  modeController.selectedMode = nextMode;
+  modeController.botEnabled = nextBotEnabled;
+  modeController.modeGeneration = nextGeneration;
+  if (modeChanged) {
+    modeController.lastLoggedActivationKey = "";
+    clearVsRuntimeState(observerState, log, onVsRoundStatus);
+    clearAllModePrebuffers(observerState);
+  }
+  if (!nextBotEnabled) {
+    modeController.lastLoggedActivationKey = "";
+    clearVsRuntimeState(observerState, log, onVsRoundStatus);
+    safeLog(
+      log,
+      `[mode] activation cancelled mode=${nextMode} generation=${nextGeneration}`
+    );
+    return true;
+  }
+  if (nextMode === MODE_SOLO) {
+    modeController.lastLoggedActivationKey = "";
+    clearVsRuntimeState(observerState, log, onVsRoundStatus);
+    return true;
+  }
+  const activationKey = `${nextMode}:${nextGeneration}`;
+  if (modeController.lastLoggedActivationKey !== activationKey) {
+    modeController.lastLoggedActivationKey = activationKey;
+    safeLog(log, `[${nextMode}] activation started`);
+  }
+  clearVsRuntimeState(observerState, log, onVsRoundStatus);
+  if (nextMode === MODE_ZENITH) {
+    resetSessionSelfProbeActivation(observerState, log, "bot_on");
+  }
+  replayModePrebuffer(observerState, log, onVsRoundStatus);
+  if (nextMode === MODE_ZENITH) {
+    notifySessionSelfProbeTrigger(observerState, cdp, log, onVsRoundStatus, {
+      reason: "zenith_bot_on"
+    });
+  }
+  return true;
+}
+
+function createSessionSelfProbeState({
+  retryMs = DEFAULT_SESSION_SELF_PROBE_RETRY_MS,
+  maxAttempts = DEFAULT_SESSION_SELF_PROBE_MAX_ATTEMPTS,
+  now = () => Date.now(),
+  setTimeoutFn = setTimeout,
+  clearTimeoutFn = clearTimeout
+} = {}) {
+  return {
+    retryMs: clampProbeRetryMs(retryMs),
+    maxAttempts: clampProbeMaxAttempts(maxAttempts),
+    now,
+    setTimeoutFn,
+    clearTimeoutFn,
+    needed: true,
+    bootstrapReady: false,
+    attemptCount: 0,
+    targetGeneration: 1,
+    running: false,
+    timer: null,
+    scheduledDelayMs: 0,
+    started: false,
+    shutdown: false
+  };
+}
+
+function clampProbeRetryMs(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_SESSION_SELF_PROBE_RETRY_MS;
+  }
+  return Math.max(200, Math.min(500, Math.round(numeric)));
+}
+
+function clampProbeMaxAttempts(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_SESSION_SELF_PROBE_MAX_ATTEMPTS;
+  }
+  return Math.max(1, Math.min(5, Math.round(numeric)));
+}
+
+function hasPinnedSessionSelf(observerState) {
+  const identity = observerState?.vsBridge?.sessionSelfIdentity ?? null;
+  return Boolean(identity?.userid || identity?.username);
+}
+
+function cancelSessionSelfProbeLoop(observerState, { shutdown = false } = {}) {
+  const probe = observerState?.sessionSelfProbe;
+  if (!probe) {
+    return;
+  }
+  probe.shutdown = shutdown;
+  if (probe.timer) {
+    try {
+      probe.clearTimeoutFn?.(probe.timer);
+    } catch {}
+    probe.timer = null;
+  }
+  probe.running = false;
+  probe.scheduledDelayMs = 0;
+}
+
+function notifySessionSelfProbeTargetReset(
+  observerState,
+  log,
+  reason = "target_reset"
+) {
+  if (!observerState?.sessionSelfProbe) {
+    return;
+  }
+  const probe = observerState.sessionSelfProbe;
+  if (probe.timer) {
+    try {
+      probe.clearTimeoutFn?.(probe.timer);
+    } catch {}
+    probe.timer = null;
+  }
+  probe.shutdown = false;
+  probe.running = false;
+  probe.scheduledDelayMs = 0;
+  probe.attemptCount = 0;
+  probe.bootstrapReady = false;
+  probe.needed = true;
+  probe.started = false;
+  probe.targetGeneration += 1;
+  resetVsBridgeZenithAccumulator(observerState.vsBridge);
+  clearAllModePrebuffers(observerState);
+  safeLog(
+    log,
+    `[vs-bridge] page session probe reset reason=${reason} target_generation=${probe.targetGeneration}`
+  );
+}
+
+function resetSessionSelfProbeActivation(observerState, log, reason = "bot_on") {
+  const probe = observerState?.sessionSelfProbe;
+  if (!probe) {
+    return;
+  }
+  if (probe.timer) {
+    try {
+      probe.clearTimeoutFn?.(probe.timer);
+    } catch {}
+    probe.timer = null;
+  }
+  probe.shutdown = false;
+  probe.running = false;
+  probe.scheduledDelayMs = 0;
+  probe.attemptCount = 0;
+  probe.needed = true;
+  probe.started = false;
+  probe.targetGeneration += 1;
+  resetVsBridgeZenithAccumulator(observerState.vsBridge);
+  safeLog(
+    log,
+    `[vs-bridge] page session probe reset reason=${reason} target_generation=${probe.targetGeneration}`
+  );
+}
+
+function notifySessionSelfProbeBootstrapReady(
+  observerState,
+  cdp,
+  log,
+  onVsRoundStatus = null
+) {
+  const probe = observerState?.sessionSelfProbe;
+  if (!probe) {
+    return false;
+  }
+  probe.bootstrapReady = true;
+  return notifySessionSelfProbeTrigger(
+    observerState,
+    cdp,
+    log,
+    onVsRoundStatus,
+    { reason: "bootstrap_ready" }
+  );
+}
+
+function notifySessionSelfProbeTrigger(
+  observerState,
+  cdp,
+  log,
+  onVsRoundStatus = null,
+  {
+    reason = "session_probe",
+    delayMs = 0
+  } = {}
+) {
+  if (!observerState?.vsBridge || !observerState?.sessionSelfProbe) {
+    return false;
+  }
+  const probe = observerState.sessionSelfProbe;
+  if (
+    probe.shutdown ||
+    !probe.needed ||
+    hasPinnedSessionSelf(observerState) ||
+    !isZenithModeActive(observerState)
+  ) {
+    if (hasPinnedSessionSelf(observerState)) {
+      probe.needed = false;
+    }
+    return false;
+  }
+  if (!probe.bootstrapReady && reason !== "bootstrap_ready") {
+    return false;
+  }
+  if (probe.running) {
+    return false;
+  }
+  if (probe.attemptCount >= probe.maxAttempts) {
+    probe.needed = false;
+    return false;
+  }
+  const normalizedDelayMs = Math.max(0, Number(delayMs) || 0);
+  const nextAttempt = probe.attemptCount + 1;
+  if (probe.timer) {
+    if (normalizedDelayMs > 0 || probe.scheduledDelayMs === 0) {
+      return false;
+    }
+    try {
+      probe.clearTimeoutFn?.(probe.timer);
+    } catch {}
+    probe.timer = null;
+    probe.scheduledDelayMs = 0;
+  }
+  safeLog(
+    log,
+    `[vs-bridge] page session probe scheduled reason=${reason} target_generation=${probe.targetGeneration} attempt=${nextAttempt}`
+  );
+  if (normalizedDelayMs > 0) {
+    probe.scheduledDelayMs = normalizedDelayMs;
+    const generation = probe.targetGeneration;
+    probe.timer = probe.setTimeoutFn(() => {
+      probe.timer = null;
+      probe.scheduledDelayMs = 0;
+      void startSessionSelfProbeRun(
+        observerState,
+        cdp,
+        log,
+        onVsRoundStatus,
+        reason,
+        generation
+      );
+    }, normalizedDelayMs);
+    return true;
+  }
+  void startSessionSelfProbeRun(
+    observerState,
+    cdp,
+    log,
+    onVsRoundStatus,
+    reason,
+    probe.targetGeneration
+  );
+  return true;
+}
+
+async function startSessionSelfProbeRun(
+  observerState,
+  cdp,
+  log,
+  onVsRoundStatus,
+  reason,
+  targetGeneration
+) {
+  const probe = observerState?.sessionSelfProbe;
+  if (!probe || probe.shutdown || probe.running) {
+    return false;
+  }
+  if (
+    targetGeneration !== probe.targetGeneration ||
+    !probe.needed ||
+    hasPinnedSessionSelf(observerState) ||
+    probe.attemptCount >= probe.maxAttempts
+  ) {
+    return false;
+  }
+  probe.running = true;
+  probe.started = true;
+  probe.attemptCount += 1;
+  const attempt = probe.attemptCount;
+  safeLog(
+    log,
+    `[vs-bridge] page session probe started reason=${reason} attempt=${attempt}`
+  );
+  let result = null;
+  try {
+    result = normalizeSessionSelfProbeResult(
+      await resolveSessionSelfIdentity(observerState, cdp)
+    );
+  } catch (error) {
+    result = {
+      status: "error",
+      error: error?.message ?? String(error),
+      userid: null,
+      username: null,
+      sourcePath: null,
+      keys: []
+    };
+  }
+  probe.running = false;
+  if (probe.shutdown || targetGeneration !== probe.targetGeneration) {
+    return false;
+  }
+  logSessionSelfProbeResult(log, result, probe.targetGeneration);
+  if (result.status === "resolved") {
+    const changed = ingestVsBridgeSessionSelfIdentity(observerState.vsBridge, {
+      userid: result.userid,
+      username: result.username,
+      source: result.sourcePath ?? "page_session_probe"
+    });
+    if (hasPinnedSessionSelf(observerState)) {
+      probe.needed = false;
+      if (changed) {
+        emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
+      }
+      return changed;
+    }
+  }
+  if (probe.attemptCount >= probe.maxAttempts) {
+    probe.needed = false;
+    return false;
+  }
+  return notifySessionSelfProbeTrigger(
+    observerState,
+    cdp,
+    log,
+    onVsRoundStatus,
+    {
+      reason: `retry_after_${result.status}`,
+      delayMs: probe.retryMs
+    }
+  );
+}
+
+function normalizeSessionSelfProbeResult(result) {
+  if (!result) {
+    return {
+      status: "not_found",
+      userid: null,
+      username: null,
+      sourcePath: null,
+      keys: []
+    };
+  }
+  if (typeof result !== "object") {
+    return {
+      status: "not_found",
+      userid: null,
+      username: null,
+      sourcePath: null,
+      keys: []
+    };
+  }
+  const status =
+    result.status === "resolved" ||
+    result.status === "not_ready" ||
+    result.status === "not_found" ||
+    result.status === "error"
+      ? result.status
+      : result.userid !== undefined ||
+          result.username !== undefined ||
+          result._id !== undefined ||
+          result.user_id !== undefined ||
+          result.name !== undefined
+        ? "resolved"
+        : "not_found";
+  return {
+    status,
+    userid: sanitizeTraceScalar(result.userid ?? result._id ?? result.user_id) ?? null,
+    username: sanitizeTraceScalar(result.username ?? result.name) ?? null,
+    sourcePath:
+      sanitizeTraceScalar(
+        result.sourcePath ?? result.source_path ?? result.source
+      ) ?? null,
+    keys: sanitizeTraceKeyList(result.keys),
+    error: sanitizeTraceScalar(result.error) ?? null
+  };
+}
+
+function sanitizeTraceKeyList(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((entry) => sanitizeTraceScalar(entry))
+    .filter((entry) => typeof entry === "string")
+    .slice(0, 12);
+}
+
+function logSessionSelfProbeResult(log, result, targetGeneration) {
+  const keysLabel =
+    Array.isArray(result?.keys) && result.keys.length > 0
+      ? result.keys.join(",")
+      : "-";
+  const errorSuffix =
+    result?.status === "error" && result?.error
+      ? ` error=${result.error}`
+      : "";
+  safeLog(
+    log,
+    `[vs-bridge] page session probe result status=${result?.status ?? "not_found"} userid=${
+      result?.userid ?? "null"
+    } username=${result?.username ?? "null"} source_path=${
+      result?.sourcePath ?? "null"
+    } keys=${keysLabel} target_generation=${targetGeneration}${errorSuffix}`
+  );
+}
+
+async function resolveSessionSelfIdentity(observerState, cdp) {
+  if (typeof observerState?.resolveSessionSelfIdentity === "function") {
+    return await observerState.resolveSessionSelfIdentity(cdp);
+  }
+  return await probePageSessionSelfIdentity(cdp);
+}
+
+async function probePageSessionSelfIdentity(cdp) {
+  if (!cdp?.send) {
+    return { status: "error", error: "cdp_unavailable" };
+  }
+  const response = await cdp.send("Runtime.evaluate", {
+    expression: pageSessionIdentityExpression(),
+    returnByValue: true,
+    awaitPromise: false
+  });
+  const value = response?.result?.value;
+  if (!value || typeof value !== "object") {
+    return { status: "not_found" };
+  }
+  const status =
+    sanitizeTraceScalar(value.status) ?? "resolved";
+  const userid = sanitizeTraceScalar(value.userid ?? value._id ?? value.user_id);
+  const username = sanitizeTraceScalar(value.username ?? value.name);
+  const sourcePath =
+    sanitizeTraceScalar(value.sourcePath ?? value.source) ?? null;
+  if (
+    status === "resolved" &&
+    userid === undefined &&
+    username === undefined
+  ) {
+    return { status: "not_found", sourcePath };
+  }
+  return {
+    status,
+    userid,
+    username,
+    sourcePath,
+    keys: sanitizeTraceKeyList(value.keys)
+  };
+}
+
+function pageSessionIdentityExpression() {
+  return `(() => {
+    const MAX_NODES = 400;
+    const MAX_DEPTH = 4;
+    if (
+      !window ||
+      !window.document ||
+      (window.document.readyState &&
+        window.document.readyState !== "complete" &&
+        window.document.readyState !== "interactive")
+    ) {
+      return { status: "not_ready" };
+    }
+    const seen = new WeakSet();
+    const participantHints = /players?|leaderboard|entrants?|bracket|naturalorder|opponents?|copies/i;
+    const selfHints = /self|me|user|account|session|profile|auth|state|store/i;
+    const queue = [{ value: window, path: "window", depth: 0 }];
+    let visited = 0;
+    let best = null;
+    const scalar = (value) =>
+      value === null ||
+      value === undefined ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+        ? value
+        : undefined;
+    const scoreCandidate = (path, value) => {
+      let score = 0;
+      if (selfHints.test(path)) score += 4;
+      if (participantHints.test(path)) score -= 10;
+      if (scalar(value?.userid ?? value?._id ?? value?.user_id) !== undefined) score += 3;
+      if (scalar(value?.username ?? value?.name) !== undefined) score += 2;
+      if (path.includes(".__NUXT__") || path.includes(".$nuxt") || path.includes(".store")) {
+        score += 2;
+      }
+      if (/session|account|auth|profile/.test(path)) {
+        score += 3;
+      }
+      if (scalar(value?.gameid ?? value?.game_id) !== undefined) score -= 4;
+      if (value && typeof value === "object" && !Array.isArray(value)) {
+        if (value.options || value.players || value.player || value.naturalorder !== undefined) {
+          score -= 8;
+        }
+      }
+      return score;
+    };
+    while (queue.length > 0 && visited < MAX_NODES) {
+      const current = queue.shift();
+      const value = current?.value;
+      if (!value || typeof value !== "object") continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      visited += 1;
+      const userid = scalar(value.userid ?? value._id ?? value.user_id);
+      const username = scalar(value.username ?? value.name);
+      if (userid !== undefined || username !== undefined) {
+        const score = scoreCandidate(current.path, value);
+        if (score > 0 && (!best || score > best.score)) {
+          best = {
+            userid,
+            username,
+            sourcePath: current.path,
+            keys: Object.keys(value).slice(0, 12),
+            score
+          };
+        }
+      }
+      if (current.depth >= MAX_DEPTH) continue;
+      const entries = Array.isArray(value)
+        ? value.map((entry, index) => [String(index), entry])
+        : Object.entries(value);
+      for (const [key, entry] of entries) {
+        if (typeof entry !== "object" || entry === null) continue;
+        if (participantHints.test(key) && current.path === "window") continue;
+        queue.push({
+          value: entry,
+          path: current.path + "." + key,
+          depth: current.depth + 1
+        });
+      }
+    }
+    if (best) {
+      return {
+        status: "resolved",
+        userid: best.userid ?? null,
+        username: best.username ?? null,
+        sourcePath: best.sourcePath,
+        keys: best.keys
+      };
+    }
+    return {
+      status: "not_found"
+    };
+  })()`;
 }
 
 function recordPerfFrame(observerState, frameStartedAt, log) {
@@ -454,7 +1278,15 @@ export function tryUnpackAtOffsets(buffer, unpack) {
 }
 
 export function decodeGameOptionsCandidates(payload, unpack) {
-  return collectOptionCandidates(collectDecodedRoots(payload, unpack));
+  const candidates = [];
+  collectDecodedCandidates(candidates, collectDecodedRoots(payload, unpack));
+  return candidates.map((candidate) => candidate.options);
+}
+
+export function decodeGameOptionsCandidateRecords(payload, unpack) {
+  const candidates = [];
+  collectDecodedCandidates(candidates, collectDecodedRoots(payload, unpack));
+  return candidates;
 }
 
 export function findGameOptions(root) {
@@ -492,11 +1324,15 @@ export function sanitizeGameOptions(options) {
 
 function collectDecodedCandidates(target, values) {
   for (const value of values) {
-    const match = findGameOptions(value);
-    const sanitized = sanitizeGameOptions(match);
-    if (sanitized) {
-      target.push(sanitized);
-    }
+    collectOptionCandidatesFromValue(
+      target,
+      value,
+      "root",
+      [],
+      new WeakSet(),
+      { visitedObjects: 0 },
+      0
+    );
   }
 }
 
@@ -607,21 +1443,32 @@ function isSensitiveKey(key) {
   return SENSITIVE_KEYS.has(String(key).toLowerCase());
 }
 
+export function shouldEmitSoloSignalForGameOptions(options) {
+  return !isZenithBagtype(options?.bagtype);
+}
+
 function logCapturedCandidates(
   candidates,
   requestId,
   observerState,
   log,
-  onGameOptions = null
+  onGameOptions = null,
+  cdp = null,
+  logger = log,
+  onVsRoundStatus = null,
+  {
+    allowBridgeIngest = true,
+    allowSoloSignals = true
+  } = {}
 ) {
-  for (const options of candidates) {
+  for (const candidate of candidates) {
+    const options = candidate?.options ?? null;
+    if (!options) {
+      continue;
+    }
     const signature = buildOptionsSignature(options);
     const now = Date.now();
     const summary = summarizeOptionsForSignalLog(options);
-    safeLog(
-      log,
-      `[browser] solo signal candidate type=ddd_game_options path=ws_observer seed=${summary.seed} bagtype=${summary.bagtype} nextcount=${summary.nextcount} signature=${summary.signature}`
-    );
     if (!signature) {
       safeLog(
         log,
@@ -641,16 +1488,47 @@ function logCapturedCandidates(
     observerState.recentOptionsSignatures.set(signature, now);
     observerState.optionsCaptured += 1;
     observerState.optionsCaptureSequence += 1;
-    try {
-      onGameOptions?.({
-        signature,
-        options,
-        sequence: observerState.optionsCaptureSequence,
-        capturedAt: now
+    if (allowBridgeIngest) {
+      try {
+        ingestVsBridgeOptionsCandidate(observerState.vsBridge, {
+          ...candidate,
+          requestId,
+          capturedAt: now
+        });
+      } catch {}
+    }
+    if (
+      allowBridgeIngest &&
+      isZenithBagtype(options?.bagtype) &&
+      !hasPinnedSessionSelf(observerState)
+    ) {
+      notifySessionSelfProbeTrigger(observerState, cdp, logger, onVsRoundStatus, {
+        reason: "zenith_options_missing_self"
       });
+    }
+
+    const emitSoloSignal =
+      allowSoloSignals && shouldEmitSoloSignalForGameOptions(options);
+    if (emitSoloSignal) {
+      safeLog(
+        log,
+        `[browser] solo signal candidate type=ddd_game_options path=ws_observer seed=${summary.seed} bagtype=${summary.bagtype} nextcount=${summary.nextcount} signature=${summary.signature}`
+      );
+    }
+    try {
+      if (emitSoloSignal) {
+        onGameOptions?.({
+          signature,
+          options,
+          sequence: observerState.optionsCaptureSequence,
+          capturedAt: now
+        });
+      }
     } catch {}
 
-    safeLog(log, `[browser] solo signal queued key=ddd:${signature} source=ddd_game_options`);
+    if (emitSoloSignal) {
+      safeLog(log, `[browser] solo signal queued key=ddd:${signature} source=ddd_game_options`);
+    }
     safeLog(log, "[ws-observer] game options captured");
     if (requestId && observerState.requestUrls.has(requestId)) {
       safeLog(
@@ -753,8 +1631,121 @@ function collectDecodedRoots(payload, unpack) {
 
 function collectOptionCandidates(decodedRoots) {
   const candidates = [];
+  const seen = new Set();
   collectDecodedCandidates(candidates, decodedRoots);
-  return candidates;
+  return candidates.filter((candidate) => {
+    const key = `${buildOptionsSignature(candidate?.options ?? null)}|${JSON.stringify(candidate?.context ?? {})}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function collectOptionCandidatesFromValue(
+  target,
+  value,
+  pathLabel,
+  ancestors,
+  seen,
+  counters,
+  depth
+) {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  if (depth > MAX_DEPTH || counters.visitedObjects >= MAX_VISITED_OBJECTS) {
+    return;
+  }
+  if (seen.has(value)) {
+    return;
+  }
+
+  seen.add(value);
+  counters.visitedObjects += 1;
+
+  const lineage = [{ value, path: pathLabel }, ...ancestors];
+  const directMatch = resolveOptionCandidateEntry(value);
+  const sanitized = sanitizeGameOptions(directMatch?.candidate ?? null);
+  if (sanitized) {
+    target.push({
+      options: sanitized,
+      context: extractTraceContext(lineage),
+      path: pathLabel
+    });
+  }
+
+  if (depth === MAX_DEPTH) {
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      collectOptionCandidatesFromValue(
+        target,
+        value[index],
+        `${pathLabel}[${index}]`,
+        lineage.slice(0, 4),
+        seen,
+        counters,
+        depth + 1
+      );
+    }
+    return;
+  }
+
+  for (const key of Object.keys(value)) {
+    if (isSensitiveKey(key)) {
+      continue;
+    }
+    if (directMatch?.skipNestedKey === key) {
+      continue;
+    }
+    let nestedValue;
+    try {
+      nestedValue = value[key];
+    } catch {
+      continue;
+    }
+    collectOptionCandidatesFromValue(
+      target,
+      nestedValue,
+      `${pathLabel}.${key}`,
+      lineage.slice(0, 4),
+      seen,
+      counters,
+      depth + 1
+    );
+  }
+}
+
+function resolveOptionCandidateEntry(value) {
+  if (hasSeedAndBagtype(value)) {
+    return {
+      candidate: value,
+      skipNestedKey: null
+    };
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, "options") &&
+    hasSeedAndBagtype(value.options)
+  ) {
+    return {
+      candidate: mergeAllowedOptionShape(value, value.options),
+      skipNestedKey: "options"
+    };
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(value, "setoptions") &&
+    hasSeedAndBagtype(value.setoptions)
+  ) {
+    return {
+      candidate: mergeAllowedOptionShape(value, value.setoptions),
+      skipNestedKey: "setoptions"
+    };
+  }
+  return null;
 }
 
 function createTraceRecorder(traceFilePath, log) {

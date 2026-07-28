@@ -26,6 +26,14 @@ const REQUIRED_LOCAL_OPTION_KEYS = [
   "boardwidth",
   "boardheight"
 ];
+const ZENITH_PLAYER_STALE_MS = 30_000;
+const ZENITH_SESSION_KEYS = [
+  "session",
+  "sessionid",
+  "session_id",
+  "roomid",
+  "room_id"
+];
 const GARBAGE_DATA_KEYS = [
   "type",
   "gameid",
@@ -44,6 +52,10 @@ export function isVsWsSimEnabled(env = process.env) {
   return env?.FUSION_VS_WS_SIM === "1";
 }
 
+export function isZenithBagtype(value) {
+  return normalizeBagtype(value) === "zenith";
+}
+
 export function createVsBridgeState(
   bridgeFilePath = DEFAULT_BRIDGE_PATH,
   log = null
@@ -57,23 +69,93 @@ export function createVsBridgeState(
     lastDisabledRoundId: "",
     lastWaitingReason: "",
     lastLocalPlayerSignature: "",
-    selfUser: {
-      userid: null,
-      username: null
-    },
+    lastSelfIdentitySignature: "",
+    lastIgnoredSelfCandidateSignature: "",
+    lastZenithWaitingSignature: "",
+    sessionSelfIdentity: createEmptySessionSelfIdentity(),
+    participantIdentities: new Map(),
+    requestIdentityState: new Map(),
+    pendingRequestSelfCandidates: new Map(),
     roomUsers: new Map(),
     roundPlayers: new Map(),
+    zenithPlayersByGameId: new Map(),
+    zenithPlayersByUserId: new Map(),
     roomOptions: {},
+    zenithSession: null,
     roundObservedAt: 0,
     roundObservationKey: "",
+    identityCandidateKeys: new Set(),
     log,
     ingest(root, context = {}) {
       return ingestVsBridgeRoot(state, root, context, state.log);
     }
   };
 
-  log?.(`[vs-bridge] enabled path=${displayPath(state.bridgeFilePath)}`);
+  log?.(`[vs-bridge] producer enabled path=${buildLogPath(state.bridgeFilePath)}`);
   return state;
+}
+
+export function ingestVsBridgeOptionsCandidate(
+  state,
+  candidate,
+  log = state?.log ?? null
+) {
+  if (!state || !candidate || typeof candidate !== "object") {
+    return false;
+  }
+  const options = asPlainObject(candidate.options);
+  const context = asPlainObject(candidate.context);
+  const pathLabel = sanitizeScalar(candidate.path) ?? "unknown";
+  const requestId = sanitizeScalar(candidate.requestId ?? candidate.request_id);
+  let changed = false;
+
+  if (context) {
+    logIdentityCandidate(state, {
+      path: pathLabel,
+      source: context,
+      requestId,
+      marker: describeIdentityMarker(context, "candidate_context")
+    }, log);
+  }
+
+  if (context && isConfirmedObserverSelfContext(context)) {
+    changed =
+      ingestVsBridgeSessionSelfIdentity(
+        state,
+        {
+          userid: sanitizeScalar(context.userid ?? context.user_id),
+          username: sanitizeScalar(context.username ?? context.name),
+          gameid: sanitizeScalar(context.gameid ?? context.game_id),
+          session:
+            findZenithSessionValue(context) ??
+            findZenithSessionValue(options),
+          requestId,
+          source: `candidate:${pathLabel}`
+        },
+        log
+      ) || changed;
+  }
+
+  if (options && isZenithBagtype(options.bagtype)) {
+    const requestState = ensureRequestIdentityState(state, requestId);
+    noteZenithRequestCandidate(requestState, context, options);
+    changed =
+      accumulateZenithPlayerCandidate(state, {
+        options,
+        context,
+        path: pathLabel,
+        requestId,
+        capturedAt: normalizeTimestamp(candidate.capturedAt ?? Date.now())
+      }) || changed;
+  }
+  if (changed) {
+    tryBuildBridge(
+      state,
+      normalizeTimestamp(candidate.capturedAt ?? Date.now()),
+      log
+    );
+  }
+  return changed;
 }
 
 export function updateVsBridgeState(
@@ -104,15 +186,16 @@ export function ingestVsBridgeRoot(
   }
 
   const capturedAt = normalizeTimestamp(context.timestamp);
-  updateSelfUserCache(state, root);
+  updateSelfUserCache(state, root, context, log);
   updateRoomUsersCache(state, root);
   updateRoundPlayersCache(state, root);
   updateRoomOptionsCache(state, root);
+  updateZenithSessionCache(state, root, context);
   updateRoundObservation(state, capturedAt);
 
   const built = tryBuildBridge(state, capturedAt, log);
   if (built) {
-    maybeLogResolvedLocalPlayer(state, built.local, log);
+    maybeLogResolvedLocalPlayer(state, built, log);
   }
 
   if (!state.current?.active) {
@@ -162,6 +245,7 @@ export function ingestVsBridgeRoot(
 
 export function markVsBridgeInactive(state, log = state?.log ?? null) {
   if (!state?.current?.active) {
+    resetVsBridgeZenithAccumulator(state);
     return;
   }
 
@@ -174,6 +258,53 @@ export function markVsBridgeInactive(state, log = state?.log ?? null) {
     capturedAt: Date.now()
   };
   safeWriteBridgeFile(state, log);
+  resetVsBridgeZenithAccumulator(state);
+}
+
+export function resetVsBridgeZenithAccumulator(state) {
+  if (!state) {
+    return false;
+  }
+  state.zenithPlayersByGameId?.clear?.();
+  state.zenithPlayersByUserId?.clear?.();
+  state.participantIdentities?.clear?.();
+  state.requestIdentityState?.clear?.();
+  state.pendingRequestSelfCandidates?.clear?.();
+  state.zenithSession = null;
+  state.lastZenithWaitingSignature = "";
+  state.sessionSelfIdentity = createEmptySessionSelfIdentity();
+  state.lastSelfIdentitySignature = "";
+  state.lastIgnoredSelfCandidateSignature = "";
+  return true;
+}
+
+export function ingestVsBridgeSessionSelfIdentity(
+  state,
+  identity,
+  log = state?.log ?? null
+) {
+  const changed = pinSessionSelfIdentity(
+    state,
+    {
+      userid: sanitizeScalar(identity?.userid ?? identity?._id ?? identity?.user_id),
+      username: sanitizeScalar(identity?.username ?? identity?.name),
+      gameid: sanitizeScalar(identity?.gameid ?? identity?.game_id),
+      session: sanitizeScalar(
+        identity?.session ??
+          identity?.sessionid ??
+          identity?.session_id ??
+          identity?.roomid ??
+          identity?.room_id
+      ),
+      requestId: sanitizeScalar(identity?.requestId ?? identity?.request_id) ?? null,
+      source: sanitizeScalar(identity?.source) ?? "session_identity"
+    },
+    log
+  );
+  if (changed) {
+    tryBuildBridge(state, Date.now(), log);
+  }
+  return changed;
 }
 
 export function deriveVsRoundBridge(root, capturedAt = Date.now()) {
@@ -182,13 +313,16 @@ export function deriveVsRoundBridge(root, capturedAt = Date.now()) {
   }
 
   const state = {
-    selfUser: {
-      userid: null,
-      username: null
-    },
+    sessionSelfIdentity: createEmptySessionSelfIdentity(),
+    participantIdentities: new Map(),
+    requestIdentityState: new Map(),
+    pendingRequestSelfCandidates: new Map(),
     roomUsers: new Map(),
     roundPlayers: new Map(),
+    zenithPlayersByGameId: new Map(),
+    zenithPlayersByUserId: new Map(),
     roomOptions: {},
+    zenithSession: null,
     roundObservedAt: 0,
     roundObservationKey: "",
     current: null,
@@ -197,15 +331,20 @@ export function deriveVsRoundBridge(root, capturedAt = Date.now()) {
     lastDisabledRoundId: "",
     lastWaitingReason: "",
     lastLocalPlayerSignature: "",
+    lastSelfIdentitySignature: "",
+    lastIgnoredSelfCandidateSignature: "",
+    lastZenithWaitingSignature: "",
     sequence: 0,
     bridgeFilePath: DEFAULT_BRIDGE_PATH,
+    identityCandidateKeys: new Set(),
     log: null
   };
 
-  updateSelfUserCache(state, root);
+  updateSelfUserCache(state, root, {}, null);
   updateRoomUsersCache(state, root);
   updateRoundPlayersCache(state, root);
   updateRoomOptionsCache(state, root);
+  updateZenithSessionCache(state, root);
   updateRoundObservation(state, capturedAt);
 
   return buildBridgeFromState(state, capturedAt);
@@ -290,17 +429,28 @@ function tryBuildBridge(state, capturedAt, log) {
   }
 
   if (safeWriteBridgeFile(state, log)) {
-    log?.(
-      `[vs-bridge] readyAt offset_ms=${built.bridge.readyOffsetMs ?? 0} source=${built.bridge.readyOffsetSource ?? "precountdown_fallback"}`
-    );
-    log?.(`[vs-bridge] written roundId=${state.current.roundId}`);
+    if (state.current.mode === "zenith") {
+      log?.(
+        `[vs-bridge] zenith bridge written sequence=${state.current.sequence} round_id=${state.current.round_id ?? state.current.roundId ?? ""} phase=${state.current.phase ?? "active"}`
+      );
+    } else {
+      log?.(
+        `[vs-bridge] readyAt offset_ms=${built.bridge.readyOffsetMs ?? 0} source=${built.bridge.readyOffsetSource ?? "precountdown_fallback"}`
+      );
+      log?.(`[vs-bridge] written roundId=${state.current.roundId}`);
+    }
   }
   return state.current;
 }
 
 function buildBridgeFromState(state, capturedAt) {
-  const selfUser = state.selfUser ?? {};
-  if (!selfUser.userid && !selfUser.username) {
+  const selfIdentity = state.sessionSelfIdentity ?? createEmptySessionSelfIdentity();
+  const zenithPlayers = getZenithPlayers(state, capturedAt);
+  const zenithMode = shouldBuildZenithBridge(state, zenithPlayers);
+  if (zenithMode) {
+    return buildZenithBridgeFromState(state, zenithPlayers, selfIdentity);
+  }
+  if (!selfIdentity.userid && !selfIdentity.username) {
     setWaitingReason(state, "self_user_missing");
     return null;
   }
@@ -308,14 +458,19 @@ function buildBridgeFromState(state, capturedAt) {
   const roundPlayers = [...state.roundPlayers.values()]
     .map((player) => withBackfilledRoundUsername(state, player))
     .filter((player) => player?.userid);
-  if (roundPlayers.length < 2) {
+  if (roundPlayers.length === 0) {
     setWaitingReason(state, "round_players_missing");
     return null;
   }
 
-  const localPlayer = resolveLocalPlayer(selfUser, roundPlayers);
+  const localPlayer = resolveLocalPlayer(selfIdentity, roundPlayers);
   if (!localPlayer) {
     setWaitingReason(state, "local_player_unresolved");
+    return null;
+  }
+
+  if (roundPlayers.length < 2) {
+    setWaitingReason(state, "round_players_missing");
     return null;
   }
 
@@ -367,27 +522,156 @@ function buildBridgeFromState(state, capturedAt) {
       readyAt,
       readyOffsetMs,
       readyOffsetSource: readyTiming.source,
-      local: summarizeBridgePlayer(localPlayer, state.selfUser),
+      local: summarizeBridgePlayer(localPlayer, selfIdentity),
       opponents: opponents.map((player) => summarizeBridgePlayer(player, null)),
       options
     }
   };
 }
 
-function updateSelfUserCache(state, root) {
-  const user = asPlainObject(root.user);
-  if (!user) {
-    return;
+function buildZenithBridgeFromState(state, zenithPlayers, selfIdentity) {
+  if (!selfIdentity.userid && !selfIdentity.username) {
+    setWaitingReason(state, "self_user_missing");
+    logZenithWaitingState(state, "self_user_missing");
+    return null;
   }
 
-  const userid = sanitizeScalar(user._id ?? user.userid ?? user.user_id);
-  const username = sanitizeScalar(user.username ?? user.name);
-  if (userid !== undefined) {
-    state.selfUser.userid = userid;
+  if (zenithPlayers.length === 0) {
+    setWaitingReason(state, "zenith_players_missing");
+    logZenithWaitingState(state, "zenith_players_missing");
+    return null;
   }
-  if (username !== undefined) {
-    state.selfUser.username = username;
+
+  const localPlayer = resolveLocalPlayer(selfIdentity, zenithPlayers);
+  if (!localPlayer) {
+    setWaitingReason(state, "local_zenith_player_missing");
+    logZenithWaitingState(state, "local_zenith_player_missing");
+    return null;
   }
+
+  const localOptions = asPlainObject(localPlayer.options);
+  const seed = sanitizeScalar(localOptions.seed);
+  const localGameId = sanitizeScalar(localPlayer.gameid ?? localOptions.gameid);
+  const session = resolveZenithSessionId(state, localPlayer);
+  if (
+    seed === undefined ||
+    localGameId === undefined ||
+    session === undefined ||
+    !isZenithBagtype(localOptions?.bagtype)
+  ) {
+    setWaitingReason(state, "local_zenith_options_incomplete");
+    logZenithWaitingState(state, "local_zenith_options_incomplete");
+    return null;
+  }
+
+  const local = summarizeBridgePlayer(localPlayer, selfIdentity);
+  const username =
+    sanitizeScalar(local.username) ??
+    sanitizeScalar(selfIdentity?.username) ??
+    null;
+  const userid = sanitizeScalar(local.userid) ?? null;
+  const options = {
+    bagtype: "zenith",
+    nextcount: sanitizeScalar(localOptions.nextcount),
+    boardwidth: sanitizeScalar(localOptions.boardwidth),
+    boardheight: sanitizeScalar(localOptions.boardheight)
+  };
+  if (!hasScalarKeys(options, ["bagtype", "nextcount", "boardwidth", "boardheight"])) {
+    setWaitingReason(state, "local_zenith_options_incomplete");
+    logZenithWaitingState(state, "local_zenith_options_incomplete");
+    return null;
+  }
+
+  const roundId = `zenith:${session}:${localGameId}:${seed}`;
+  return {
+    roomSeed: null,
+    bridge: {
+      mode: "zenith",
+      roundId,
+      round_id: roundId,
+      phase: "active",
+      bagtype: "zenith",
+      local: {
+        userid,
+        username,
+        gameid: localGameId,
+        seed
+      },
+      opponents: [],
+      options
+    }
+  };
+}
+
+function updateSelfUserCache(state, root, context = {}, log = state?.log ?? null) {
+  const requestId = sanitizeScalar(context.requestId ?? context.request_id) ?? null;
+  const requestState = ensureRequestIdentityState(state, requestId);
+  const envelope = summarizeIdentityEnvelope(root);
+  mergeRequestIdentityState(requestState, envelope);
+  for (const candidate of collectRootIdentityCandidates(root)) {
+    const identity = extractIdentityFromSource(candidate.source);
+    logIdentityCandidate(state, {
+      path: candidate.path,
+      source: candidate.source,
+      requestId,
+      marker: candidate.marker
+    }, log);
+    if (candidate.path === "root.user") {
+      observeParticipantIdentity(
+        state,
+        {
+          ...identity,
+          requestId,
+          sourcePath: candidate.path
+        },
+        log
+      );
+      if (requestState && identity.userid !== undefined) {
+        requestState.rootUserIds.add(String(identity.userid));
+      }
+      if (shouldTreatRootUserAsParticipantOnly(envelope, requestState)) {
+        clearPendingRootUserCandidate(state, requestId);
+        if (hasPinnedSessionSelfIdentity(state)) {
+          maybeLogIgnoredSelfCandidate(
+            state,
+            identity,
+            "participant_roster_identity",
+            log
+          );
+        }
+        continue;
+      }
+      if (requestId && !canUseRootUserAsSessionSelf(identity, envelope, requestState)) {
+        stagePendingRootUserCandidate(state, requestId, {
+          ...identity,
+          requestId,
+          session:
+            findZenithSessionValue(root) ??
+            findZenithSessionValue(context) ??
+            sanitizeScalar(state.zenithSession),
+          source: candidate.path
+        });
+        continue;
+      }
+    }
+    if (!candidate.trusted) {
+      continue;
+    }
+    pinSessionSelfIdentity(
+      state,
+      {
+        ...identity,
+        requestId,
+        session:
+          findZenithSessionValue(root) ??
+          findZenithSessionValue(context) ??
+          sanitizeScalar(state.zenithSession),
+        source: candidate.path
+      },
+      log
+    );
+  }
+  maybePromotePendingRootUserCandidate(state, requestId, log);
 }
 
 function updateRoomUsersCache(state, root) {
@@ -426,18 +710,40 @@ function updateRoundPlayersCache(state, root) {
     if (!source) {
       continue;
     }
-
+    const options = asPlainObject(source.options);
     const userid = sanitizeScalar(source.userid ?? source._id ?? source.user_id);
-    if (userid === undefined) {
-      continue;
-    }
-
     const gameid = sanitizeScalar(source.gameid ?? source?.options?.gameid);
     const username =
       sanitizeScalar(source.username ?? source.name ?? source?.options?.username) ??
       state.roomUsers.get(userid)?.username ??
       null;
-    const options = asPlainObject(source.options);
+    if (userid === undefined) {
+      if (
+        isZenithBagtype(options?.bagtype) &&
+        (gameid !== undefined || username !== null)
+      ) {
+        upsertZenithPlayerEntry(state, {
+          userid: undefined,
+          username,
+          gameid,
+          seed: sanitizeScalar(options?.seed),
+          bagtype: sanitizeScalar(options?.bagtype),
+          nextcount: sanitizeScalar(options?.nextcount),
+          boardwidth: sanitizeScalar(options?.boardwidth),
+          boardheight: sanitizeScalar(options?.boardheight),
+          lastSeenAt: Date.now(),
+          requestId: null,
+          sourcePath: "root.players",
+          options: {
+            ...pickScalarFields(
+              options,
+              ROOM_OPTION_KEYS.concat(["gameid", ...ZENITH_SESSION_KEYS])
+            )
+          }
+        });
+      }
+      continue;
+    }
 
     const hasRoundData =
       gameid !== undefined ||
@@ -462,10 +768,38 @@ function updateRoundPlayersCache(state, root) {
     if (options) {
       entry.options = {
         ...entry.options,
-        ...pickScalarFields(options, ROOM_OPTION_KEYS.concat(["gameid", "username"]))
+        ...pickScalarFields(
+          options,
+          ROOM_OPTION_KEYS.concat([
+            "gameid",
+            "username",
+            ...ZENITH_SESSION_KEYS
+          ])
+        )
       };
     }
     state.roundPlayers.set(userid, entry);
+    if (isZenithBagtype(entry.options?.bagtype)) {
+      upsertZenithPlayerEntry(state, {
+        userid,
+        username,
+        gameid: sanitizeScalar(entry.gameid ?? entry.options?.gameid),
+        seed: sanitizeScalar(entry.options?.seed),
+        bagtype: sanitizeScalar(entry.options?.bagtype),
+        nextcount: sanitizeScalar(entry.options?.nextcount),
+        boardwidth: sanitizeScalar(entry.options?.boardwidth),
+        boardheight: sanitizeScalar(entry.options?.boardheight),
+        lastSeenAt: Date.now(),
+        requestId: null,
+        sourcePath: "root.players",
+        options: {
+          ...pickScalarFields(
+            entry.options,
+            ROOM_OPTION_KEYS.concat(["gameid", ...ZENITH_SESSION_KEYS])
+          )
+        }
+      });
+    }
   }
 
   for (const [userid, entry] of state.roundPlayers.entries()) {
@@ -484,8 +818,20 @@ function updateRoomOptionsCache(state, root) {
 
   state.roomOptions = {
     ...state.roomOptions,
-    ...pickScalarFields(options, ROOM_OPTION_KEYS)
+    ...pickScalarFields(options, ROOM_OPTION_KEYS.concat(ZENITH_SESSION_KEYS))
   };
+}
+
+function updateZenithSessionCache(state, root, context = {}) {
+  const rootSession = findZenithSessionValue(root);
+  if (rootSession !== undefined) {
+    setZenithSessionValue(state, rootSession);
+    return;
+  }
+  const contextSession = findZenithSessionValue(context);
+  if (contextSession !== undefined) {
+    setZenithSessionValue(state, contextSession);
+  }
 }
 
 function updateRoundObservation(state, capturedAt) {
@@ -508,10 +854,14 @@ function updateRoundObservation(state, capturedAt) {
   }
 }
 
-function resolveLocalPlayer(selfUser, roundPlayers) {
-  if (selfUser.userid !== null && selfUser.userid !== undefined) {
+function resolveLocalPlayer(selfIdentity, roundPlayers) {
+  const sessionSelfIdentity = selfIdentity ?? {};
+  if (
+    sessionSelfIdentity.userid !== null &&
+    sessionSelfIdentity.userid !== undefined
+  ) {
     const matches = roundPlayers.filter(
-      (player) => player.userid === selfUser.userid
+      (player) => player.userid === sessionSelfIdentity.userid
     );
     if (matches.length === 1) {
       return matches[0];
@@ -519,23 +869,27 @@ function resolveLocalPlayer(selfUser, roundPlayers) {
     return null;
   }
 
-  if (selfUser.username !== null && selfUser.username !== undefined) {
-    const matches = roundPlayers.filter(
-      (player) => player.username === selfUser.username
-    );
-    if (matches.length === 1) {
-      return matches[0];
-    }
+  const fallbackUsername = normalizeIdentityName(sessionSelfIdentity.username);
+  if (fallbackUsername === null) {
+    return null;
+  }
+  const matches = roundPlayers.filter(
+    (player) =>
+      (player.userid === null || player.userid === undefined) &&
+      normalizeIdentityName(player.username) === fallbackUsername
+  );
+  if (matches.length === 1) {
+    return matches[0];
   }
 
   return null;
 }
 
-function summarizeBridgePlayer(player, selfUser = null) {
+function summarizeBridgePlayer(player, selfIdentity = null) {
   const summary = {
     username:
       sanitizeScalar(player?.username) ??
-      sanitizeScalar(selfUser?.username) ??
+      sanitizeScalar(selfIdentity?.username) ??
       null,
     userid: sanitizeScalar(player?.userid) ?? null,
     gameid: sanitizeScalar(player?.gameid ?? player?.options?.gameid) ?? null
@@ -587,17 +941,44 @@ function resolveReadyTiming(options) {
 }
 
 function maybeLogResolvedLocalPlayer(state, local, log) {
+  const localPlayer = local?.local ?? null;
   const signature = [
-    local?.username ?? "",
-    local?.userid ?? "",
-    local?.gameid ?? ""
+    local?.mode ?? "vs",
+    localPlayer?.username ?? "",
+    localPlayer?.userid ?? "",
+    localPlayer?.gameid ?? "",
+    localPlayer?.seed ?? "",
+    state.sessionSelfIdentity?.source ?? ""
   ].join("|");
   if (!signature || signature === state.lastLocalPlayerSignature) {
     return;
   }
   state.lastLocalPlayerSignature = signature;
+  if (local?.mode === "zenith") {
+    log?.(
+      `[vs-bridge] zenith local resolved userid=${localPlayer?.userid ?? "null"} username=${localPlayer?.username ?? "null"} gameid=${localPlayer?.gameid ?? "null"} seed=${localPlayer?.seed ?? "null"} self_source=${state.sessionSelfIdentity?.source ?? "unknown"}`
+    );
+    return;
+  }
   log?.(
-    `[vs-bridge] local player username=${local.username ?? "null"} userid=${local.userid ?? "null"} gameid=${local.gameid ?? "null"}`
+    `[vs-bridge] local player username=${localPlayer?.username ?? "null"} userid=${localPlayer?.userid ?? "null"} gameid=${localPlayer?.gameid ?? "null"}`
+  );
+}
+
+function logZenithWaitingState(state, reason) {
+  const selfUserid = sanitizeScalar(state.sessionSelfIdentity?.userid) ?? "null";
+  const signature = [
+    reason,
+    selfUserid,
+    state.zenithPlayersByGameId?.size ?? 0,
+    state.zenithPlayersByUserId?.size ?? 0
+  ].join("|");
+  if (signature === state.lastZenithWaitingSignature) {
+    return;
+  }
+  state.lastZenithWaitingSignature = signature;
+  state.log?.(
+    `[vs-bridge] zenith waiting reason=${reason} self_userid=${selfUserid} players_by_gameid=${state.zenithPlayersByGameId?.size ?? 0} players_by_userid=${state.zenithPlayersByUserId?.size ?? 0}`
   );
 }
 
@@ -627,6 +1008,14 @@ function displayPath(filePath) {
   return String(filePath).replace(/\\/g, "/");
 }
 
+function buildLogPath(filePath) {
+  const relative = path.relative(process.cwd(), filePath);
+  if (relative && !relative.startsWith("..") && !path.isAbsolute(relative)) {
+    return displayPath(relative);
+  }
+  return displayPath(filePath);
+}
+
 function normalizeTimestamp(value) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) {
@@ -644,6 +1033,665 @@ function asPlainObject(value) {
     return null;
   }
   return value;
+}
+
+function isConfirmedObserverSelfContext(context) {
+  if (!context || typeof context !== "object") {
+    return false;
+  }
+  return [context.local, context.self, context.me].some((value) => value === true);
+}
+
+function collectRootIdentityCandidates(root) {
+  const candidates = [];
+  pushRootIdentityCandidate(
+    candidates,
+    "root.user",
+    root?.user,
+    "participant_user",
+    true
+  );
+  pushRootIdentityCandidate(candidates, "root.account", root?.account, "account_packet", true);
+  pushRootIdentityCandidate(candidates, "root.context", root?.context, "context_packet", true);
+  pushRootIdentityCandidate(candidates, "root.self", root?.self, "self_path", true);
+  pushRootIdentityCandidate(candidates, "root.me", root?.me, "me_path", true);
+  pushRootIdentityCandidate(candidates, "root.session", root?.session, "session_packet", true);
+  if (
+    sanitizeScalar(root?._id ?? root?.userid ?? root?.user_id) !== undefined ||
+    sanitizeScalar(root?.username ?? root?.name) !== undefined
+  ) {
+    candidates.push({
+      path: "root",
+      source: root,
+      marker: "top_level_untrusted",
+      trusted: false
+    });
+  }
+  return candidates;
+}
+
+function pushRootIdentityCandidate(target, pathLabel, value, marker, trusted) {
+  const source = asPlainObject(value);
+  if (!source) {
+    return;
+  }
+  const userid = sanitizeScalar(source._id ?? source.userid ?? source.user_id);
+  const username = sanitizeScalar(source.username ?? source.name);
+  if (userid === undefined && username === undefined) {
+    return;
+  }
+  target.push({
+    path: pathLabel,
+    source,
+    marker,
+    trusted
+  });
+}
+
+function logIdentityCandidate(
+  state,
+  { path: pathLabel, source, requestId = null, marker = "" } = {},
+  log = state?.log ?? null
+) {
+  if (!state || typeof log !== "function") {
+    return false;
+  }
+  const userid = sanitizeScalar(source?._id ?? source?.userid ?? source?.user_id);
+  const username = sanitizeScalar(source?.username ?? source?.name);
+  if (userid === undefined && username === undefined) {
+    return false;
+  }
+  const signature = [
+    pathLabel ?? "",
+    userid ?? "",
+    username ?? "",
+    requestId ?? "",
+    marker ?? ""
+  ].join("|");
+  if (state.identityCandidateKeys?.has(signature)) {
+    return false;
+  }
+  state.identityCandidateKeys?.add(signature);
+  const keys = Object.keys(source ?? {}).sort().join(",");
+  log(
+    `[vs-bridge] identity candidate path=${pathLabel ?? "unknown"} keys=${keys || "-"} userid=${userid ?? "null"} username=${username ?? "null"} marker=${marker || "-"} request_id=${requestId ?? "null"}`
+  );
+  return true;
+}
+
+function describeIdentityMarker(source, fallback = "") {
+  const markers = [];
+  if (source?.local === true) {
+    markers.push("local");
+  }
+  if (source?.self === true) {
+    markers.push("self");
+  }
+  if (source?.me === true) {
+    markers.push("me");
+  }
+  return markers.length > 0 ? markers.join(",") : fallback;
+}
+
+function pinSessionSelfIdentity(state, identity, log = state?.log ?? null) {
+  if (!state) {
+    return false;
+  }
+  const userid = sanitizeScalar(identity?.userid);
+  const username = sanitizeScalar(identity?.username);
+  if (userid === undefined && username === undefined) {
+    return false;
+  }
+  const current = state.sessionSelfIdentity ?? createEmptySessionSelfIdentity();
+  if (
+    current.userid &&
+    userid &&
+    current.userid !== userid
+  ) {
+    maybeLogIgnoredSelfCandidate(state, identity, "pinned_self_preserved", log);
+    return false;
+  }
+  if (
+    !current.userid &&
+    current.username &&
+    username &&
+    current.username !== username
+  ) {
+    maybeLogIgnoredSelfCandidate(state, identity, "pinned_self_preserved", log);
+    return false;
+  }
+  const next = {
+    userid: userid ?? current.userid ?? null,
+    username: username ?? current.username ?? null,
+    gameid: sanitizeScalar(identity?.gameid) ?? current.gameid ?? null,
+    requestId:
+      sanitizeScalar(identity?.requestId ?? identity?.request_id) ??
+      current.requestId ??
+      null,
+    session:
+      sanitizeScalar(identity?.session) ??
+      current.session ??
+      sanitizeScalar(state.zenithSession) ??
+      null,
+    source: sanitizeScalar(identity?.source) ?? current.source ?? "unknown"
+  };
+  const signature = [
+    next.source ?? "",
+    next.userid ?? "",
+    next.username ?? "",
+    next.session ?? ""
+  ].join("|");
+  state.sessionSelfIdentity = next;
+  if (signature === state.lastSelfIdentitySignature) {
+    return true;
+  }
+  state.lastSelfIdentitySignature = signature;
+  log?.(
+    `[vs-bridge] self identity pinned source=${next.source ?? "unknown"} userid=${next.userid ?? "null"} username=${next.username ?? "null"} session=${next.session ?? "null"}`
+  );
+  return true;
+}
+
+function createEmptySessionSelfIdentity() {
+  return {
+    userid: null,
+    username: null,
+    gameid: null,
+    requestId: null,
+    session: null,
+    source: null
+  };
+}
+
+function extractIdentityFromSource(source) {
+  return {
+    userid: sanitizeScalar(source?._id ?? source?.userid ?? source?.user_id),
+    username: sanitizeScalar(source?.username ?? source?.name),
+    gameid: sanitizeScalar(source?.gameid ?? source?.game_id)
+  };
+}
+
+function ensureRequestIdentityState(state, requestId) {
+  if (!state || !requestId) {
+    return null;
+  }
+  if (!state.requestIdentityState.has(requestId)) {
+    state.requestIdentityState.set(requestId, {
+      requestId,
+      zenithSeen: false,
+      roundLikeSeen: false,
+      rootUserIds: new Set(),
+      playerUserIds: new Set(),
+      playerGameIds: new Set()
+    });
+  }
+  return state.requestIdentityState.get(requestId);
+}
+
+function mergeRequestIdentityState(requestState, envelope) {
+  if (!requestState || !envelope) {
+    return;
+  }
+  requestState.zenithSeen = requestState.zenithSeen || envelope.zenithSeen;
+  requestState.roundLikeSeen = requestState.roundLikeSeen || envelope.roundLikeSeen;
+  for (const userid of envelope.playerUserIds ?? []) {
+    requestState.playerUserIds.add(userid);
+  }
+  for (const gameid of envelope.playerGameIds ?? []) {
+    requestState.playerGameIds.add(gameid);
+  }
+}
+
+function noteZenithRequestCandidate(requestState, context, options) {
+  if (!requestState) {
+    return;
+  }
+  requestState.zenithSeen = true;
+  const userid = sanitizeScalar(context?.userid ?? context?.user_id);
+  const gameid = sanitizeScalar(context?.gameid ?? context?.game_id ?? options?.gameid);
+  if (userid !== undefined) {
+    requestState.playerUserIds.add(String(userid));
+  }
+  if (gameid !== undefined) {
+    requestState.playerGameIds.add(String(gameid));
+  }
+}
+
+function summarizeIdentityEnvelope(root) {
+  const playerUserIds = new Set();
+  const playerGameIds = new Set();
+  let zenithSeen = false;
+  let roundLikeSeen = false;
+  const pushPlayer = (value) => {
+    const source = asPlainObject(value);
+    if (!source) {
+      return;
+    }
+    const userid = sanitizeScalar(source.userid ?? source._id ?? source.user_id);
+    const gameid = sanitizeScalar(source.gameid ?? source?.options?.gameid);
+    const hasPlayerShape =
+      userid !== undefined ||
+      gameid !== undefined ||
+      asPlainObject(source.options) !== null ||
+      sanitizeScalar(source.naturalorder) !== undefined;
+    if (!hasPlayerShape) {
+      return;
+    }
+    roundLikeSeen = true;
+    if (userid !== undefined) {
+      playerUserIds.add(String(userid));
+    }
+    if (gameid !== undefined) {
+      playerGameIds.add(String(gameid));
+    }
+    if (
+      isZenithBagtype(source?.options?.bagtype) ||
+      isZenithBagtype(source?.bagtype)
+    ) {
+      zenithSeen = true;
+    }
+  };
+
+  if (isZenithBagtype(root?.options?.bagtype) || isZenithBagtype(root?.bagtype)) {
+    zenithSeen = true;
+  }
+  if (Array.isArray(root?.players)) {
+    if (root.players.length > 0) {
+      roundLikeSeen = true;
+    }
+    for (const player of root.players) {
+      pushPlayer(player);
+    }
+  }
+  pushPlayer(root?.player);
+  pushPlayer(root);
+
+  return {
+    zenithSeen,
+    roundLikeSeen,
+    playerUserIds,
+    playerGameIds
+  };
+}
+
+function canUseRootUserAsSessionSelf(identity, envelope, requestState) {
+  if (!identity || !envelope) {
+    return false;
+  }
+  if (envelope.zenithSeen || requestState?.zenithSeen) {
+    return false;
+  }
+  if (!envelope.roundLikeSeen && !requestState?.roundLikeSeen) {
+    return false;
+  }
+  if (identity.userid === undefined || identity.userid === null) {
+    return false;
+  }
+  const identityKey = String(identity.userid);
+  return (
+    envelope.playerUserIds.has(identityKey) ||
+    requestState?.playerUserIds?.has(identityKey) === true
+  );
+}
+
+function shouldTreatRootUserAsParticipantOnly(envelope, requestState) {
+  if (envelope?.zenithSeen) {
+    return true;
+  }
+  return shouldTreatRequestAsParticipantOnly(requestState);
+}
+
+function shouldTreatRequestAsParticipantOnly(requestState) {
+  if (!requestState) {
+    return false;
+  }
+  return requestState.zenithSeen || requestState.rootUserIds.size > 1;
+}
+
+function stagePendingRootUserCandidate(state, requestId, identity) {
+  if (!state || !requestId || !identity) {
+    return false;
+  }
+  const existing = state.pendingRequestSelfCandidates.get(requestId);
+  if (
+    existing &&
+    sanitizeScalar(existing.userid) !== undefined &&
+    sanitizeScalar(identity.userid) !== undefined &&
+    sanitizeScalar(existing.userid) !== sanitizeScalar(identity.userid)
+  ) {
+    state.pendingRequestSelfCandidates.delete(requestId);
+    return false;
+  }
+  state.pendingRequestSelfCandidates.set(requestId, identity);
+  return true;
+}
+
+function clearPendingRootUserCandidate(state, requestId) {
+  if (!state || !requestId) {
+    return false;
+  }
+  return state.pendingRequestSelfCandidates.delete(requestId);
+}
+
+function maybePromotePendingRootUserCandidate(state, requestId, log) {
+  if (!state || !requestId) {
+    return false;
+  }
+  const pending = state.pendingRequestSelfCandidates.get(requestId);
+  const requestState = state.requestIdentityState.get(requestId);
+  if (!pending || !requestState) {
+    return false;
+  }
+  if (shouldTreatRequestAsParticipantOnly(requestState)) {
+    state.pendingRequestSelfCandidates.delete(requestId);
+    return false;
+  }
+  if (!requestState.roundLikeSeen) {
+    return false;
+  }
+  if (
+    pending.userid !== undefined &&
+    pending.userid !== null &&
+    requestState.playerUserIds.size > 0 &&
+    !requestState.playerUserIds.has(String(pending.userid))
+  ) {
+    return false;
+  }
+  const changed = pinSessionSelfIdentity(state, pending, log);
+  state.pendingRequestSelfCandidates.delete(requestId);
+  return changed;
+}
+
+function observeParticipantIdentity(state, identity, log = state?.log ?? null) {
+  const userid = sanitizeScalar(identity?.userid);
+  const username = sanitizeScalar(identity?.username);
+  if (userid === undefined && username === undefined) {
+    return false;
+  }
+  const requestId = sanitizeScalar(identity?.requestId ?? identity?.request_id) ?? "null";
+  const sourcePath = sanitizeScalar(identity?.sourcePath) ?? "unknown";
+  const key = [requestId, sourcePath, userid ?? "", username ?? ""].join("|");
+  if (state.participantIdentities.has(key)) {
+    return false;
+  }
+  state.participantIdentities.set(key, {
+    userid: userid ?? null,
+    username: username ?? null,
+    requestId,
+    sourcePath
+  });
+  log?.(
+    `[vs-bridge] participant identity observed userid=${userid ?? "null"} username=${username ?? "null"} request_id=${requestId} source_path=${sourcePath}`
+  );
+  return true;
+}
+
+function hasPinnedSessionSelfIdentity(state) {
+  return Boolean(state?.sessionSelfIdentity?.userid || state?.sessionSelfIdentity?.username);
+}
+
+function maybeLogIgnoredSelfCandidate(
+  state,
+  identity,
+  reason,
+  log = state?.log ?? null
+) {
+  const userid = sanitizeScalar(identity?.userid) ?? "null";
+  const currentSelfUserid = sanitizeScalar(state?.sessionSelfIdentity?.userid) ?? "null";
+  const signature = [reason, userid, currentSelfUserid].join("|");
+  if (signature === state?.lastIgnoredSelfCandidateSignature) {
+    return false;
+  }
+  state.lastIgnoredSelfCandidateSignature = signature;
+  log?.(
+    `[vs-bridge] self candidate ignored reason=${reason} userid=${userid} current_self_userid=${currentSelfUserid}`
+  );
+  return true;
+}
+
+function normalizeBagtype(value) {
+  const scalar = sanitizeScalar(value);
+  if (scalar === undefined || scalar === null) {
+    return "";
+  }
+  return String(scalar).trim().toLowerCase();
+}
+
+function normalizeIdentityName(value) {
+  const scalar = sanitizeScalar(value);
+  if (scalar === undefined || scalar === null) {
+    return null;
+  }
+  const normalized = String(scalar).trim().toLowerCase();
+  return normalized ? normalized : null;
+}
+
+function findZenithSessionValue(value) {
+  const source = asPlainObject(value);
+  if (!source) {
+    return undefined;
+  }
+  for (const key of ZENITH_SESSION_KEYS) {
+    const scalar = sanitizeScalar(source[key]);
+    if (scalar !== undefined) {
+      return scalar;
+    }
+  }
+  const optionSource = asPlainObject(source.options);
+  if (!optionSource) {
+    return undefined;
+  }
+  for (const key of ZENITH_SESSION_KEYS) {
+    const scalar = sanitizeScalar(optionSource[key]);
+    if (scalar !== undefined) {
+      return scalar;
+    }
+  }
+  return undefined;
+}
+
+function setZenithSessionValue(state, value) {
+  const nextValue = sanitizeScalar(value);
+  if (nextValue === undefined) {
+    return false;
+  }
+  if (state.zenithSession === null || state.zenithSession === undefined) {
+    state.zenithSession = nextValue;
+    return true;
+  }
+  if (state.zenithSession === nextValue) {
+    return false;
+  }
+  state.zenithPlayersByGameId?.clear?.();
+  state.zenithPlayersByUserId?.clear?.();
+  state.zenithSession = nextValue;
+  state.lastZenithWaitingSignature = "";
+  return true;
+}
+
+function resolveZenithSessionId(state, localPlayer) {
+  const playerSession =
+    findZenithSessionValue(localPlayer) ??
+    findZenithSessionValue(localPlayer?.options);
+  if (playerSession !== undefined) {
+    return playerSession;
+  }
+  const roomSession =
+    findZenithSessionValue(state?.roomOptions) ??
+    sanitizeScalar(state?.zenithSession);
+  if (roomSession !== undefined) {
+    return roomSession;
+  }
+  return undefined;
+}
+
+function accumulateZenithPlayerCandidate(state, candidate) {
+  if (!state || !candidate) {
+    return false;
+  }
+  const options = asPlainObject(candidate.options);
+  if (!options || !isZenithBagtype(options.bagtype)) {
+    return false;
+  }
+  const context = asPlainObject(candidate.context);
+  const entry = {
+    userid: sanitizeScalar(context?.userid ?? context?.user_id),
+    username: sanitizeScalar(context?.username ?? context?.name),
+    gameid: sanitizeScalar(context?.gameid ?? context?.game_id ?? options?.gameid),
+    seed: sanitizeScalar(options.seed),
+    bagtype: sanitizeScalar(options.bagtype),
+    nextcount: sanitizeScalar(options.nextcount),
+    boardwidth: sanitizeScalar(options.boardwidth),
+    boardheight: sanitizeScalar(options.boardheight),
+    lastSeenAt: normalizeTimestamp(candidate.capturedAt ?? Date.now()),
+    requestId: sanitizeScalar(candidate.requestId ?? candidate.request_id) ?? null,
+    sourcePath: sanitizeScalar(candidate.path) ?? "unknown",
+    options: {
+      seed: sanitizeScalar(options.seed),
+      bagtype: sanitizeScalar(options.bagtype),
+      nextcount: sanitizeScalar(options.nextcount),
+      boardwidth: sanitizeScalar(options.boardwidth),
+      boardheight: sanitizeScalar(options.boardheight),
+      gameid: sanitizeScalar(options.gameid),
+      ...pickScalarFields(options, ZENITH_SESSION_KEYS)
+    }
+  };
+  if (entry.gameid === undefined && entry.userid === undefined) {
+    return false;
+  }
+  setZenithSessionValue(
+    state,
+    findZenithSessionValue(context) ?? findZenithSessionValue(options)
+  );
+  return upsertZenithPlayerEntry(state, entry);
+}
+
+function upsertZenithPlayerEntry(state, entry) {
+  const gameidKey =
+    entry.gameid === undefined || entry.gameid === null
+      ? null
+      : String(entry.gameid);
+  const useridKey =
+    entry.userid === undefined || entry.userid === null
+      ? null
+      : String(entry.userid);
+  const existing =
+    (gameidKey && state.zenithPlayersByGameId.get(gameidKey)) ??
+    (useridKey && state.zenithPlayersByUserId.get(useridKey)) ??
+    null;
+  const merged = mergeZenithPlayerEntry(existing, entry);
+  if (existing) {
+    const previousGameid =
+      existing.gameid === undefined || existing.gameid === null
+        ? null
+        : String(existing.gameid);
+    const previousUserid =
+      existing.userid === undefined || existing.userid === null
+        ? null
+        : String(existing.userid);
+    if (previousGameid && previousGameid !== gameidKey) {
+      state.zenithPlayersByGameId.delete(previousGameid);
+    }
+    if (previousUserid && previousUserid !== useridKey) {
+      state.zenithPlayersByUserId.delete(previousUserid);
+    }
+  }
+  if (gameidKey) {
+    state.zenithPlayersByGameId.set(gameidKey, merged);
+  }
+  if (useridKey) {
+    state.zenithPlayersByUserId.set(useridKey, merged);
+  }
+  return true;
+}
+
+function mergeZenithPlayerEntry(previous, incoming) {
+  const merged = {
+    userid: previous?.userid ?? null,
+    username: previous?.username ?? null,
+    gameid: previous?.gameid,
+    seed: previous?.seed,
+    bagtype: previous?.bagtype,
+    nextcount: previous?.nextcount,
+    boardwidth: previous?.boardwidth,
+    boardheight: previous?.boardheight,
+    lastSeenAt: Math.max(
+      0,
+      Number(previous?.lastSeenAt ?? 0),
+      Number(incoming?.lastSeenAt ?? 0)
+    ),
+    requestId: previous?.requestId ?? null,
+    sourcePath: previous?.sourcePath ?? "unknown",
+    options: {
+      ...(previous?.options ?? {})
+    }
+  };
+  for (const [key, value] of Object.entries(incoming ?? {})) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+    if (key === "options") {
+      merged.options = {
+        ...merged.options,
+        ...Object.fromEntries(
+          Object.entries(value).filter(([, nested]) => nested !== undefined && nested !== null)
+        )
+      };
+      continue;
+    }
+    merged[key] = value;
+  }
+  return merged;
+}
+
+function getZenithPlayers(state, now = Date.now()) {
+  const players = [];
+  const seen = new Set();
+  pruneStaleZenithPlayers(state, now);
+  for (const entry of state.zenithPlayersByGameId?.values?.() ?? []) {
+    if (!entry || seen.has(entry)) {
+      continue;
+    }
+    seen.add(entry);
+    players.push(entry);
+  }
+  for (const entry of state.zenithPlayersByUserId?.values?.() ?? []) {
+    if (!entry || seen.has(entry)) {
+      continue;
+    }
+    seen.add(entry);
+    players.push(entry);
+  }
+  return players;
+}
+
+function pruneStaleZenithPlayers(state, now = Date.now()) {
+  const cutoff = Math.max(0, Number(now ?? Date.now()) - ZENITH_PLAYER_STALE_MS);
+  for (const [gameid, entry] of state.zenithPlayersByGameId?.entries?.() ?? []) {
+    if (Number(entry?.lastSeenAt ?? 0) < cutoff) {
+      state.zenithPlayersByGameId.delete(gameid);
+    }
+  }
+  for (const [userid, entry] of state.zenithPlayersByUserId?.entries?.() ?? []) {
+    if (Number(entry?.lastSeenAt ?? 0) < cutoff) {
+      state.zenithPlayersByUserId.delete(userid);
+    }
+  }
+}
+
+function shouldBuildZenithBridge(state, zenithPlayers) {
+  if ((zenithPlayers?.length ?? 0) > 0) {
+    return true;
+  }
+  if (isZenithBagtype(state.roomOptions?.bagtype)) {
+    return true;
+  }
+  if (state.zenithSession) {
+    return true;
+  }
+  return [...(state.roundPlayers?.values?.() ?? [])].some((player) =>
+    isZenithBagtype(player?.options?.bagtype)
+  );
 }
 
 function walkBridgeObject(

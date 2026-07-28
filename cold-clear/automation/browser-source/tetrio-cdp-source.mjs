@@ -42,6 +42,9 @@ const DEFAULT_SUPPRESSED_REASON = "VS WebSocket simulation owns live state";
 const PERF_LOG_INTERVAL_MS = 2000;
 const DEFAULT_BOOTSTRAP_TRANSPORT_SETTLE_MS = 1500;
 const DEFAULT_BOOTSTRAP_FALLBACK_MS = 15000;
+export const RUNTIME_MODE_SOLO = "solo";
+export const RUNTIME_MODE_ZENITH = "zenith";
+export const RUNTIME_MODE_FRIENDLY_VS = "friendly_vs";
 const NEXT_GAME_INTERACTION_PHASE_INACTIVE = "inactive";
 const NEXT_GAME_INTERACTION_PHASE_POST_GAME_WATCH = "post_game_watch";
 const NEXT_GAME_INTERACTION_PHASE_REACQUIRING = "reacquiring";
@@ -98,6 +101,45 @@ export function resolveUseSeedSimulationFallback(
 
 export function isVsWsSimEnvEnabled(env = process.env) {
   return env?.FUSION_VS_WS_SIM === "1";
+}
+
+export function isZenithGameplayOptions(options) {
+  const bagtype = String(options?.bagtype ?? "")
+    .trim()
+    .toLowerCase();
+  return bagtype === "zenith";
+}
+
+export function normalizeRuntimeMode(value) {
+  const normalized = String(value ?? "")
+    .trim()
+    .toLowerCase();
+  if (normalized === RUNTIME_MODE_ZENITH) {
+    return RUNTIME_MODE_ZENITH;
+  }
+  if (normalized === RUNTIME_MODE_FRIENDLY_VS) {
+    return RUNTIME_MODE_FRIENDLY_VS;
+  }
+  return RUNTIME_MODE_SOLO;
+}
+
+export function isSoloModeSelected(controlState) {
+  return normalizeRuntimeMode(controlState?.selectedMode) === RUNTIME_MODE_SOLO;
+}
+
+export function isZenithModeSelected(controlState) {
+  return normalizeRuntimeMode(controlState?.selectedMode) === RUNTIME_MODE_ZENITH;
+}
+
+export function isFriendlyVsModeSelected(controlState) {
+  return (
+    normalizeRuntimeMode(controlState?.selectedMode) ===
+    RUNTIME_MODE_FRIENDLY_VS
+  );
+}
+
+export function isSoloModeActive(controlState) {
+  return Boolean(controlState?.botEnabled) && isSoloModeSelected(controlState);
 }
 
 export function shouldAttemptClosureCapture({
@@ -1226,7 +1268,9 @@ export function shouldLogClosureCaptureSkipped({
 
 export function createBrowserControlState() {
   return {
-    botEnabled: false
+    botEnabled: false,
+    selectedMode: RUNTIME_MODE_SOLO,
+    modeGeneration: 0
   };
 }
 
@@ -2348,20 +2392,49 @@ export function applyBrowserControlMessage({
   controlState,
   closureCaptureState,
   nextGameReacquireState = null,
+  onModeChanged = null,
+  onBotEnabled = null,
+  onBotDisabled = null,
   now = Date.now(),
   log = console.log,
   windowMs = DEFAULT_CAPTURE_ARMING_WINDOW_MS,
   bootstrapReady = true
 }) {
-  if (
-    !message ||
-    typeof message !== "object" ||
-    message.type !== "bot_enabled" ||
-    typeof message.enabled !== "boolean"
-  ) {
+  if (!controlState) {
     return false;
   }
-  if (!controlState) {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  if (message.type === "selected_mode") {
+    const nextMode = normalizeRuntimeMode(message.mode);
+    const nextGeneration = Math.max(0, Number(message.generation ?? 0));
+    if (
+      controlState.selectedMode === nextMode &&
+      Math.max(0, Number(controlState.modeGeneration ?? 0)) === nextGeneration
+    ) {
+      return false;
+    }
+    controlState.selectedMode = nextMode;
+    controlState.modeGeneration = nextGeneration;
+    cancelNextGameReacquire(nextGameReacquireState, {
+      reason: "mode_changed",
+      log
+    });
+    disarmClosureCaptureWindow(closureCaptureState, {
+      reason: "mode_changed",
+      log,
+      clearPending: true
+    });
+    log?.(`[mode] selected mode=${nextMode}`);
+    onModeChanged?.({
+      selectedMode: nextMode,
+      modeGeneration: nextGeneration,
+      botEnabled: Boolean(controlState.botEnabled)
+    });
+    return true;
+  }
+  if (message.type !== "bot_enabled" || typeof message.enabled !== "boolean") {
     return false;
   }
   if (controlState.botEnabled === message.enabled) {
@@ -2369,12 +2442,23 @@ export function applyBrowserControlMessage({
   }
   controlState.botEnabled = message.enabled;
   if (message.enabled) {
-    requestClosureCaptureArm(closureCaptureState, {
-      reason: "bot_on",
-      now,
-      bootstrapReady,
-      windowMs,
-      log
+    log?.(
+      `[mode] bot enabled mode=${normalizeRuntimeMode(
+        controlState.selectedMode
+      )} generation=${Math.max(0, Number(controlState.modeGeneration ?? 0))}`
+    );
+    if (isSoloModeSelected(controlState)) {
+      requestClosureCaptureArm(closureCaptureState, {
+        reason: "bot_on",
+        now,
+        bootstrapReady,
+        windowMs,
+        log
+      });
+    }
+    onBotEnabled?.({
+      selectedMode: normalizeRuntimeMode(controlState.selectedMode),
+      modeGeneration: Math.max(0, Number(controlState.modeGeneration ?? 0))
     });
   } else {
     cancelNextGameReacquire(nextGameReacquireState, {
@@ -2385,6 +2469,13 @@ export function applyBrowserControlMessage({
       reason: "bot_off",
       log,
       clearPending: true
+    });
+    log?.(
+      `[mode] bot disabled mode=${normalizeRuntimeMode(controlState.selectedMode)}`
+    );
+    onBotDisabled?.({
+      selectedMode: normalizeRuntimeMode(controlState.selectedMode),
+      modeGeneration: Math.max(0, Number(controlState.modeGeneration ?? 0))
     });
   }
   return true;
@@ -2651,6 +2742,52 @@ async function main() {
   let lastPerfLoggedAt = Date.now();
   let loopStartedAt = Date.now();
   let maxEventLoopDelayMs = 0;
+  const notifyObserverTargetReset = (reason = "browser_target_reset") => {
+    try {
+      dddWsObserverCleanup?.notifyTargetReset?.(reason);
+    } catch {}
+  };
+  const notifyObserverBootstrapReady = () => {
+    try {
+      dddWsObserverCleanup?.notifyBootstrapReady?.();
+    } catch {}
+  };
+  const notifyObserverModeControl = () => {
+    try {
+      dddWsObserverCleanup?.setModeControl?.({
+        selectedMode: normalizeRuntimeMode(browserControlState.selectedMode),
+        botEnabled: Boolean(browserControlState.botEnabled),
+        modeGeneration: Math.max(0, Number(browserControlState.modeGeneration ?? 0))
+      });
+    } catch {}
+  };
+  const clearModeRuntimeState = (reason = "mode_change") => {
+    cancelNextGameReacquire(nextGameReacquireState, {
+      reason,
+      log: (message) => console.log(message)
+    });
+    cancelPostGameInteractionWatch(postGameInteractionWatchState, {
+      reason,
+      log: (message) => console.log(message)
+    });
+    disarmClosureCaptureWindow(closureCaptureState, {
+      reason,
+      log: (message) => console.log(message),
+      clearPending: true
+    });
+    resetGameStartSignalState(gameStartSignalState);
+    resetSnapshotTracking(snapshotTracking);
+    probeState.lastCaptureAt = 0;
+    waitingForNextGame = false;
+    waitingForNextGameSignalCutoffAt = 0;
+    endedHandled = false;
+    lastReason = "";
+    lastReasonAt = 0;
+    clearSnapshotFile(snapshotPath);
+    console.log(
+      `[mode] runtime state cleared mode=${normalizeRuntimeMode(browserControlState.selectedMode)}`
+    );
+  };
   try {
     const { installDddWsObserver } =
       await import("./ddd-ws-observer.mjs");
@@ -2683,6 +2820,12 @@ async function main() {
         }
       },
       onGameOptions: ({ signature, options, capturedAt }) => {
+        if (!isSoloModeActive(browserControlState)) {
+          return;
+        }
+        if (isZenithGameplayOptions(options)) {
+          return;
+        }
         const now = Number.isFinite(capturedAt) ? capturedAt : Date.now();
         const countdownMs = estimateCountdownWait(options);
         noteSoloGameStartSignal(gameStartSignalState, {
@@ -2704,6 +2847,7 @@ async function main() {
     });
 
     console.log("[ws-observer] installed");
+    notifyObserverModeControl();
   } catch (error) {
     console.log(
       `[ws-observer] installation failed: ${
@@ -2727,17 +2871,22 @@ async function main() {
       log: (message) => console.log(message)
     }).catch(() => undefined);
   await installInteractionTrackerForCurrentDocument();
+  notifyObserverTargetReset("initial_target_state");
   console.log("[browser] browser target state reset");
   if (useRibbonWebsocket) {
     await installRibbonMonitor(cdp, network, msgpack, bootstrapState, {
-      onGameplaySignal: ({ key, source, details }) =>
+      onGameplaySignal: ({ key, source, details }) => {
+        if (!isSoloModeActive(browserControlState)) {
+          return;
+        }
         noteSoloGameStartSignal(gameStartSignalState, {
           key,
           source,
           now: Date.now(),
           details,
           log: (message) => console.log(message)
-        })
+        });
+      }
     });
   }
   const resetBrowserTargetState = ({ resetConnectedAt = false } = {}) => {
@@ -2759,6 +2908,9 @@ async function main() {
       reason: "browser_reset",
       log: (message) => console.log(message)
     });
+    notifyObserverTargetReset(
+      resetConnectedAt ? "page_navigation" : "execution_context_reset"
+    );
     console.log("[browser] browser target state reset");
   };
   cdp.on("Page.frameNavigated", (event) => {
@@ -2805,6 +2957,17 @@ async function main() {
       controlState: browserControlState,
       closureCaptureState,
       nextGameReacquireState,
+      onModeChanged: () => {
+        notifyObserverModeControl();
+        clearModeRuntimeState("mode_change");
+      },
+      onBotEnabled: () => {
+        notifyObserverModeControl();
+      },
+      onBotDisabled: () => {
+        notifyObserverModeControl();
+        clearModeRuntimeState("bot_off");
+      },
       bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
       log: (entry) => console.log(entry)
     });
@@ -2860,6 +3023,19 @@ async function main() {
         Math.max(0, loopNow - (loopStartedAt + pollMs))
       );
       loopStartedAt = loopNow;
+      if (!isSoloModeActive(browserControlState)) {
+        const perfUpdate = maybeLogBrowserPerf({
+          browserPerfEnabled,
+          lastPerfLoggedAt,
+          maxEventLoopDelayMs
+        });
+        if (perfUpdate) {
+          lastPerfLoggedAt = perfUpdate.lastPerfLoggedAt;
+          maxEventLoopDelayMs = perfUpdate.maxEventLoopDelayMs;
+        }
+        await sleep(pollMs);
+        continue;
+      }
       const previousGameplayPhase = String(probeState.lastGameplayPhase ?? "inactive");
       const state = await readTetrioState(cdp, {
         probePageState,
@@ -2880,11 +3056,12 @@ async function main() {
         perfEnabled: browserPerfEnabled,
         initialCaptureSignalProbe: true,
         targetUrl: target.url ?? "",
-        candidateTraceEnabled: closureCandidateTraceEnabled
+        candidateTraceEnabled: closureCandidateTraceEnabled,
+        onBootstrapReady: notifyObserverBootstrapReady
       });
 
       if (
-        browserControlState.botEnabled &&
+        isSoloModeActive(browserControlState) &&
         !waitingForNextGame &&
         !postGameInteractionWatchState.active &&
         previousGameplayPhase === "playing" &&
@@ -2967,7 +3144,7 @@ async function main() {
           transientState,
           log: (message) => console.log(message)
         });
-        if (browserControlState.botEnabled) {
+        if (isSoloModeActive(browserControlState)) {
           startNextGameReacquire(nextGameReacquireState, {
             now: Date.now(),
             epoch: gameEpoch,
@@ -3052,7 +3229,7 @@ async function main() {
       }
 
       if (
-        browserControlState.botEnabled &&
+        isSoloModeActive(browserControlState) &&
         waitingForNextGame &&
         hasUnconsumedGameStartSignal(gameStartSignalState, {
           since: waitingForNextGameSignalCutoffAt
@@ -3504,6 +3681,9 @@ function inspectRibbonPayload(
   for (const decoded of candidates) {
     const options = findOptionsObject(decoded);
     if (options?.seed !== undefined && options?.bagtype !== undefined) {
+      if (isZenithGameplayOptions(options)) {
+        return;
+      }
       const countdownMs = estimateCountdownWait(options);
       network.seed = String(options.seed);
       network.nextCount = Math.max(
@@ -4087,6 +4267,7 @@ export async function readTetrioState(cdp, options) {
     options.endedGameCandidate ?? createEndedGameCandidateState();
   const waitingForNextGame = Boolean(options.waitingForNextGame);
   const verboseReacquireLogs = options.verboseReacquireLogs === true;
+  const soloBotEnabled = isSoloModeActive(browserControlState);
   if (
     nextGameReacquireState.active &&
     nextGameReacquireState.interactionPhase === NEXT_GAME_INTERACTION_PHASE_INACTIVE
@@ -4142,7 +4323,7 @@ export async function readTetrioState(cdp, options) {
     options.probePageState &&
     !options.suppressClosureCapture &&
     !bootstrapReady &&
-    (browserControlState.botEnabled ||
+    (soloBotEnabled ||
       hasPendingClosureCaptureArm(closureCaptureState) ||
       isClosureCaptureArmed(closureCaptureState, now)) &&
     shouldLogBootstrapBlocked(bootstrapState, bootstrapReason, now)
@@ -4157,6 +4338,9 @@ export async function readTetrioState(cdp, options) {
     bootstrapJustBecameReady &&
     !bootstrapState.readyLogged
   ) {
+    try {
+      options.onBootstrapReady?.();
+    } catch {}
     log("[browser] TETR.IO bootstrap ready; closure capture enabled");
     bootstrapState.readyLogged = true;
   }
@@ -4238,7 +4422,7 @@ export async function readTetrioState(cdp, options) {
     options.probePageState &&
     !options.suppressClosureCapture &&
     bootstrapReady &&
-    browserControlState.botEnabled &&
+    soloBotEnabled &&
     !state.ok &&
     !nextGameReacquireState.active &&
     !postGameInteractionWatchState.active &&
@@ -4286,7 +4470,7 @@ export async function readTetrioState(cdp, options) {
     options.probePageState &&
     !options.suppressClosureCapture &&
     bootstrapReady &&
-    browserControlState.botEnabled &&
+    soloBotEnabled &&
     nextGameReacquireState.interactionPhase !==
       NEXT_GAME_INTERACTION_PHASE_CAPTURED_WAITING_START &&
     (
@@ -4297,7 +4481,7 @@ export async function readTetrioState(cdp, options) {
     options.probePageState &&
     !options.suppressClosureCapture &&
     bootstrapReady &&
-    browserControlState.botEnabled &&
+    soloBotEnabled &&
     (
       (nextGameReacquireState.active && waitingForNextGame) ||
       (postGameInteractionWatchState.active &&
@@ -4525,7 +4709,7 @@ export async function readTetrioState(cdp, options) {
         )}`
       );
       if (
-        browserControlState.botEnabled &&
+        soloBotEnabled &&
         isTrustedNextGameInteraction(interaction) &&
         generation > Math.max(0, Number(postGameInteractionWatchState.provisionalArmedGeneration ?? 0))
       ) {
@@ -4592,7 +4776,7 @@ export async function readTetrioState(cdp, options) {
     options.probePageState &&
     !options.suppressClosureCapture &&
     bootstrapJustBecameReady &&
-    browserControlState.botEnabled &&
+    soloBotEnabled &&
     !state.ok &&
     closureCaptureState.armedReason !== "next_game_user_interaction" &&
     !isProvisionalClosureCaptureReason(closureCaptureState.armedReason) &&
@@ -4611,7 +4795,7 @@ export async function readTetrioState(cdp, options) {
     }
   }
   const carriedInteractionExpected =
-    browserControlState.botEnabled &&
+    soloBotEnabled &&
     waitingForNextGame &&
     nextGameReacquireState.active &&
     hasUnhandledCarriedPostGameInteraction(nextGameReacquireState);

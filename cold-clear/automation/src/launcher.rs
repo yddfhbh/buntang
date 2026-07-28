@@ -66,6 +66,32 @@ enum ModePreset {
     Custom,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuntimeMode {
+    Solo,
+    Zenith,
+    FriendlyVs,
+}
+
+impl RuntimeMode {
+    fn label(self) -> &'static str {
+        match self {
+            RuntimeMode::Solo => "Solo",
+            RuntimeMode::Zenith => "Zenith",
+            RuntimeMode::FriendlyVs => "Friendly VS",
+        }
+    }
+
+    fn control_value(self) -> &'static str {
+        match self {
+            RuntimeMode::Solo => "solo",
+            RuntimeMode::Zenith => "zenith",
+            RuntimeMode::FriendlyVs => "friendly_vs",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum BrowserStatus {
     Closed,
@@ -148,6 +174,9 @@ impl InputStatus {
 #[serde(default)]
 struct LauncherState {
     preset: ModePreset,
+    selected_mode: RuntimeMode,
+    bot_enabled: bool,
+    mode_generation: u64,
     snapshot_provider: SnapshotProviderConfig,
     scanner_config_path: String,
     snapshot_path: String,
@@ -180,6 +209,9 @@ impl Default for LauncherState {
     fn default() -> Self {
         Self {
             preset: ModePreset::VsLeft1080p,
+            selected_mode: RuntimeMode::Solo,
+            bot_enabled: false,
+            mode_generation: 0,
             snapshot_provider: SnapshotProviderConfig::BrowserCdp,
             scanner_config_path: "automation/scan-config.vs-left-1080p.json".to_owned(),
             snapshot_path: "automation/live-snapshot.json".to_owned(),
@@ -488,6 +520,7 @@ impl LauncherApp {
         let mut state = load_launcher_state(&paths).unwrap_or_default();
         state.ensure_scanner_config_path();
         state.migrate_legacy_defaults();
+        state.bot_enabled = false;
         let (event_tx, event_rx) = mpsc::channel();
         Self {
             paths,
@@ -552,6 +585,7 @@ impl LauncherApp {
     }
 
     fn save_state(&mut self) {
+        self.state.bot_enabled = self.bot_desired_enabled;
         if let Err(err) = save_launcher_state(&self.paths, &self.state) {
             self.push_log(format!("[launcher] failed to save launcher state: {err:#}"));
         } else {
@@ -622,6 +656,14 @@ impl LauncherApp {
                     return;
                 }
             };
+        if let Err(err) = snapshot_provider.set_selected_mode(
+            self.state.selected_mode.control_value(),
+            self.state.mode_generation,
+        ) {
+            self.push_log(format!(
+                "[browser] failed to forward selected mode to snapshot provider: {err:#}"
+            ));
+        }
 
         self.push_log("[input] connecting");
         let input_backend = match BrowserCdpInputBackend::shared(&self.paths, &config) {
@@ -676,6 +718,34 @@ impl LauncherApp {
                 self.bot_desired_enabled = false;
                 self.push_log("[launcher] bot on blocked: browser runtime is not ready");
             }
+            return;
+        }
+
+        if self.state.selected_mode != RuntimeMode::Solo {
+            if mode == BotStartMode::UserInitiated {
+                self.save_state();
+                self.push_log("[launcher] bot on");
+            }
+            if let Some(session) = self.browser_session.as_mut() {
+                if let Err(err) = session.snapshot_provider.set_bot_enabled(true) {
+                    self.push_log(format!(
+                        "[browser] failed to forward bot on state to snapshot provider: {err:#}"
+                    ));
+                    self.bot_status = BotStatus::Error;
+                    if mode == BotStartMode::UserInitiated {
+                        self.bot_desired_enabled = false;
+                    }
+                    return;
+                }
+            }
+            self.bot_status = BotStatus::On;
+            self.bot_waiting_for_next_game = false;
+            self.bot_restart_pending = false;
+            self.push_log(format!(
+                "[mode] bot enabled mode={} generation={}",
+                self.state.selected_mode.control_value(),
+                self.state.mode_generation
+            ));
             return;
         }
 
@@ -827,6 +897,35 @@ impl LauncherApp {
             }
         }
         self.bot_status = BotStatus::Off;
+    }
+
+    fn select_mode(&mut self, next_mode: RuntimeMode) {
+        if self.state.selected_mode == next_mode {
+            return;
+        }
+        if self.bot_desired_enabled
+            || self.bot_session.is_some()
+            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On)
+        {
+            self.stop_bot_with_browser_hint(self.browser_session.is_some());
+        }
+        self.state.selected_mode = next_mode;
+        self.state.mode_generation = self.state.mode_generation.saturating_add(1);
+        self.push_log(format!(
+            "[mode] selected mode={}",
+            self.state.selected_mode.control_value()
+        ));
+        if let Some(session) = self.browser_session.as_mut() {
+            if let Err(err) = session.snapshot_provider.set_selected_mode(
+                self.state.selected_mode.control_value(),
+                self.state.mode_generation,
+            ) {
+                self.push_log(format!(
+                    "[browser] failed to forward selected mode to snapshot provider: {err:#}"
+                ));
+            }
+        }
+        self.save_state();
     }
 
     fn close_browser(&mut self) {
@@ -1007,6 +1106,9 @@ impl LauncherApp {
     }
 
     fn maybe_resume_bot_runner(&mut self) {
+        if self.state.selected_mode != RuntimeMode::Solo {
+            return;
+        }
         if !self.bot_restart_pending || !self.bot_desired_enabled || self.bot_session.is_some() {
             return;
         }
@@ -1108,7 +1210,9 @@ impl eframe::App for LauncherApp {
         )));
 
         let browser_locked = self.browser_session.is_some();
-        let bot_locked = self.bot_session.is_some();
+        let bot_locked = self.bot_desired_enabled
+            || self.bot_session.is_some()
+            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On);
         let can_turn_bot_on = self.browser_status == BrowserStatus::Ready
             && self.input_status == InputStatus::Ready
             && matches!(
@@ -1186,6 +1290,22 @@ impl eframe::App for LauncherApp {
             if bot_locked {
                 ui.small("플레이 스타일은 다음 Bot ON부터 적용됩니다.");
             }
+            ui.horizontal(|ui| {
+                ui.label("Mode");
+                let current_mode = self.state.selected_mode;
+                for mode in [
+                    RuntimeMode::Solo,
+                    RuntimeMode::Zenith,
+                    RuntimeMode::FriendlyVs,
+                ] {
+                    if ui
+                        .selectable_label(current_mode == mode, mode.label())
+                        .clicked()
+                    {
+                        self.select_mode(mode);
+                    }
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label(BOT_UI_VISIBLE_LABELS[0]);
                 ui.add_enabled_ui(!bot_locked, |ui| {
@@ -1375,8 +1495,43 @@ fn extract_resumed_epoch_from_bot_log(line: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use serde_json::json;
+
+    fn test_paths(test_name: &str) -> AppPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "automation-launcher-tests-{test_name}-{}-{unique}",
+            std::process::id()
+        ));
+        let automation = root.join("automation");
+        let _ = fs::create_dir_all(automation.join("browser-source"));
+        let _ = fs::create_dir_all(automation.join("scripts"));
+        AppPaths {
+            workspace_root: root.clone(),
+            launcher_state_path: automation.join("launcher-state.json"),
+            scanner_script_path: automation.join("scripts").join("screen_scanner.py"),
+            browser_host_script_path: automation
+                .join("browser-source")
+                .join("tetrio-browser-host.mjs"),
+            browser_snapshot_script_path: automation
+                .join("browser-source")
+                .join("tetrio-cdp-source.mjs"),
+            browser_input_script_path: automation
+                .join("browser-source")
+                .join("browser-cdp-input.mjs"),
+        }
+    }
+
+    fn cleanup_test_paths(paths: &AppPaths) {
+        let _ = fs::remove_dir_all(&paths.workspace_root);
+    }
 
     #[test]
     fn built_in_preset_uses_safe_defaults() {
@@ -1479,6 +1634,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(state.play_style, PlayStyleConfig::Normal);
+    }
+
+    #[test]
+    fn default_selected_mode_is_solo() {
+        let state = LauncherState::default();
+        assert_eq!(state.selected_mode, RuntimeMode::Solo);
+        assert!(!state.bot_enabled);
+        assert_eq!(state.mode_generation, 0);
     }
 
     #[test]
@@ -1593,6 +1756,28 @@ mod tests {
         assert_eq!(extract_snapshot_epoch("browser-2-0"), Some(2));
         assert_eq!(extract_snapshot_epoch("browser-17-42"), Some(17));
         assert_eq!(extract_snapshot_epoch("scanner-2-0"), None);
+    }
+
+    #[test]
+    fn mode_change_increments_generation_and_stops_active_bot_state() {
+        let paths = test_paths("mode-change");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.mode_generation = 4;
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+
+        app.select_mode(RuntimeMode::Zenith);
+
+        assert_eq!(app.state.selected_mode, RuntimeMode::Zenith);
+        assert_eq!(app.state.mode_generation, 5);
+        assert!(!app.bot_desired_enabled);
+        assert_eq!(app.bot_status, BotStatus::Off);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[mode] selected mode=zenith"));
+
+        cleanup_test_paths(&paths);
     }
 
     #[test]

@@ -101,6 +101,29 @@ impl ProviderProcess {
         Ok(())
     }
 
+    pub fn set_selected_mode(&mut self, mode: &str, generation: u64) -> Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        let payload = serde_json::json!({
+            "type": "selected_mode",
+            "mode": mode,
+            "generation": generation
+        });
+        let serialized = serde_json::to_vec(&payload)
+            .context("failed to encode browser provider selected_mode control message")?;
+        stdin
+            .write_all(&serialized)
+            .context("failed to send browser provider selected_mode control message")?;
+        stdin
+            .write_all(b"\n")
+            .context("failed to terminate browser provider selected_mode control message")?;
+        stdin
+            .flush()
+            .context("failed to flush browser provider selected_mode control message")?;
+        Ok(())
+    }
+
     pub fn start_prewarmed(
         paths: &AppPaths,
         config: &AutomationConfig,

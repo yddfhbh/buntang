@@ -12,9 +12,11 @@ import path from "node:path";
 
 import {
   decodeGameOptionsCandidates,
+  decodeGameOptionsCandidateRecords,
   findGameOptions,
   installDddWsObserver,
   sanitizeGameOptions,
+  shouldEmitSoloSignalForGameOptions,
   split87Frame,
   tryUnpackAtOffsets
 } from "./ddd-ws-observer.mjs";
@@ -89,6 +91,53 @@ function readJsonLines(filePath) {
   }
 
   return content.split("\n").map((line) => JSON.parse(line));
+}
+
+function readJson(filePath) {
+  return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+async function flushObserverWork() {
+  await new Promise((resolve) => setImmediate(resolve));
+  await Promise.resolve();
+}
+
+function setObserverMode(cleanup, mode, generation = 1, botEnabled = true) {
+  cleanup.setModeControl?.({
+    selectedMode: mode,
+    modeGeneration: generation,
+    botEnabled
+  });
+}
+
+function createManualTimerHarness() {
+  const queue = [];
+  return {
+    setTimeoutFn(callback, delayMs) {
+      const entry = { callback, delayMs, cleared: false };
+      queue.push(entry);
+      return entry;
+    },
+    clearTimeoutFn(entry) {
+      if (entry) {
+        entry.cleared = true;
+      }
+    },
+    runNext() {
+      while (queue.length > 0) {
+        const entry = queue.shift();
+        if (entry.cleared) {
+          continue;
+        }
+        entry.callback();
+        return entry.delayMs;
+      }
+      return null;
+    },
+    get pendingCount() {
+      return queue.filter((entry) => !entry.cleared).length;
+    }
+  };
 }
 
 function vsRoundPayload({
@@ -263,6 +312,96 @@ test("findGameOptions skips sensitive-key subtrees", () => {
   assert.equal(result, null);
 });
 
+test("root.player.options context is accumulated", () => {
+  const [candidate] = decodeGameOptionsCandidateRecords(
+    {
+      player: {
+        userid: "local-id",
+        username: "hebi_",
+        gameid: 6001,
+        options: {
+          seed: 111,
+          bagtype: "zenith",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      }
+    },
+    () => {
+      throw new Error("unused");
+    }
+  );
+
+  assert.equal(candidate.path, "root.player");
+  assert.deepEqual(candidate.context, {
+    username: "hebi_",
+    userid: "local-id",
+    gameid: 6001
+  });
+});
+
+test("root.options context is accumulated", () => {
+  const [candidate] = decodeGameOptionsCandidateRecords(
+    {
+      userid: "local-id",
+      username: "hebi_",
+      gameid: 6002,
+      session: "zenith-session-2",
+      options: {
+        seed: 112,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    },
+    () => {
+      throw new Error("unused");
+    }
+  );
+
+  assert.equal(candidate.path, "root");
+  assert.deepEqual(candidate.context, {
+    username: "hebi_",
+    userid: "local-id",
+    gameid: 6002,
+    session: "zenith-session-2"
+  });
+});
+
+test("indexed root player options are accumulated", () => {
+  const [candidate] = decodeGameOptionsCandidateRecords(
+    [
+      null,
+      {
+        player: {
+          userid: "guest-id",
+          username: "guest",
+          gameid: 6003,
+          options: {
+            seed: 113,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      }
+    ],
+    () => {
+      throw new Error("unused");
+    }
+  );
+
+  assert.equal(candidate.path, "root[1].player");
+  assert.deepEqual(candidate.context, {
+    username: "guest",
+    userid: "guest-id",
+    gameid: 6003
+  });
+});
+
 test("same option signature logs only once", async () => {
   const cdp = new FakeCdp();
   const logs = [];
@@ -329,13 +468,14 @@ test("same option signature can be captured again after the dedupe window", asyn
 
   Date.now = () => now;
   try {
-    await installDddWsObserver(cdp, {
+    const cleanup = await installDddWsObserver(cdp, {
       unpack: () => {
         throw new Error("unused");
       },
       log: (line) => logs.push(line),
       onGameOptions: (entry) => captured.push(entry)
     });
+    setObserverMode(cleanup, "solo");
 
     cdp.emit("Network.webSocketFrameReceived", {
       requestId: "req-1",
@@ -360,6 +500,7 @@ test("same option signature can be captured again after the dedupe window", asyn
         payloadData: payload
       }
     });
+    cleanup();
   } finally {
     Date.now = originalDateNow;
   }
@@ -454,7 +595,7 @@ test("observer stays inactive when msgpack unpack is unavailable", async () => {
   cleanup();
 });
 
-test("VS sim OFF leaves bridge logging and files untouched", async () => {
+test("passive producer starts without FUSION_VS_WS_SIM and creates the first bridge file", async () => {
   const cdp = new FakeCdp();
   const logs = [];
   const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
@@ -464,14 +605,21 @@ test("VS sim OFF leaves bridge logging and files untouched", async () => {
       unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
       log: (line) => logs.push(line),
       vsSimEnabled: false,
-      vsBridgePath: filePath
+      vsBridgePath: filePath,
+      resolveSessionSelfIdentity: async () => ({
+        userid: "local-id",
+        username: "hebi_",
+        source: "page_session_probe"
+      })
     });
+    setObserverMode(cleanup, "zenith", 1, false);
 
     cdp.emit("Network.webSocketFrameReceived", {
       requestId: "req-1",
       response: {
         opcode: 1,
         payloadData: JSON.stringify({
+          session: "zenith-session-1",
           user: { _id: "local-id", username: "hebi_" },
           players: [
             {
@@ -479,7 +627,7 @@ test("VS sim OFF leaves bridge logging and files untouched", async () => {
               gameid: 5449,
               options: {
                 seed: 1744077373,
-                bagtype: "7-bag",
+                bagtype: "zenith",
                 nextcount: 5,
                 boardwidth: 10,
                 boardheight: 20
@@ -490,7 +638,7 @@ test("VS sim OFF leaves bridge logging and files untouched", async () => {
               gameid: 5450,
               options: {
                 seed: 1744077373,
-                bagtype: "7-bag",
+                bagtype: "zenith",
                 nextcount: 5,
                 boardwidth: 10,
                 boardheight: 20
@@ -500,14 +648,335 @@ test("VS sim OFF leaves bridge logging and files untouched", async () => {
         })
       }
     });
+    await flushObserverWork();
+    assert.equal(existsSync(filePath), false);
+
+    setObserverMode(cleanup, "zenith", 1, true);
+    cleanup.notifyBootstrapReady();
+    await flushObserverWork();
 
     cleanup();
 
-    assert.equal(existsSync(filePath), false);
-    assert.equal(logs.some((line) => line.startsWith("[vs-bridge]")), false);
+    assert.equal(existsSync(filePath), true);
+    assert.ok(logs.includes("[vs-bridge] observer attached mode=passive"));
+    assert.ok(logs.some((line) => line.startsWith("[vs-bridge] producer enabled path=")));
+    assert.ok(
+      logs.some((line) =>
+        line.startsWith("[vs-bridge] self identity pinned source=page_session_probe userid=local-id username=hebi_")
+      )
+    );
+    assert.ok(
+      logs.some((line) =>
+        line.startsWith("[vs-bridge] zenith bridge written sequence=1 round_id=zenith:zenith-session-1:5449:1744077373 phase=active")
+      )
+    );
+    assert.ok(logs.includes("[zenith] prebuffer replayed candidates=2"));
   } finally {
     cleanupTempDir(dir);
   }
+});
+
+test("trusted page session probe can pin self before zenith roster users arrive", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: false,
+      vsBridgePath: filePath,
+      resolveSessionSelfIdentity: async () => ({
+        userid: "local-id",
+        username: "hebi_",
+        source: "page_session_probe"
+      })
+    });
+    setObserverMode(cleanup, "zenith", 1, false);
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-zenith",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          session: "zenith-session-1",
+          user: { _id: "guest-id", username: "guest" },
+          players: [
+            {
+              userid: "local-id",
+              gameid: 6001,
+              options: {
+                seed: 2001,
+                bagtype: "zenith",
+                nextcount: 5,
+                boardwidth: 10,
+                boardheight: 20
+              }
+            },
+            {
+              userid: "guest-id",
+              gameid: 6002,
+              options: {
+                seed: 2001,
+                bagtype: "zenith",
+                nextcount: 5,
+                boardwidth: 10,
+                boardheight: 20
+              }
+            }
+          ]
+        })
+      }
+    });
+    await flushObserverWork();
+    assert.equal(existsSync(filePath), false);
+
+    setObserverMode(cleanup, "zenith", 1, true);
+    cleanup.notifyBootstrapReady();
+    await flushObserverWork();
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.local.userid, "local-id");
+    assert.equal(bridge.round_id, "zenith:zenith-session-1:6001:2001");
+    assert.ok(
+      logs.some((line) =>
+        line.startsWith("[vs-bridge] participant identity observed userid=guest-id username=guest")
+      )
+    );
+    cleanup();
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("page session probe retries after not_ready and resolves from bootstrap-ready page state", async () => {
+  const timers = createManualTimerHarness();
+  const logs = [];
+  const cdp = {
+    listeners: new Map(),
+    sent: [],
+    async send(method, params = {}) {
+      this.sent.push({ method, params });
+      if (method === "Network.enable") {
+        return {};
+      }
+      if (method === "Runtime.evaluate") {
+        const window = {
+          document: { readyState: this.sent.length < 3 ? "loading" : "complete" },
+          __NUXT__: {
+            state: {
+              session: {
+                user: {
+                  _id: "local-id",
+                  username: "hebi_"
+                }
+              }
+            }
+          }
+        };
+        window.window = window;
+        const result = await import("node:vm").then(({ default: vm }) =>
+          vm.runInNewContext(params.expression, { window })
+        );
+        return { result: { value: result } };
+      }
+      return {};
+    },
+    on(method, handler) {
+      const listeners = this.listeners.get(method) ?? new Set();
+      listeners.add(handler);
+      this.listeners.set(method, listeners);
+      return () => listeners.delete(handler);
+    },
+    emit(method, params) {
+      for (const handler of this.listeners.get(method) ?? []) {
+        handler(params);
+      }
+    }
+  };
+
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    sessionSelfProbeRetryMs: 200,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn
+  });
+
+  setObserverMode(cleanup, "zenith");
+  cleanup.notifyTargetReset("test_reset");
+  cdp.emit("Network.webSocketCreated", {
+    requestId: "req-bootstrap",
+    url: "wss://spool.tetr.io/socket"
+  });
+  await flushObserverWork();
+  assert.equal(
+    logs.some((line) => line.includes("page session probe started")),
+    false
+  );
+  assert.equal(timers.pendingCount, 0);
+
+  cleanup.notifyBootstrapReady();
+  await flushObserverWork();
+  assert.ok(
+    logs.some((line) =>
+      line.includes("page session probe result status=not_ready")
+    )
+  );
+  assert.equal(timers.pendingCount, 1);
+
+  assert.equal(timers.runNext(), 200);
+  await flushObserverWork();
+
+  assert.ok(
+    logs.some((line) =>
+      line.includes(
+        "page session probe result status=resolved userid=local-id username=hebi_ source_path=window.__NUXT__.state.session.user"
+      )
+    )
+  );
+  assert.equal(timers.pendingCount, 0);
+  cleanup();
+});
+
+test("page session probe retry loop stays bounded and does not duplicate per generation", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const timers = createManualTimerHarness();
+  let attempts = 0;
+
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    resolveSessionSelfIdentity: async () => {
+      attempts += 1;
+      throw new Error(`probe_${attempts}`);
+    },
+    sessionSelfProbeRetryMs: 200,
+    sessionSelfProbeMaxAttempts: 5,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn
+  });
+
+  setObserverMode(cleanup, "zenith");
+  cdp.emit("Network.webSocketCreated", {
+    requestId: "req-bounded",
+    url: "wss://spool.tetr.io/socket"
+  });
+  cdp.emit("Network.webSocketCreated", {
+    requestId: "req-bounded-2",
+    url: "wss://spool.tetr.io/socket"
+  });
+  await flushObserverWork();
+  assert.equal(timers.pendingCount, 0);
+
+  cleanup.notifyBootstrapReady();
+  await flushObserverWork();
+  assert.equal(timers.pendingCount, 1);
+
+  while (timers.runNext() !== null) {
+    await flushObserverWork();
+  }
+
+  assert.equal(
+    logs.filter((line) => line.includes("page session probe started")).length,
+    5
+  );
+  assert.equal(
+    logs.filter((line) => line.includes("page session probe result status=error")).length,
+    5
+  );
+  assert.equal(timers.pendingCount, 0);
+  cleanup();
+});
+
+test("target reset cancels stale probe retries and allows a fresh generation", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const timers = createManualTimerHarness();
+  let callCount = 0;
+
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    resolveSessionSelfIdentity: async () => {
+      callCount += 1;
+      return callCount === 1
+        ? { status: "not_found" }
+        : { userid: "local-id", username: "hebi_", source: "page_session_probe" };
+    },
+    sessionSelfProbeRetryMs: 200,
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn
+  });
+
+  setObserverMode(cleanup, "zenith");
+  cleanup.notifyBootstrapReady();
+  await flushObserverWork();
+  assert.equal(timers.pendingCount, 1);
+
+  cleanup.notifyTargetReset("generation_two");
+  assert.equal(timers.pendingCount, 0);
+  cleanup.notifyBootstrapReady();
+  await flushObserverWork();
+
+  assert.ok(
+    logs.some((line) =>
+      line.includes("page session probe reset reason=generation_two target_generation=3")
+    )
+  );
+  assert.ok(
+    logs.some((line) =>
+      line.includes("self identity pinned source=page_session_probe userid=local-id username=hebi_")
+    )
+  );
+  cleanup();
+});
+
+test("passive producer does not emit zenith options as Solo activation signals", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const captures = [];
+
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
+    },
+    log: (line) => logs.push(line),
+    vsSimEnabled: false,
+    onGameOptions: (entry) => captures.push(entry)
+  });
+
+  cdp.emit("Network.webSocketFrameReceived", {
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify({
+        options: {
+          seed: 1744077373,
+          bagtype: "zenith",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      })
+    }
+  });
+
+  cleanup();
+
+  assert.deepEqual(captures, []);
+  assert.equal(
+    logs.some((line) => line.includes("solo signal queued") || line.includes("solo signal candidate")),
+    false
+  );
+  assert.ok(logs.includes("[ws-observer] game options captured"));
 });
 
 test("VS bridge initialization failure does not stop the observer", async () => {
@@ -538,6 +1007,7 @@ test("observer callback fires only when active state or roundId changes", async 
     vsSimEnabled: true,
     onVsRoundStatus: (status) => statuses.push(status)
   });
+  setObserverMode(cleanup, "friendly_vs");
 
   cdp.emit("Network.webSocketCreated", {
     requestId: "req-vs-1",
@@ -568,6 +1038,12 @@ test("observer callback fires only when active state or roundId changes", async 
   cleanup();
 
   assert.deepEqual(statuses, [
+    {
+      active: false,
+      roundId: "",
+      localGameId: "",
+      seed: ""
+    },
     {
       active: true,
       roundId: "5449:1744077373",
@@ -602,6 +1078,7 @@ test("observer callback errors do not stop frame handling", async () => {
       throw new Error("status callback failure");
     }
   });
+  setObserverMode(cleanup, "friendly_vs");
 
   assert.doesNotThrow(() => {
     cdp.emit("Network.webSocketFrameReceived", {
@@ -615,6 +1092,61 @@ test("observer callback errors do not stop frame handling", async () => {
 
   cleanup();
   assert.ok(logs.some((line) => line.startsWith("[vs-bridge] written roundId=")));
+});
+
+test("bot off keeps passive listener attached but does not start page probes or write a bridge", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: false,
+      vsBridgePath: filePath
+    });
+    setObserverMode(cleanup, "zenith", 7, false);
+
+    cdp.emit("Network.webSocketCreated", {
+      requestId: "req-passive",
+      url: "wss://spool.tetr.io/socket"
+    });
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-passive",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify({
+          session: "zenith-passive",
+          players: [
+            {
+              userid: "local-id",
+              gameid: 7001,
+              options: {
+                seed: 3001,
+                bagtype: "zenith",
+                nextcount: 5,
+                boardwidth: 10,
+                boardheight: 20
+              }
+            }
+          ]
+        })
+      }
+    });
+    await flushObserverWork();
+
+    assert.ok(cdp.listeners.size > 0);
+    assert.ok(logs.includes("[mode] passive websocket listener active mode=zenith"));
+    assert.equal(
+      logs.some((line) => line.includes("page session probe started")),
+      false
+    );
+    assert.equal(existsSync(filePath), false);
+    cleanup();
+  } finally {
+    cleanupTempDir(dir);
+  }
 });
 
 test("trace file is not created when trace env is absent", async () => {

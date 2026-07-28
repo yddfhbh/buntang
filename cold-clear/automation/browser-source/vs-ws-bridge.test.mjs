@@ -9,8 +9,11 @@ import {
   collectVsIncomingGarbage,
   createVsBridgeState,
   deriveVsRoundBridge,
+  ingestVsBridgeSessionSelfIdentity,
+  ingestVsBridgeOptionsCandidate,
   ingestVsBridgeRoot,
   markVsBridgeInactive,
+  resetVsBridgeZenithAccumulator,
   updateVsBridgeState,
   writeVsBridgeFile
 } from "./vs-ws-bridge.mjs";
@@ -149,6 +152,51 @@ function combinedRoundRoot(overrides = {}) {
   };
 }
 
+function zenithRoundRoot(overrides = {}) {
+  return {
+    session: "zenith-session-1",
+    user: {
+      _id: "local-id",
+      username: "Hebi_"
+    },
+    players: [
+      {
+        userid: "local-id",
+        username: "Hebi_",
+        gameid: 1111,
+        options: {
+          gameid: 1111,
+          seed: 5678,
+          bagtype: "zenith",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      }
+    ],
+    ...overrides
+  };
+}
+
+function zenithFlatOptionsRoot(overrides = {}) {
+  return {
+    session: "zenith-session-flat",
+    player: {
+      userid: "local-id",
+      username: "hebi_",
+      gameid: 7101,
+      options: {
+        seed: 9911,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    },
+    ...overrides
+  };
+}
+
 test("createVsBridgeState logs its enabled absolute bridge path", () => {
   const logs = [];
   const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, (line) => logs.push(line));
@@ -159,9 +207,7 @@ test("createVsBridgeState logs its enabled absolute bridge path", () => {
     /\/cold-clear\/automation\/vs-ws-bridge\.json$/
   );
   assert.ok(
-    logs.includes(
-      `[vs-bridge] enabled path=${state.bridgeFilePath.replace(/\\/g, "/")}`
-    )
+    logs.some((line) => line.startsWith("[vs-bridge] producer enabled path="))
   );
 });
 
@@ -192,6 +238,674 @@ test("deriveVsRoundBridge computes readyAt from room countdown options", () => {
   assert.equal(result.bridge.readyAt, capturedAt + 3000);
   assert.equal(result.bridge.readyOffsetMs, 3000);
   assert.equal(result.bridge.readyOffsetSource, "countdown");
+});
+
+test("zenith resolves local player by root userid before observer identity and writes passive bridge", () => {
+  const result = deriveVsRoundBridge(
+    zenithRoundRoot({
+      user: {
+        _id: "guest-id",
+        username: "guest-user"
+      },
+      context: {
+        _id: "local-id",
+        username: "VISIBLE_ROOT"
+      },
+      players: [
+        {
+          userid: "local-id",
+          username: "VISIBLE_ROOT",
+          gameid: 4321,
+          options: {
+            gameid: 4321,
+            seed: 9876,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "observer-id",
+          username: "observer-user",
+          gameid: 4322,
+          options: {
+            gameid: 4322,
+            seed: 9876,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    }),
+    1000
+  );
+
+  assert.ok(result);
+  assert.equal(result.bridge.mode, "zenith");
+  assert.equal(result.bridge.round_id, "zenith:zenith-session-1:4321:9876");
+  assert.equal(result.bridge.local.userid, "local-id");
+  assert.equal(result.bridge.local.username, "VISIBLE_ROOT");
+  assert.equal(result.bridge.local.gameid, 4321);
+  assert.equal(result.bridge.local.seed, 9876);
+  assert.deepEqual(result.bridge.opponents, []);
+  assert.deepEqual(result.bridge.options, {
+    bagtype: "zenith",
+    nextcount: 5,
+    boardwidth: 10,
+    boardheight: 20
+  });
+});
+
+test("zenith resolves local player from observer userid before username fallback", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+
+  try {
+    const state = createVsBridgeState(filePath, () => {});
+    ingestVsBridgeOptionsCandidate(state, {
+      options: {
+        seed: 5678,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      },
+      context: {
+        local: true,
+        userid: "player-b",
+        username: "HEBI_"
+      }
+    });
+    ingestVsBridgeRoot(
+      state,
+      zenithRoundRoot({
+        user: null,
+        players: [
+          {
+            userid: "player-a",
+            username: "hebi_",
+            gameid: 7001,
+            options: {
+              gameid: 7001,
+              seed: 5678,
+              bagtype: "zenith",
+              nextcount: 5,
+              boardwidth: 10,
+              boardheight: 20
+            }
+          },
+          {
+            userid: "player-b",
+            username: "hebi_",
+            gameid: 7002,
+            options: {
+              gameid: 7002,
+              seed: 5678,
+              bagtype: "zenith",
+              nextcount: 5,
+              boardwidth: 10,
+              boardheight: 20
+            }
+          }
+        ]
+      }),
+      { timestamp: 1000 }
+    );
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.local.userid, "player-b");
+    assert.equal(bridge.local.gameid, 7002);
+    assert.equal(bridge.round_id, "zenith:zenith-session-1:7002:5678");
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("zenith falls back to normalized username only when userid is unavailable", () => {
+  const result = deriveVsRoundBridge(
+    zenithRoundRoot({
+      context: {
+        username: "HEBI_"
+      },
+      players: [
+        {
+          username: "hebi_",
+          gameid: 9001,
+          options: {
+            gameid: 9001,
+            seed: 5678,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          username: "guest",
+          gameid: 9002,
+          options: {
+            gameid: 9002,
+            seed: 5678,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+      ]
+    }),
+    1000
+  );
+
+  assert.ok(result);
+  assert.equal(result.bridge.local.userid, null);
+  assert.equal(result.bridge.local.gameid, 9001);
+});
+
+test("many-player zenith bridge does not require an opponent entry", () => {
+  const result = deriveVsRoundBridge(
+    zenithRoundRoot({
+      context: {
+        userid: "local-id",
+        username: "hebi_"
+      },
+      players: [
+        {
+          userid: "local-id",
+          username: "hebi_",
+          gameid: 1111,
+          options: {
+            gameid: 1111,
+            seed: 5678,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "other-1",
+          username: "other-1",
+          gameid: 1112,
+          options: {
+            gameid: 1112,
+            seed: 5678,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "other-2",
+          username: "other-2",
+          gameid: 1113,
+          options: {
+            gameid: 1113,
+            seed: 5678,
+            bagtype: "zenith",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    }),
+    1000
+  );
+
+  assert.ok(result);
+  assert.equal(result.bridge.local.userid, "local-id");
+  assert.deepEqual(result.bridge.opponents, []);
+});
+
+test("duplicate flattened options update one zenith player entry", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  const candidate = {
+    path: "root.player.options",
+    context: {
+      userid: "local-id",
+      username: "hebi_",
+      gameid: 7101
+    },
+    options: {
+      seed: 9911,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  };
+
+  ingestVsBridgeOptionsCandidate(state, candidate);
+  ingestVsBridgeOptionsCandidate(state, {
+    ...candidate,
+    options: {
+      ...candidate.options,
+      nextcount: 6
+    }
+  });
+
+  assert.equal(state.zenithPlayersByGameId.size, 1);
+  assert.equal(state.zenithPlayersByUserId.size, 1);
+  assert.equal(
+    state.zenithPlayersByGameId.get("7101")?.nextcount,
+    6
+  );
+});
+
+test("identity before options creates bridge", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+
+  try {
+    const state = createVsBridgeState(filePath, () => {});
+    ingestVsBridgeSessionSelfIdentity(state, {
+      userid: "local-id",
+      username: "hebi_",
+      source: "trusted_session_packet"
+    });
+    ingestVsBridgeOptionsCandidate(state, {
+      path: "root.player.options",
+      context: {
+        userid: "local-id",
+        username: "hebi_",
+        gameid: 7101,
+        session: "zenith-session-flat"
+      },
+      options: {
+        seed: 9911,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    });
+    ingestVsBridgeRoot(state, zenithFlatOptionsRoot(), { timestamp: 1001 });
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.round_id, "zenith:zenith-session-flat:7101:9911");
+    assert.equal(bridge.local.userid, "local-id");
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("options before identity creates bridge", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+
+  try {
+    const state = createVsBridgeState(filePath, () => {});
+    ingestVsBridgeOptionsCandidate(state, {
+      path: "root.player.options",
+      context: {
+        userid: "local-id",
+        username: "hebi_",
+        gameid: 7101,
+        session: "zenith-session-flat"
+      },
+      options: {
+        seed: 9911,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    });
+    ingestVsBridgeRoot(state, zenithFlatOptionsRoot({ user: null }), { timestamp: 1000 });
+    assert.equal(state.lastWaitingReason, "self_user_missing");
+    ingestVsBridgeSessionSelfIdentity(state, {
+      userid: "local-id",
+      username: "hebi_",
+      source: "trusted_session_packet"
+    });
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.round_id, "zenith:zenith-session-flat:7101:9911");
+    assert.equal(bridge.local.userid, "local-id");
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("zenith bridge does not require original players array", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+
+  try {
+    const state = createVsBridgeState(filePath, () => {});
+    ingestVsBridgeOptionsCandidate(state, {
+      path: "root.player.options",
+      context: {
+        userid: "local-id",
+        username: "hebi_",
+        gameid: 7101,
+        session: "zenith-session-flat"
+      },
+      options: {
+        seed: 9911,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    });
+    ingestVsBridgeSessionSelfIdentity(state, {
+      userid: "local-id",
+      username: "hebi_",
+      session: "zenith-session-flat",
+      source: "trusted_session_packet"
+    });
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.round_id, "zenith:zenith-session-flat:7101:9911");
+    assert.deepEqual(bridge.opponents, []);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("arbitrary standalone user object is not accepted as self", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    context: {
+      userid: "other-id",
+      username: "other",
+      gameid: 7102,
+      session: "zenith-session-flat"
+    },
+    options: {
+      seed: 9912,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+  ingestVsBridgeRoot(state, {
+    _id: "standalone-user",
+    username: "standalone"
+  }, { timestamp: 1000 });
+
+  assert.equal(state.lastWaitingReason, "self_user_missing");
+});
+
+test("missing self reports self_user_missing", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    context: {
+      userid: "guest-id",
+      username: "guest",
+      gameid: 7201,
+      session: "zenith-session-flat"
+    },
+    options: {
+      seed: 9921,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+  ingestVsBridgeRoot(state, { session: "zenith-session-flat" }, { timestamp: 1000 });
+
+  assert.equal(state.lastWaitingReason, "self_user_missing");
+});
+
+test("accumulated players without a local match report local_zenith_player_missing", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    context: {
+      userid: "guest-id",
+      username: "guest",
+      gameid: 7202,
+      session: "zenith-session-flat"
+    },
+    options: {
+      seed: 9922,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+  ingestVsBridgeSessionSelfIdentity(state, {
+    userid: "local-id",
+    username: "hebi_",
+    session: "zenith-session-flat",
+    source: "trusted_session_packet"
+  });
+
+  assert.equal(state.lastWaitingReason, "local_zenith_player_missing");
+});
+
+test("target reset clears Zenith accumulator", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeSessionSelfIdentity(state, {
+    userid: "local-id",
+    username: "hebi_",
+    source: "trusted_session_packet"
+  });
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    context: {
+      userid: "local-id",
+      username: "hebi_",
+      gameid: 7301,
+      session: "zenith-session-flat"
+    },
+    options: {
+      seed: 9931,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+
+  assert.equal(state.zenithPlayersByGameId.size, 1);
+  assert.equal(resetVsBridgeZenithAccumulator(state), true);
+  assert.equal(state.zenithPlayersByGameId.size, 0);
+  assert.equal(state.zenithPlayersByUserId.size, 0);
+  assert.equal(state.zenithSession, null);
+  assert.equal(state.sessionSelfIdentity.userid, null);
+});
+
+test("roster root.user is treated as participant, not self", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    requestId: "req-zenith",
+    context: {
+      userid: "guest-id",
+      username: "guest",
+      gameid: 8001
+    },
+    options: {
+      seed: 5511,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+  ingestVsBridgeRoot(state, {
+    user: {
+      _id: "guest-id",
+      username: "guest"
+    }
+  }, { requestId: "req-zenith", timestamp: 1000 });
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.participantIdentities.size, 1);
+  assert.equal(state.lastWaitingReason, "self_user_missing");
+});
+
+test("multiple root.user candidates in one request never overwrite session self", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeSessionSelfIdentity(state, {
+    userid: "local-id",
+    username: "hebi_",
+    source: "trusted_session_packet"
+  });
+
+  ingestVsBridgeRoot(state, {
+    user: {
+      _id: "guest-a",
+      username: "guest-a"
+    }
+  }, { requestId: "req-zenith", timestamp: 1000 });
+  ingestVsBridgeRoot(state, {
+    user: {
+      _id: "guest-b",
+      username: "guest-b"
+    }
+  }, { requestId: "req-zenith", timestamp: 1001 });
+
+  assert.equal(state.sessionSelfIdentity.userid, "local-id");
+  assert.equal(state.participantIdentities.size, 2);
+});
+
+test("participant root.user before trusted self leaves self unresolved", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeRoot(state, {
+    user: {
+      _id: "guest-id",
+      username: "guest"
+    }
+  }, { requestId: "req-zenith", timestamp: 1000 });
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+});
+
+test("trusted session packet pins self identity", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeRoot(state, {
+    context: {
+      userid: "local-id",
+      username: "hebi_"
+    }
+  }, { timestamp: 1000 });
+
+  assert.equal(state.sessionSelfIdentity.userid, "local-id");
+  assert.equal(state.sessionSelfIdentity.source, "root.context");
+});
+
+test("pinned self ignores later participant identities", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeSessionSelfIdentity(state, {
+    userid: "local-id",
+    username: "hebi_",
+    source: "trusted_session_packet"
+  });
+
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    requestId: "req-zenith",
+    context: {
+      userid: "guest-id",
+      username: "guest",
+      gameid: 8002
+    },
+    options: {
+      seed: 5512,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+  ingestVsBridgeRoot(state, {
+    user: {
+      _id: "guest-id",
+      username: "guest"
+    }
+  }, { requestId: "req-zenith", timestamp: 1000 });
+
+  assert.equal(state.sessionSelfIdentity.userid, "local-id");
+});
+
+test("userid match takes precedence over username", () => {
+  const { dir, filePath } = makeTempBridgeFile();
+
+  try {
+    const state = createVsBridgeState(filePath, () => {});
+    ingestVsBridgeSessionSelfIdentity(state, {
+      userid: "player-b",
+      username: "hebi_",
+      source: "trusted_session_packet"
+    });
+    ingestVsBridgeOptionsCandidate(state, {
+      path: "root.player.options",
+      context: {
+        userid: "player-a",
+        username: "hebi_",
+        gameid: 8101,
+        session: "zenith-session-flat"
+      },
+      options: {
+        seed: 9913,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    });
+    ingestVsBridgeOptionsCandidate(state, {
+      path: "root.player.options",
+      context: {
+        userid: "player-b",
+        username: "hebi_",
+        gameid: 8102,
+        session: "zenith-session-flat"
+      },
+      options: {
+        seed: 9913,
+        bagtype: "zenith",
+        nextcount: 5,
+        boardwidth: 10,
+        boardheight: 20
+      }
+    });
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.local.userid, "player-b");
+    assert.equal(bridge.local.gameid, 8102);
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("unrelated participant with the same username is not selected", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  ingestVsBridgeSessionSelfIdentity(state, {
+    userid: "local-id",
+    username: "hebi_",
+    source: "trusted_session_packet"
+  });
+  ingestVsBridgeOptionsCandidate(state, {
+    path: "root.player.options",
+    context: {
+      userid: "other-id",
+      username: "hebi_",
+      gameid: 8201,
+      session: "zenith-session-flat"
+    },
+    options: {
+      seed: 9914,
+      bagtype: "zenith",
+      nextcount: 5,
+      boardwidth: 10,
+      boardheight: 20
+    }
+  });
+
+  assert.equal(state.lastWaitingReason, "local_zenith_player_missing");
 });
 
 test("deriveVsRoundBridge falls back to precountdown when countdown metadata is invalid", () => {

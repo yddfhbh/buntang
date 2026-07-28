@@ -42,6 +42,7 @@ import {
   isBootstrapReadyForClosureCapture,
   isClosureCaptureArmed,
   isGameplayExpectedForClosureCapture,
+  isZenithGameplayOptions,
   isTransientRuntimeError,
   isVsWsSimEnvEnabled,
   isTetrioGameEndedState,
@@ -302,6 +303,17 @@ test("VS sim env detection only enables suppression for env value 1", () => {
   assert.equal(isVsWsSimEnvEnabled({}), false);
   assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "0" }), false);
   assert.equal(isVsWsSimEnvEnabled({ FUSION_VS_WS_SIM: "1" }), true);
+});
+
+test("zenith options are not treated as Solo activation signals", () => {
+  assert.equal(
+    isZenithGameplayOptions({ bagtype: "zenith", seed: 1, nextcount: 5 }),
+    true
+  );
+  assert.equal(
+    isZenithGameplayOptions({ bagtype: "7-bag", seed: 1, nextcount: 5 }),
+    false
+  );
 });
 
 test("closure capture probe is skipped when gameplay is not expected", () => {
@@ -1317,6 +1329,25 @@ test("locator hint failure falls back to the paused scope scan", async () => {
       "[browser] fast closure locator miss; retaining locator cache and falling back to scan"
     )
   );
+});
+
+test("actual Solo game-start signals remain unchanged", () => {
+  const signalState = createGameStartSignalState();
+  assert.equal(
+    noteGameStartSignal(signalState, {
+      key: "ddd:solo-seed",
+      source: "ddd_game_options",
+      now: 10_000,
+      details: { bagtype: "7-bag" }
+    }),
+    true
+  );
+  assert.deepEqual(consumeGameStartSignal(signalState), {
+    key: "0:ddd_game_options:ddd:solo-seed",
+    source: "ddd_game_options",
+    seenAt: 10_000,
+    details: { bagtype: "7-bag" }
+  });
 });
 
 test("cached locator is invalidated only after an actual property lookup failure", async () => {
@@ -5200,4 +5231,36 @@ test("captureTetrioGame source still keeps raf and setTimeout breakpoints", () =
     source,
     /for \(const expression of \["window\.requestAnimationFrame", "window\.setTimeout"\]\)/
   );
+});
+
+test("passive bridge producer remains installed in connect_only mode", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.match(source, /const connectOnly = args\.connectOnly === "1";/);
+  assert.match(source, /dddWsObserverCleanup = await installDddWsObserver\(cdp, \{/);
+  assert.doesNotMatch(source, /if \(!connectOnly\)\s*\{[\s\S]{0,400}installDddWsObserver/);
+});
+
+test("page session probe lifecycle is wired to target reset and bootstrap ready", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.match(source, /notifyObserverTargetReset\("initial_target_state"\);/);
+  assert.match(
+    source,
+    /notifyObserverTargetReset\(\s*resetConnectedAt \? "page_navigation" : "execution_context_reset"\s*\);/
+  );
+  assert.match(source, /onBootstrapReady: notifyObserverBootstrapReady/);
+  assert.match(source, /options\.onBootstrapReady\?\.\(\);/);
+});
+
+test("zenith ribbon seeds do not create Solo generations", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.match(source, /if \(isZenithGameplayOptions\(options\)\) \{\s*return;\s*\}/);
 });

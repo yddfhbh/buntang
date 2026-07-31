@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  buildDiagnosticWsEnvelopeRecord,
   decodeGameOptionsCandidates,
   decodeGameOptionsCandidateRecords,
   findGameOptions,
@@ -1815,4 +1816,102 @@ test("decodeGameOptionsCandidates inspects split87 chunks and raw payload", () =
     gameid: "g-2"
   });
   assert.deepEqual(decoded[1], decoded[0]);
+});
+
+test("raw packet envelope remains associated with flattened candidates and sensitive fields are removed", () => {
+  const root = {
+    event: "round_start",
+    token: "secret-token",
+    auth: "secret-auth",
+    data: {
+      command: "dispatch",
+      cookie: "do-not-keep"
+    },
+    players: [
+      {
+        userid: "local-id",
+        username: "VISIBLE_ROOT",
+        gameid: 4321,
+        naturalorder: 1,
+        options: {
+          seed: 9876,
+          bagtype: "zenith",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20,
+          gameid: 4321
+        }
+      }
+    ]
+  };
+  const candidates = decodeGameOptionsCandidateRecords(root, () => {
+    throw new Error("unreachable");
+  });
+  const record = buildDiagnosticWsEnvelopeRecord({
+    direction: "inbound",
+    event: {
+      requestId: "req-quick-play",
+      response: { opcode: 1 }
+    },
+    decodedRoots: [root],
+    candidates,
+    observerState: {
+      requestUrls: new Map([["req-quick-play", "wss://tetr.io/socket"]]),
+      modeController: { modeGeneration: 9 }
+    },
+    timestamp: 1234
+  });
+
+  assert.equal(record.direction, "inbound");
+  assert.equal(record.request_id, "req-quick-play");
+  assert.equal(record.websocket_request_id, "req-quick-play");
+  assert.equal(record.message_request_id, null);
+  assert.equal(record.mode_generation, 9);
+  assert.equal(record.event, "round_start");
+  assert.equal(record.command, "dispatch");
+  assert.ok(record.root_keys.includes("players"));
+  assert.ok(!record.root_keys.includes("token"));
+  assert.ok(record.payload_keys.includes("command"));
+  assert.ok(!record.payload_keys.includes("cookie"));
+  assert.deepEqual(record.candidate_paths, ["root.players[0]"]);
+  assert.equal(record.players.length, 1);
+  assert.equal(record.players[0].gameid, 4321);
+  assert.equal(record.candidates.length, 1);
+  assert.equal(record.candidates[0].path, "root.players[0]");
+  assert.deepEqual(record.candidates[0].ancestorPaths, ["root.players", "root"]);
+  assert.equal(record.candidates[0].gameid, 4321);
+  assert.equal(record.candidates[0].seed, 9876);
+  assert.equal(record.distinct_userid_count, 1);
+  assert.equal(record.distinct_gameid_count, 1);
+});
+
+test("diagnostic envelope preserves websocket and message request correlation separately", () => {
+  const record = buildDiagnosticWsEnvelopeRecord({
+    direction: "outbound",
+    event: {
+      requestId: "socket-42",
+      response: { opcode: 2 }
+    },
+    decodedRoots: [
+      {
+        request_id: "message-7",
+        event: "join_room",
+        player: {
+          userid: "local-id",
+          gameid: 7001
+        }
+      }
+    ],
+    candidates: [],
+    observerState: {
+      requestUrls: new Map([["socket-42", "wss://tetr.io/socket"]]),
+      modeController: { modeGeneration: 3 }
+    },
+    timestamp: 700
+  });
+
+  assert.equal(record.request_id, "message-7");
+  assert.equal(record.websocket_request_id, "socket-42");
+  assert.equal(record.message_request_id, "message-7");
+  assert.equal(record.websocket_session, "socket-42");
 });

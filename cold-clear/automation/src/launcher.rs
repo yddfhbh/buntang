@@ -498,6 +498,7 @@ impl BotSession {
 pub struct LauncherApp {
     paths: AppPaths,
     state: LauncherState,
+    quick_play_diagnostic_username: String,
     logs: Vec<String>,
     event_tx: Sender<LauncherEvent>,
     event_rx: Receiver<LauncherEvent>,
@@ -525,6 +526,7 @@ impl LauncherApp {
         Self {
             paths,
             state,
+            quick_play_diagnostic_username: String::new(),
             logs: vec!["Launcher ready".to_owned()],
             event_tx,
             event_rx,
@@ -870,6 +872,41 @@ impl LauncherApp {
 
     fn stop_bot(&mut self) {
         self.stop_bot_with_browser_hint(self.browser_session.is_some());
+    }
+
+    fn start_quick_play_diagnostic(&mut self) {
+        if self.state.selected_mode != RuntimeMode::Zenith {
+            self.push_log("[quick-play] diagnostic blocked: mode is not zenith");
+            return;
+        }
+        if self.bot_desired_enabled
+            || self.bot_session.is_some()
+            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On)
+        {
+            self.push_log("[quick-play] diagnostic blocked: bot is enabled");
+            return;
+        }
+        let Some(session) = self.browser_session.as_mut() else {
+            self.push_log("[quick-play] diagnostic blocked: browser runtime is not ready");
+            return;
+        };
+        let username_hint = {
+            let trimmed = self.quick_play_diagnostic_username.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        };
+        match session
+            .snapshot_provider
+            .start_quick_play_diagnostic(username_hint)
+        {
+            Ok(()) => self.push_log("[quick-play] diagnostic capture requested"),
+            Err(err) => self.push_log(format!(
+                "[quick-play] failed to request diagnostic capture: {err:#}"
+            )),
+        }
     }
 
     fn stop_bot_with_browser_hint(&mut self, browser_remains_open: bool) {
@@ -1220,6 +1257,14 @@ impl eframe::App for LauncherApp {
                 SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
             )
             && !bot_locked;
+        let can_capture_quick_play = self.state.selected_mode == RuntimeMode::Zenith
+            && self.browser_status == BrowserStatus::Ready
+            && self.input_status == InputStatus::Ready
+            && matches!(
+                self.snapshot_status,
+                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+            )
+            && !bot_locked;
 
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1364,6 +1409,32 @@ impl eframe::App for LauncherApp {
                     self.stop_bot();
                 }
             });
+            if self.state.selected_mode == RuntimeMode::Zenith {
+                ui.horizontal(|ui| {
+                    ui.label("Diagnostic local username");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.quick_play_diagnostic_username)
+                            .hint_text("optional exact username"),
+                    );
+                });
+                ui.small(
+                    "Temporary diagnostic hint only. It is not saved to launcher-state.json and is used only to correlate profile username -> userid -> gameid during capture.",
+                );
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            can_capture_quick_play,
+                            egui::Button::new("Capture Quick Play Data"),
+                        )
+                        .clicked()
+                    {
+                        self.start_quick_play_diagnostic();
+                    }
+                });
+                ui.small(
+                    "Bot OFF 상태에서 Quick Play WS/session/closure 진단 캡처만 수행합니다.",
+                );
+            }
 
             ui.separator();
             ui.heading("Settings");
@@ -1642,6 +1713,15 @@ mod tests {
         assert_eq!(state.selected_mode, RuntimeMode::Solo);
         assert!(!state.bot_enabled);
         assert_eq!(state.mode_generation, 0);
+    }
+
+    #[test]
+    fn diagnostic_username_hint_is_not_persisted_in_launcher_state() {
+        let serialized = serde_json::to_value(LauncherState::default()).unwrap();
+        assert_eq!(
+            serialized.get("quick_play_diagnostic_username"),
+            None
+        );
     }
 
     #[test]

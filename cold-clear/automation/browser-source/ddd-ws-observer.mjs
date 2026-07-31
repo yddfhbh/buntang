@@ -191,6 +191,7 @@ export async function installDddWsObserver(
     vsBridgePath = DEFAULT_VS_BRIDGE_PATH,
     onVsRoundStatus = null,
     onGameOptions = null,
+    onDiagnosticEnvelope = null,
     perfEnabled = process.env.FUSION_BROWSER_PERF === "1",
     resolveSessionSelfIdentity = null,
     sessionSelfProbeRetryMs = DEFAULT_SESSION_SELF_PROBE_RETRY_MS,
@@ -293,7 +294,7 @@ export async function installDddWsObserver(
     } catch {}
   });
 
-  const offReceived = cdp.on("Network.webSocketFrameReceived", (event) => {
+  const processWsFrame = (direction, event) => {
     try {
       const frameStartedAt = Date.now();
       observerState.framesReceived += 1;
@@ -325,6 +326,17 @@ export async function installDddWsObserver(
           candidates,
           decodedRoots
         });
+        emitDiagnosticEnvelope(
+          onDiagnosticEnvelope,
+          buildDiagnosticWsEnvelopeRecord({
+            direction,
+            event,
+            decodedRoots,
+            candidates,
+            observerState,
+            timestamp
+          })
+        );
         logCapturedCandidates(
           candidates,
           event?.requestId,
@@ -381,6 +393,17 @@ export async function installDddWsObserver(
           candidates,
           decodedRoots
         });
+        emitDiagnosticEnvelope(
+          onDiagnosticEnvelope,
+          buildDiagnosticWsEnvelopeRecord({
+            direction,
+            event,
+            decodedRoots,
+            candidates,
+            observerState,
+            timestamp
+          })
+        );
         logCapturedCandidates(
           candidates,
           event?.requestId,
@@ -412,6 +435,13 @@ export async function installDddWsObserver(
       }
       recordPerfFrame(observerState, frameStartedAt, logger);
     } catch {}
+  };
+
+  const offReceived = cdp.on("Network.webSocketFrameReceived", (event) => {
+    processWsFrame("inbound", event);
+  });
+  const offSent = cdp.on("Network.webSocketFrameSent", (event) => {
+    processWsFrame("outbound", event);
   });
 
   const cleanup = () => {
@@ -421,6 +451,7 @@ export async function installDddWsObserver(
     offCreated();
     offClosed();
     offReceived();
+    offSent();
     observerState.requestUrls.clear();
     finalizeTrace(observerState, logger);
   };
@@ -1289,6 +1320,79 @@ export function decodeGameOptionsCandidateRecords(payload, unpack) {
   return candidates;
 }
 
+export function buildDiagnosticWsEnvelopeRecord({
+  direction = "inbound",
+  event = null,
+  decodedRoots = [],
+  candidates = [],
+  observerState = null,
+  timestamp = Date.now()
+} = {}) {
+  const websocketRequestId =
+    sanitizeTraceScalar(event?.requestId) ??
+    sanitizeTraceScalar(event?.request_id) ??
+    null;
+  const messageRequestId =
+    resolveEnvelopeScalar(decodedRoots, [
+      "request_id",
+      "requestId",
+      "reqid",
+      "req_id",
+      "id"
+    ]) ?? null;
+  const rootKeys = collectRootKeyList(decodedRoots);
+  const payloadKeys = collectPayloadKeyList(decodedRoots);
+  const players = collectDiagnosticWsPlayers(decodedRoots);
+  const sanitizedCandidates = (Array.isArray(candidates) ? candidates : [])
+    .map((candidate) => sanitizeDiagnosticOptionsCandidate(candidate))
+    .filter(Boolean);
+  const useridSet = new Set();
+  const gameidSet = new Set();
+  for (const player of players) {
+    if (player.userid !== null && player.userid !== undefined) {
+      useridSet.add(String(player.userid));
+    }
+    if (player.gameid !== null && player.gameid !== undefined) {
+      gameidSet.add(String(player.gameid));
+    }
+  }
+  for (const candidate of sanitizedCandidates) {
+    if (candidate.userid !== null && candidate.userid !== undefined) {
+      useridSet.add(String(candidate.userid));
+    }
+    if (candidate.gameid !== null && candidate.gameid !== undefined) {
+      gameidSet.add(String(candidate.gameid));
+    }
+  }
+  return {
+    timestamp: Math.max(0, Number(timestamp ?? Date.now())),
+    direction: direction === "outbound" ? "outbound" : "inbound",
+    request_id: messageRequestId ?? websocketRequestId,
+    websocket_request_id: websocketRequestId,
+    message_request_id: messageRequestId,
+    websocket_session: websocketRequestId,
+    mode_generation: Math.max(
+      0,
+      Number(observerState?.modeController?.modeGeneration ?? 0)
+    ),
+    url_host: resolveTraceUrlHost(websocketRequestId, observerState),
+    opcode: event?.response?.opcode ?? null,
+    event: resolveEnvelopeScalar(decodedRoots, ["event"]),
+    type: resolveEnvelopeScalar(decodedRoots, ["type"]),
+    command: resolveEnvelopeScalar(decodedRoots, ["command", "cmd", "action"]),
+    root_keys: rootKeys,
+    payload_keys: payloadKeys,
+    candidate_paths: sanitizedCandidates
+      .map((candidate) => sanitizeTraceScalar(candidate?.path))
+      .filter((entry) => typeof entry === "string")
+      .slice(0, 24),
+    distinct_userid_count: useridSet.size,
+    distinct_gameid_count: gameidSet.size,
+    players,
+    candidates: sanitizedCandidates
+  };
+}
+
 export function findGameOptions(root) {
   const seen = new WeakSet();
   const counters = {
@@ -1672,7 +1776,8 @@ function collectOptionCandidatesFromValue(
     target.push({
       options: sanitized,
       context: extractTraceContext(lineage),
-      path: pathLabel
+      path: pathLabel,
+      ancestorPaths: ancestors.map((entry) => entry?.path).filter(Boolean)
     });
   }
 
@@ -1718,6 +1823,228 @@ function collectOptionCandidatesFromValue(
       depth + 1
     );
   }
+}
+
+function emitDiagnosticEnvelope(onDiagnosticEnvelope, record) {
+  if (typeof onDiagnosticEnvelope !== "function" || !record) {
+    return;
+  }
+  try {
+    onDiagnosticEnvelope(record);
+  } catch {}
+}
+
+function sanitizeDiagnosticOptionsCandidate(candidate) {
+  if (!candidate || typeof candidate !== "object") {
+    return null;
+  }
+  const options = sanitizeGameOptions(candidate.options);
+  if (!options) {
+    return null;
+  }
+  const context =
+    candidate.context && typeof candidate.context === "object"
+      ? candidate.context
+      : {};
+  return {
+    path: sanitizeTraceScalar(candidate.path) ?? "root",
+    ancestorPaths: Array.isArray(candidate.ancestorPaths)
+      ? candidate.ancestorPaths
+          .map((entry) => sanitizeTraceScalar(entry))
+          .filter((entry) => typeof entry === "string")
+          .slice(0, 6)
+      : [],
+    userid:
+      sanitizeTraceScalar(context.userid ?? context.user_id ?? context._id) ?? null,
+    username: sanitizeTraceScalar(context.username ?? context.name) ?? null,
+    gameid: sanitizeTraceScalar(options.gameid ?? context.gameid ?? context.game_id) ?? null,
+    seed: sanitizeTraceScalar(options.seed) ?? null,
+    bagtype: sanitizeTraceScalar(options.bagtype) ?? null,
+    nextcount: sanitizeTraceScalar(options.nextcount) ?? null,
+    boardwidth: sanitizeTraceScalar(options.boardwidth) ?? null,
+    boardheight: sanitizeTraceScalar(options.boardheight) ?? null,
+    naturalorder:
+      sanitizeTraceScalar(context.naturalorder ?? context.slot ?? context.index) ?? null,
+    sessionFieldPresent: hasSessionFieldInContext(context)
+  };
+}
+
+function hasSessionFieldInContext(context) {
+  if (!context || typeof context !== "object") {
+    return false;
+  }
+  return [
+    "session",
+    "sessionid",
+    "session_id"
+  ].some((key) => Object.prototype.hasOwnProperty.call(context, key));
+}
+
+function collectRootKeyList(decodedRoots) {
+  const keys = new Set();
+  for (const root of decodedRoots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) {
+      continue;
+    }
+    for (const key of Object.keys(root)) {
+      if (!isSensitiveKey(key)) {
+        keys.add(key);
+      }
+    }
+  }
+  return [...keys].sort().slice(0, 48);
+}
+
+function collectPayloadKeyList(decodedRoots) {
+  const keys = new Set();
+  for (const root of decodedRoots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) {
+      continue;
+    }
+    for (const containerKey of ["payload", "data", "body", "args", "message"]) {
+      if (!Object.prototype.hasOwnProperty.call(root, containerKey) || isSensitiveKey(containerKey)) {
+        continue;
+      }
+      const container = root[containerKey];
+      if (!container || typeof container !== "object" || Array.isArray(container)) {
+        continue;
+      }
+      for (const key of Object.keys(container)) {
+        if (!isSensitiveKey(key)) {
+          keys.add(key);
+        }
+      }
+    }
+  }
+  return [...keys].sort().slice(0, 48);
+}
+
+function resolveEnvelopeScalar(decodedRoots, keys) {
+  for (const root of decodedRoots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) {
+      continue;
+    }
+    for (const key of keys) {
+      const scalar = sanitizeTraceScalar(root[key]);
+      if (scalar !== undefined) {
+        return scalar;
+      }
+    }
+    for (const containerKey of ["payload", "data", "body", "args", "message"]) {
+      const container = root[containerKey];
+      if (!container || typeof container !== "object" || Array.isArray(container)) {
+        continue;
+      }
+      for (const key of keys) {
+        const scalar = sanitizeTraceScalar(container[key]);
+        if (scalar !== undefined) {
+          return scalar;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function collectDiagnosticWsPlayers(decodedRoots) {
+  const records = [];
+  const seen = new Set();
+  const pushRecord = (record) => {
+    if (!record) {
+      return;
+    }
+    const signature = [
+      record.source_path ?? "",
+      record.userid ?? "",
+      record.username ?? "",
+      record.gameid ?? "",
+      record.seed ?? ""
+    ].join("|");
+    if (seen.has(signature)) {
+      return;
+    }
+    seen.add(signature);
+    records.push(record);
+  };
+  for (const root of decodedRoots) {
+    collectDiagnosticWsPlayersFromValue(root, "root", pushRecord, 0, new WeakSet());
+  }
+  return records.slice(0, 64);
+}
+
+function collectDiagnosticWsPlayersFromValue(
+  value,
+  pathLabel,
+  pushRecord,
+  depth,
+  seen
+) {
+  if (!value || typeof value !== "object" || depth > 4) {
+    return;
+  }
+  if (seen.has(value)) {
+    return;
+  }
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      collectDiagnosticWsPlayersFromValue(
+        value[index],
+        `${pathLabel}[${index}]`,
+        pushRecord,
+        depth + 1,
+        seen
+      );
+    }
+    return;
+  }
+  if (looksLikePlayerRecord(value)) {
+    pushRecord(buildDiagnosticWsPlayerRecord(value, pathLabel));
+  }
+  for (const [key, nextValue] of Object.entries(value)) {
+    if (isSensitiveKey(key)) {
+      continue;
+    }
+    if (
+      key === "players" ||
+      key === "player" ||
+      key === "leaderboard" ||
+      key === "entrants"
+    ) {
+      collectDiagnosticWsPlayersFromValue(
+        nextValue,
+        `${pathLabel}.${key}`,
+        pushRecord,
+        depth + 1,
+        seen
+      );
+    }
+  }
+}
+
+function looksLikePlayerRecord(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const userid = sanitizeTraceScalar(value.userid ?? value._id ?? value.user_id);
+  const username = sanitizeTraceScalar(value.username ?? value.name);
+  const gameid = sanitizeTraceScalar(value.gameid ?? value.game_id);
+  return userid !== undefined || username !== undefined || gameid !== undefined;
+}
+
+function buildDiagnosticWsPlayerRecord(value, pathLabel) {
+  const options = sanitizeGameOptions(value.options ?? value.setoptions ?? null);
+  return {
+    source_path: pathLabel,
+    userid: sanitizeTraceScalar(value.userid ?? value._id ?? value.user_id) ?? null,
+    username: sanitizeTraceScalar(value.username ?? value.name) ?? null,
+    gameid: sanitizeTraceScalar(value.gameid ?? value.game_id) ?? null,
+    seed: sanitizeTraceScalar(options?.seed ?? value.seed) ?? null,
+    bagtype: sanitizeTraceScalar(options?.bagtype) ?? null,
+    nextcount: sanitizeTraceScalar(options?.nextcount) ?? null,
+    naturalorder:
+      sanitizeTraceScalar(value.naturalorder ?? value.slot ?? value.index) ?? null
+  };
 }
 
 function resolveOptionCandidateEntry(value) {

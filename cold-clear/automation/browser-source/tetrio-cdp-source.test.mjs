@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  rmSync
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import vm from "node:vm";
@@ -10,12 +16,14 @@ import {
   applyBrowserControlMessage,
   armClosureCaptureWindow,
   advanceGameStartSignalGeneration,
+  buildQuickPlayRuntimeReport,
   buildSnapshotSignature,
   buildSnapshotToken,
   captureTetrioGame,
   cheapGameSignalExpression,
   clearSnapshotFile,
   completeNextGameReacquire,
+  collectQuickPlayClosureDiagnosticFromPausedScopes,
   consumeGameStartSignal,
   createBrowserControlState,
   createBootstrapState,
@@ -25,6 +33,7 @@ import {
   createInteractionTrackerInstallState,
   createNextGameReacquireState,
   createPostGameInteractionWatchState,
+  createQuickPlayDiagnosticState,
   createSnapshotTracking,
   carryPendingPostGameInteractionIntoReacquire,
   cancelPostGameInteractionWatch,
@@ -36,6 +45,7 @@ import {
   activatePendingClosureCaptureArm,
   clearPendingClosureCaptureArm,
   exposeTetrioGameFromPausedCallFrames,
+  ensureZenithBootstrapCheckScheduled,
   getBootstrapReadinessStatus,
   hasUnconsumedGameStartSignal,
   hasPendingClosureCaptureArm,
@@ -48,17 +58,29 @@ import {
   isTetrioGameEndedState,
   nextGameInteractionTrackerExpression,
   pausedFrameExposureExpression,
+  quickPlayClosureCandidateScanExpression,
+  quickPlaySessionCandidateSurveyExpression,
+  maybeRunQuickPlayDiagnosticCapture,
+  maybeRunZenithBootstrapCheck,
+  mergeQuickPlaySessionSurvey,
   noteGameStartSignal,
   primeNextGameInteractionBaseline,
+  pollQuickPlayPassiveSnapshotNow,
+  retainQuickPlayPassiveCandidateHandle,
   primePostGameInteractionWatchBaseline,
   readTetrioState,
   readNextGameInteractionState,
   registerNextGameInteractionTrackerForFutureDocuments,
   requestClosureCaptureArm,
   reactivateClosureCaptureArmAfterBootstrap,
+  recordQuickPlayClosureCandidates,
+  recordQuickPlayDiagnosticEnvelope,
+  reconcileQuickPlayPassiveBinding,
+  releaseQuickPlayPassiveState,
   resetGameStartSignalState,
   resetPostGameInteractionWatch,
   resetPausedScopeScanProgress,
+  resetZenithBootstrapCheckState,
   resetClosureCaptureLocatorHint,
   resetBootstrapState,
   resetTetrioNetworkState,
@@ -74,10 +96,15 @@ import {
   shouldLogStateReason,
   shouldAdvanceGameEpoch,
   shouldHandleEndedGame,
+  scanQuickPlayClosureCandidates,
   setNextGameInteractionBaseline,
+  startQuickPlayDiagnosticCapture,
+  stopQuickPlayDiagnosticCapture,
+  createZenithBootstrapCheckState,
   startPostGameInteractionWatch,
   startNextGameReacquire,
   tetrioStateExpression,
+  updateQuickPlayPendingIdentity,
   updateBootstrapDocumentState
 } from "./tetrio-cdp-source.mjs";
 
@@ -166,6 +193,7 @@ function evaluateInWindow(expression, windowOverrides = {}, extraContext = {}) {
     Array,
     Boolean,
     Number,
+    Promise,
     String,
     ...extraContext
   };
@@ -173,6 +201,25 @@ function evaluateInWindow(expression, windowOverrides = {}, extraContext = {}) {
     result: vm.runInNewContext(expression, context),
     window
   };
+}
+
+function executeObjectFunction(functionDeclaration, target, args = []) {
+  return vm.runInNewContext(
+    `(${functionDeclaration}).apply(__target, __args)`,
+    {
+      __target: target,
+      __args: Array.isArray(args) ? args : [],
+      Date,
+      Math,
+      Object,
+      Array,
+      Boolean,
+      Number,
+      String,
+      Set,
+      Map
+    }
+  );
 }
 
 async function withPatchedDateNow(getNow, callback) {
@@ -243,6 +290,3667 @@ function armedClosureCaptureState(
   });
   return closureCaptureState;
 }
+
+function makeQuickPlayDiagnosticTempPaths() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "quick-play-diagnostic-"));
+  return {
+    dir,
+    reportPath: path.join(dir, "quick-play-runtime-report.json"),
+    rawWsPath: path.join(dir, "quick-play-ws-raw.jsonl"),
+    closurePath: path.join(dir, "quick-play-closure-candidates.jsonl"),
+    callframePath: path.join(dir, "quick-play-callframes.jsonl"),
+    passiveSnapshotPath: path.join(dir, "quick-play-passive-snapshot.json"),
+    fingerprintPath: path.join(dir, "solo-closure-fingerprint.json")
+  };
+}
+
+function cleanupQuickPlayDiagnosticTempPaths(paths) {
+  rmSync(paths.dir, { recursive: true, force: true });
+}
+
+function makeQuickPlayState(paths) {
+  const state = createQuickPlayDiagnosticState();
+  state.reportPath = paths.reportPath;
+  state.rawWsPath = paths.rawWsPath;
+  state.closurePath = paths.closurePath;
+  state.callframePath = paths.callframePath;
+  state.passiveSnapshotPath = paths.passiveSnapshotPath;
+  state.soloClosureFingerprintPath = paths.fingerprintPath;
+  return state;
+}
+
+function makeBoundQuickPlayCandidate(overrides = {}) {
+  return {
+    generation: 1,
+    targetId: "https://tetr.io/",
+    candidateId: "cand-default",
+    rootObjectId: "retained-default",
+    rootPath: ["game", "state"],
+    functionName: "_tick",
+    callFrameIndex: 5,
+    scopeIndex: 4,
+    scopeType: "closure",
+    bindingName: "Ra",
+    boardPath: ["game", "state", "board"],
+    currentPath: ["game", "state", "current"],
+    holdPath: ["game", "state", "hold"],
+    queuePath: ["game", "state", "queue"],
+    capturedAt: 1_000,
+    userid: null,
+    gameid: null,
+    wsPlayerId: "",
+    identityBound: false,
+    ...overrides
+  };
+}
+
+function createStorageMock(entries = {}) {
+  const map = new Map(Object.entries(entries));
+  const keys = [...map.keys()];
+  return {
+    get length() {
+      return keys.length;
+    },
+    key(index) {
+      return keys[index] ?? null;
+    },
+    getItem(key) {
+      return map.has(key) ? map.get(key) : null;
+    }
+  };
+}
+
+function createIndexedDbMock(databases = []) {
+  const catalog = databases.map((database) => ({
+    name: database.name,
+    objectStores: [...(database.objectStores ?? [])]
+  }));
+  return {
+    async databases() {
+      return catalog.map((database) => ({ name: database.name }));
+    },
+    open(name) {
+      const match = catalog.find((database) => database.name === name);
+      const request = {
+        result: {
+          objectStoreNames: match?.objectStores ?? [],
+          close() {}
+        },
+        onerror: null,
+        onsuccess: null,
+        onupgradeneeded: null
+      };
+      Promise.resolve().then(() => {
+        request.onsuccess?.({ target: request });
+      });
+      return request;
+    }
+  };
+}
+
+test("diagnostic capture works only in Zenith mode and does not change bot state", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    assert.equal(
+      startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+        now: 1_000,
+        log: () => {}
+      }).started,
+      false
+    );
+
+    controlState.selectedMode = "friendly_vs";
+    assert.equal(
+      startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+        now: 1_000,
+        log: () => {}
+      }).started,
+      false
+    );
+
+    controlState.selectedMode = "zenith";
+    controlState.botEnabled = true;
+    assert.equal(
+      startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+        now: 1_000,
+        log: () => {}
+      }).started,
+      false
+    );
+
+    controlState.botEnabled = false;
+    const applied = applyBrowserControlMessage({
+      message: { type: "quick_play_diagnostic", enabled: true },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 1_000,
+      log: () => {}
+    });
+
+    assert.equal(applied, true);
+    assert.equal(controlState.botEnabled, false);
+    assert.equal(controlState.selectedMode, "zenith");
+    assert.equal(diagnosticState.active, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("session candidate and participant candidate remain distinct", async () => {
+  const sessionUser = { _id: "local-id", username: "VISIBLE_ROOT" };
+  const rosterPlayer = {
+    userid: "player-a",
+    username: "VISIBLE_ROOT",
+    gameid: 7001,
+    naturalorder: 1
+  };
+  const document = {
+    querySelector() {
+      return {
+        textContent: "VISIBLE_ROOT",
+        getAttribute(name) {
+          return name === "data-username" ? "VISIBLE_ROOT" : null;
+        },
+        dataset: { username: "VISIBLE_ROOT" }
+      };
+    }
+  };
+  const { result } = evaluateInWindow(
+    quickPlaySessionCandidateSurveyExpression(),
+    {
+      document,
+      localStorage: createStorageMock(),
+      sessionStorage: createStorageMock(),
+      __NUXT__: {
+        state: {
+          session: {
+            user: sessionUser
+          },
+          room: {
+            players: [rosterPlayer]
+          }
+        }
+      }
+    },
+    { document }
+  );
+  const survey = await result;
+
+  assert.equal(survey.status, "ready");
+  assert.equal(survey.screenUsername, null);
+  assert.deepEqual(JSON.parse(JSON.stringify(survey.legacyPath)), {
+    __NUXT__: true,
+    state: true,
+    session: true,
+    user: true
+  });
+  const sessionCandidate = survey.candidates.find(
+    (candidate) => candidate.path === "window.__NUXT__.state.session.user"
+  );
+  const participantCandidate = survey.candidates.find((candidate) =>
+    String(candidate.path).includes(".players[0]")
+  );
+  assert.equal(sessionCandidate?.candidateKind, "session_user");
+  assert.equal(sessionCandidate?.screenUsernameMatches ?? null, null);
+  assert.equal(participantCandidate?.candidateKind, "participant_candidate");
+  assert.ok(
+    survey.screenIdentityEvidence.some((entry) => entry.text === "VISIBLE_ROOT")
+  );
+});
+
+test("generic [data-username] cannot resolve self and incorrect DOM username remains unresolved", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const document = {
+    querySelector(selector) {
+      if (selector === "[data-username]") {
+        return {
+          textContent: "osk",
+          getAttribute(name) {
+            return name === "data-username" ? "osk" : null;
+          },
+          dataset: { username: "osk" }
+        };
+      }
+      return null;
+    }
+  };
+  try {
+    const { result } = evaluateInWindow(
+      quickPlaySessionCandidateSurveyExpression(),
+      {
+        document,
+        localStorage: createStorageMock(),
+        sessionStorage: createStorageMock()
+      },
+      { document }
+    );
+    mergeQuickPlaySessionSurvey(diagnosticState, await result, 100);
+    diagnosticState.wsPlayers.set("ws-1", {
+      userid: "player-1",
+      username: "actual-player",
+      gameid: 5001,
+      seed: 7001,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.screen_username, null);
+    assert.equal(report.ws_self_evidence.status, "unresolved");
+    assert.equal(report.local_resolution, null);
+    assert.ok(
+      report.diagnostics.session_scan.screen_identity_evidence.some(
+        (entry) => entry.selector === "[data-username]" && entry.text === "osk"
+      )
+    );
+    assert.ok(
+      report.ws_self_evidence.rejected_strategies.includes(
+        "no_verified_storage_identity_candidate"
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("storage identity probe records only whitelisted fields and IndexedDB names", async () => {
+  const document = { querySelector() { return null; } };
+  const { result } = evaluateInWindow(
+    quickPlaySessionCandidateSurveyExpression(),
+    {
+      document,
+      localStorage: createStorageMock({
+        userConfig: JSON.stringify({
+          _id: "user-1",
+          username: "alpha",
+          token: "secret-token",
+          session: { id: "secret-session" }
+        }),
+        debugIdentity: JSON.stringify({
+          token: "debug-token",
+          password: "debug-password"
+        })
+      }),
+      sessionStorage: createStorageMock({
+        auth: JSON.stringify({
+          authorization: "Bearer hidden",
+          username: "shadow"
+        })
+      }),
+      indexedDB: createIndexedDbMock([
+        {
+          name: "tetrio",
+          objectStores: ["profiles", "sessions"]
+        }
+      ])
+    },
+    { document }
+  );
+  const survey = await result;
+  const serialized = JSON.stringify(survey);
+  const userConfigRecord = survey.storageIdentityRecords.find(
+    (entry) => entry.path === "localStorage.userConfig"
+  );
+
+  assert.equal(survey.status, "ready");
+  assert.deepEqual(JSON.parse(JSON.stringify(userConfigRecord)), {
+    path: "localStorage.userConfig",
+    parsed: true,
+    safeFields: {
+      userid: "user-1",
+      username: "alpha"
+    },
+    sensitiveFieldsRedacted: true
+  });
+  assert.ok(
+    survey.candidates.some(
+      (candidate) =>
+        candidate.path === "localStorage.userConfig" &&
+        candidate.candidateKind === "storage_identity"
+    )
+  );
+  assert.ok(
+    !survey.candidates.some((candidate) => candidate.path === "localStorage.debugIdentity")
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(survey.indexedDbCatalog)), [
+    {
+      database: "tetrio",
+      objectStores: ["profiles", "sessions"]
+    }
+  ]);
+  assert.ok(!serialized.includes("secret-token"));
+  assert.ok(!serialized.includes("secret-session"));
+  assert.ok(!serialized.includes("debug-password"));
+  assert.ok(!serialized.includes("Bearer hidden"));
+});
+
+test("diagnostic username exact profile match returns userid", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    diagnosticState.diagnosticUsernameHint = "ExactLocal";
+    diagnosticState.wsPlayers.set("player", {
+      userid: "user-7",
+      username: "ExactLocal",
+      gameid: 7007,
+      seed: 9007,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.ws_self_evidence.status, "resolved");
+    assert.equal(report.ws_self_evidence.userid, "user-7");
+    assert.equal(report.ws_self_evidence.gameid, 7007);
+    assert.equal(report.ws_self_evidence.evidence[0]?.kind, "diagnostic_username_hint");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("userid must uniquely map to gameid and ambiguous profile remains unresolved", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  try {
+    const ambiguousProfile = makeQuickPlayState(paths);
+    ambiguousProfile.diagnosticUsernameHint = "shared";
+    ambiguousProfile.wsPlayers.set("one", {
+      userid: "user-1",
+      username: "shared",
+      gameid: 11,
+      seed: 21,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    ambiguousProfile.wsPlayers.set("two", {
+      userid: "user-2",
+      username: "shared",
+      gameid: 12,
+      seed: 22,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    let report = buildQuickPlayRuntimeReport(ambiguousProfile);
+    assert.equal(report.ws_self_evidence.status, "unresolved");
+    assert.ok(
+      report.ws_self_evidence.rejected_strategies.includes(
+        "diagnostic_username_not_unique_to_userid"
+      )
+    );
+
+    const ambiguousGame = makeQuickPlayState(paths);
+    ambiguousGame.diagnosticUsernameHint = "unique";
+    ambiguousGame.wsPlayers.set("one", {
+      userid: "user-9",
+      username: "unique",
+      gameid: 91,
+      seed: 101,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    ambiguousGame.wsPlayers.set("two", {
+      userid: "user-9",
+      username: "unique",
+      gameid: 92,
+      seed: 102,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    report = buildQuickPlayRuntimeReport(ambiguousGame);
+    assert.equal(report.ws_self_evidence.status, "unresolved");
+    assert.ok(
+      report.ws_self_evidence.rejected_strategies.includes(
+        "diagnostic_userid_not_unique_to_gameid"
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("closure candidates receive stable diagnostic ids", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    const now = 5_000;
+    recordQuickPlayClosureCandidates(
+      diagnosticState,
+      {
+        candidates: [
+          {
+            candidateId: "window.app.game",
+            locator: "window.app.game",
+            pieceCounter: 1,
+            current: "t",
+            hold: "i",
+            queue: ["o", "s"],
+            boardWidth: 10,
+            boardHeight: 20,
+            boardHash: "abcd1234",
+            rowOccupancy: [0, 0, 1],
+            playing: true,
+            ended: false
+          }
+        ]
+      },
+      now
+    );
+    recordQuickPlayClosureCandidates(
+      diagnosticState,
+      {
+        candidates: [
+          {
+            candidateId: "window.app.game",
+            locator: "window.app.game",
+            pieceCounter: 2,
+            current: "o",
+            hold: "i",
+            queue: ["s", "z"],
+            boardWidth: 10,
+            boardHeight: 20,
+            boardHash: "abcd5678",
+            rowOccupancy: [0, 1, 1],
+            playing: true,
+            ended: false
+          }
+        ]
+      },
+      now + 250
+    );
+
+    const candidate = diagnosticState.closureCandidates.get("window.app.game");
+    assert.equal(diagnosticState.closureCandidates.size, 1);
+    assert.equal(candidate?.candidate_id, "window.app.game");
+    assert.equal(candidate?.pieceCounter, 2);
+    assert.equal(candidate?.firstSeen, now);
+    assert.equal(candidate?.lastSeen, now + 250);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("no forced match without common evidence and high-confidence match requires stable shared identifiers", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const unresolvedState = makeQuickPlayState(paths);
+  try {
+    unresolvedState.wsPlayers.set("a", {
+      userid: "ws-a",
+      username: "alpha",
+      gameid: 1001,
+      seed: 2001,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    unresolvedState.closureCandidates.set("closure-a", {
+      candidate_id: "closure-a",
+      userid: "closure-b",
+      gameid: 9999,
+      seed: 8888,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    let report = buildQuickPlayRuntimeReport(unresolvedState);
+    assert.deepEqual(report.matches, []);
+
+    const matchedState = makeQuickPlayState(paths);
+    matchedState.wsPlayers.set("b", {
+      userid: "local-id",
+      username: "visible_root",
+      gameid: 4321,
+      seed: 9876,
+      firstSeen: 10,
+      lastSeen: 20
+    });
+    matchedState.closureCandidates.set("closure-b", {
+      candidate_id: "closure-b",
+      userid: null,
+      gameid: 4321,
+      seed: 9876,
+      firstSeen: 12,
+      lastSeen: 18
+    });
+    report = buildQuickPlayRuntimeReport(matchedState);
+    assert.equal(report.matches.length, 1);
+    assert.equal(report.matches[0].confidence, "high");
+    assert.deepEqual(report.matches[0].matched_by, ["gameid", "seed", "timing_overlap"]);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("capture stops after bounded time and packet count", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 1_000,
+      log: () => {}
+    });
+    diagnosticState.stopAt = 1_050;
+    const result = await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          throw new Error("should not run after timeout");
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 1_051,
+      log: () => {}
+    });
+    assert.equal(result.stopped, true);
+    assert.equal(diagnosticState.active, false);
+    assert.ok(existsSync(paths.reportPath));
+
+    const packetPaths = makeQuickPlayDiagnosticTempPaths();
+    const packetState = makeQuickPlayState(packetPaths);
+    packetState.maxWsPackets = 1;
+    startQuickPlayDiagnosticCapture(packetState, controlState, {
+      now: 2_000,
+      log: () => {}
+    });
+    assert.equal(
+      recordQuickPlayDiagnosticEnvelope(packetState, {
+        timestamp: 2_000,
+        players: [],
+        candidates: []
+      }),
+      true
+    );
+    assert.equal(
+      recordQuickPlayDiagnosticEnvelope(packetState, {
+        timestamp: 2_001,
+        players: [],
+        candidates: []
+      }),
+      false
+    );
+    assert.equal(packetState.stopReason, "packet_limit_reached");
+    cleanupQuickPlayDiagnosticTempPaths(packetPaths);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("diagnostic start schedules session scan and creates empty closure and callframe files", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 11;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    const started = startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_000,
+      log: () => {}
+    });
+
+    assert.equal(started.started, true);
+    assert.equal(diagnosticState.diagnostics.session_scan.scheduled, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.scheduled, 0);
+    assert.equal(diagnosticState.captureGeneration, 11);
+    assert.ok(existsSync(paths.closurePath));
+    assert.equal(readFileSync(paths.closurePath, "utf8"), "");
+    assert.ok(existsSync(paths.callframePath));
+    assert.equal(readFileSync(paths.callframePath, "utf8"), "");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("first Zenith options rearms closure acquisition", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 1_000,
+      log: () => {}
+    });
+    diagnosticState.nextClosureSurveyAt = 0;
+    diagnosticState.closureScanState.zenithRetryScheduled = false;
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 1_200,
+      players: [],
+      candidates: [
+        {
+          path: "root.player",
+          bagtype: "zenith"
+        }
+      ]
+    });
+
+    assert.equal(diagnosticState.closureScanState.zenithRetryScheduled, true);
+    assert.equal(diagnosticState.closureScanState.pendingReason, "first_zenith_options");
+    assert.equal(diagnosticState.nextClosureSurveyAt, 1_350);
+    assert.equal(diagnosticState.diagnostics.closure_scan.scheduled, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("diagnostic_start in lobby does not consume productive scan budget", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  let sessionRuns = 0;
+  let closureRuns = 0;
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_000,
+      log: () => {}
+    });
+
+    const result = await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          throw new Error("unexpected cdp send");
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 2_000,
+      surveySessionFn: async () => {
+        sessionRuns += 1;
+        return {
+          status: "ready",
+          screenUsername: null,
+          runtimePathsChecked: [],
+          candidates: []
+        };
+      },
+      scanClosureFn: async () => {
+        closureRuns += 1;
+        return {
+          status: "ready",
+          resultType: "completed_not_found",
+          exception: false,
+          rawCandidates: [],
+          acceptedCandidates: []
+        };
+      },
+      log: () => {}
+    });
+
+    assert.equal(result.stopped, false);
+    assert.equal(sessionRuns, 1);
+    assert.equal(closureRuns, 0);
+    assert.equal(diagnosticState.diagnostics.session_scan.attempts, 1);
+    assert.equal(diagnosticState.diagnostics.session_scan.completed, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.attempts, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.productive_attempts, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.completed, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.raw_candidate_count, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.accepted_candidate_count, 0);
+    assert.ok(existsSync(paths.closurePath));
+    assert.ok(existsSync(paths.callframePath));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("duplicate retry and first-options schedules coalesce", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 1_000,
+      log: () => {}
+    });
+    diagnosticState.nextClosureSurveyAt = 2_000;
+    diagnosticState.closureScanState.pendingReason = "retry";
+    diagnosticState.closureScanState.zenithRetryScheduled = false;
+    diagnosticState.diagnostics.closure_scan.scheduled = 1;
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 1_500,
+      players: [],
+      candidates: [
+        {
+          path: "root.player",
+          bagtype: "zenith"
+        }
+      ]
+    });
+
+    assert.equal(diagnosticState.nextClosureSurveyAt, 1_650);
+    assert.equal(diagnosticState.closureScanState.pendingReason, "first_zenith_options");
+    assert.equal(diagnosticState.diagnostics.closure_scan.scheduled, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("pause request failure is recorded with explicit reason", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 3_000,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 3_050,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          if (method === "Debugger.enable") {
+            return {};
+          }
+          if (method === "Debugger.pause") {
+            throw new Error("pause denied");
+          }
+          if (
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          throw new Error("should not wait");
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 3_200,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.diagnostics.closure_scan.attempts, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.productive_attempts, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.skipped, 1);
+    assert.equal(
+      diagnosticState.diagnostics.closure_scan.skip_reasons.pause_request_failed,
+      1
+    );
+    assert.deepEqual(diagnosticState.diagnostics.closure_scan.errors, ["pause denied"]);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("missing paused event is not reported as a successful empty scan", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_000,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 4_020,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          if (
+            method === "Debugger.enable" ||
+            method === "Debugger.pause" ||
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          return null;
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 4_200,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.diagnostics.closure_scan.completed, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.raw_candidate_count, 0);
+    assert.equal(
+      diagnosticState.diagnostics.closure_scan.skip_reasons.paused_event_not_received,
+      1
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("callframes_empty is recorded without consuming productive scan budget", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  const methods = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_500,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 4_520,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          methods.push(method);
+          if (
+            method === "Debugger.enable" ||
+            method === "Debugger.pause" ||
+            method === "Debugger.resume" ||
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          return { callFrames: [] };
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 4_700,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.diagnostics.closure_scan.attempts, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.productive_attempts, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.callframes_seen, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.inventory_rows_written, 0);
+    assert.equal(diagnosticState.diagnostics.closure_scan.skip_reasons.callframes_empty, 1);
+    assert.equal(readFileSync(paths.callframePath, "utf8"), "");
+    assert.ok(methods.includes("Debugger.resume"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("acquired frames are written even without a matching _tick frame", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  writeFileSync(paths.fingerprintPath, JSON.stringify({
+    frame_function_name: "_tick",
+    call_frame_index: 1,
+    scope_index: 4,
+    scope_type: "closure"
+  }));
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      {
+        async send(method) {
+          if (method === "Runtime.getProperties") {
+            return {
+              result: [
+                {
+                  name: "console",
+                  value: { type: "object", objectId: "console-1", className: "Console" }
+                }
+              ]
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      {
+        callFrames: [
+          {
+            callFrameId: "vendor-frame",
+            functionName: "vendorTick",
+            url: "https://cdn.vendor.example/vendor.js",
+            location: { scriptId: "11", lineNumber: 3, columnNumber: 2 },
+            scopeChain: [{ type: "local", object: { objectId: "scope-vendor" } }]
+          }
+        ]
+      },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1
+      }
+    );
+
+    assert.equal(result.resultType, "matching_frame_missing");
+    assert.equal(result.inventoryRowsWritten, 1);
+    const rows = readFileSync(paths.callframePath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].function_name, "vendorTick");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("stale generation cannot write inventory", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  const methods = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_000,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 5_050,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          methods.push(method);
+          if (
+            method === "Debugger.enable" ||
+            method === "Debugger.pause" ||
+            method === "Debugger.resume" ||
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          diagnosticState.captureGeneration += 1;
+          return {
+            callFrames: [
+              {
+                callFrameId: "frame-1",
+                functionName: "_tick",
+                scopeChain: [{ type: "closure", object: { objectId: "scope-1" } }]
+              }
+            ]
+          };
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 5_300,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.diagnostics.closure_scan.skip_reasons.stale_generation, 1);
+    assert.equal(readFileSync(paths.callframePath, "utf8"), "");
+    assert.ok(methods.includes("Debugger.resume"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("Debugger.resume runs on successful closure acquisition", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  const methods = [];
+  const objectMap = {
+    "binding-at": {
+      ejectState: {
+        game: {
+          board: createBoard(),
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          gameid: 9,
+          seed: 10,
+          userid: "user-1",
+          stats: { piecesplaced: 3 }
+        }
+      }
+    }
+  };
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_500,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 5_520,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method, params = {}) {
+          methods.push(method);
+          if (
+            method === "Debugger.enable" ||
+            method === "Debugger.pause" ||
+            method === "Debugger.resume" ||
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          if (method === "Runtime.getProperties") {
+            return {
+              result: [
+                {
+                  name: "at",
+                  value: { type: "object", objectId: "binding-at", className: "Object" }
+                }
+              ]
+            };
+          }
+          if (method === "Runtime.callFunctionOn") {
+            return {
+              result: {
+                value: executeObjectFunction(
+                  params.functionDeclaration,
+                  objectMap[params.objectId]
+                )
+              }
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          return {
+            callFrames: [
+              {
+                callFrameId: "frame-1",
+                functionName: "_tick",
+                url: "https://tetr.io/assets/game-main.js",
+                location: { scriptId: "1", lineNumber: 1, columnNumber: 1 },
+                scopeChain: [
+                  { type: "local", object: { objectId: "scope-0" } },
+                  { type: "closure", object: { objectId: "scope-1" } },
+                  { type: "closure", object: { objectId: "scope-2" } },
+                  { type: "closure", object: { objectId: "scope-3" } },
+                  { type: "closure", object: { objectId: "scope-4" } }
+                ]
+              }
+            ]
+          };
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 5_700,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.diagnostics.closure_scan.productive_attempts, 1);
+    assert.ok(methods.includes("Debugger.resume"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("Debugger.resume runs when paused callframe inspection throws", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  const methods = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_800,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 5_820,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          methods.push(method);
+          if (
+            method === "Debugger.enable" ||
+            method === "Debugger.pause" ||
+            method === "Debugger.resume" ||
+            method === "Debugger.disable" ||
+            method === "Runtime.releaseObjectGroup"
+          ) {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        },
+        async waitForEvent() {
+          return Object.defineProperty({}, "callFrames", {
+            get() {
+              throw new Error("callframes exploded");
+            }
+          });
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 6_000,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.deepEqual(diagnosticState.diagnostics.closure_scan.errors, ["callframes exploded"]);
+    assert.ok(methods.includes("Debugger.resume"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("Runtime.evaluate exception is recorded for closure diagnostics", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 3_000,
+      log: () => {}
+    });
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 3_050,
+      players: [],
+      candidates: [{ path: "root.player", bagtype: "zenith" }]
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          throw new Error("unexpected cdp send");
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      now: 3_200,
+      surveySessionFn: async () => ({
+        status: "ready",
+        screenUsername: null,
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "error",
+        resultType: "exception",
+        exception: true,
+        error: "boom",
+        rawCandidates: [],
+        acceptedCandidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.deepEqual(diagnosticState.diagnostics.closure_scan.errors, ["boom"]);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("raw candidates retain rejection reasons and strict filter is applied after raw candidate recording", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    writeFileSync(paths.closurePath, "");
+    recordQuickPlayClosureCandidates(
+      diagnosticState,
+      {
+        attempt: 1,
+        resultType: "accepted_candidates_found",
+        rawCandidates: [
+          {
+            candidateId: "raw-1",
+            locator: "Ai",
+            objectKeys: ["ejectState"],
+            typeof: "object",
+            hasBoardLike: true,
+            hasCurrentLike: false,
+            hasQueueLike: true,
+            hasHoldLike: false,
+            hasGameId: false,
+            hasSeed: false,
+            hasUserId: false,
+            rejectedReason: ["current_missing"]
+          },
+          {
+            candidateId: "raw-2",
+            locator: "Game",
+            objectKeys: ["ejectState", "ejectBoardState"],
+            typeof: "object",
+            hasBoardLike: true,
+            hasCurrentLike: true,
+            hasQueueLike: true,
+            hasHoldLike: true,
+            hasGameId: true,
+            hasSeed: true,
+            hasUserId: true,
+            rejectedReason: []
+          }
+        ],
+        acceptedCandidates: [
+          {
+            candidateId: "raw-2",
+            locator: "Game",
+            pieceCounter: 2,
+            current: "t",
+            hold: "i",
+            queue: ["o", "s"],
+            boardWidth: 10,
+            boardHeight: 20,
+            boardHash: "abcd1234",
+            rowOccupancy: [0, 1],
+            playing: true,
+            ended: false
+          }
+        ]
+      },
+      4_000
+    );
+
+    const lines = readFileSync(paths.closurePath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(lines.length, 2);
+    assert.deepEqual(lines[0].rejected_reason, ["current_missing"]);
+    assert.equal(diagnosticState.closureCandidates.size, 1);
+    assert.equal(diagnosticState.diagnostics.closure_scan.raw_candidate_count, 2);
+    assert.equal(diagnosticState.diagnostics.closure_scan.accepted_candidate_count, 1);
+    assert.equal(
+      diagnosticState.diagnostics.closure_scan.rejection_counts.current_missing,
+      1
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("successful Solo capture emits a read-only fingerprint", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const closureCaptureState = createClosureCaptureState();
+  closureCaptureState.soloClosureFingerprintPath = paths.fingerprintPath;
+  closureCaptureState.windowSequence = 9;
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        return {
+          result: [
+            {
+              name: "Ai",
+              value: { objectId: "candidate-1" }
+            }
+          ]
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState", "meta"],
+                ejectKeys: ["game", "stats"],
+                stateKeys: ["board", "queue", "hold"],
+                boardStateKeys: ["b", "w"]
+              }
+            }
+          };
+        }
+        return {
+          result: {
+            value: {
+              ok: true,
+              source: "closure:Ai",
+              locator: "Ai"
+            }
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  try {
+    const result = await exposeTetrioGameFromPausedCallFrames(
+      cdp,
+      {
+        callFrames: [{
+          callFrameId: "frame-1",
+          functionName: "tickGame",
+          url: "https://tetr.io/assets/game-main.a1b2c3d4.js",
+          location: { scriptId: "101" },
+          scopeChain: [{ type: "local", object: { objectId: "scope-1" } }]
+        }]
+      },
+      {
+        closureCaptureState,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.ok, true);
+    assert.equal(result.locator, "Ai");
+    assert.equal(closureCaptureState.lastSuccessfulLocator, "");
+    assert.ok(existsSync(paths.fingerprintPath));
+
+    const fingerprint = JSON.parse(readFileSync(paths.fingerprintPath, "utf8"));
+    assert.equal(fingerprint.target_generation, 9);
+    assert.equal(fingerprint.script_url_basename, "game-main.a1b2c3d4.js");
+    assert.equal(fingerprint.frame_function_name, "tickGame");
+    assert.equal(fingerprint.local_binding_name, "Ai");
+    assert.equal(fingerprint.successful_locator, "Ai");
+    assert.deepEqual(fingerprint.property_chain, ["Ai", "ejectState", "game", "board"]);
+    assert.deepEqual(fingerprint.root_object_keys, ["ejectState", "ejectBoardState", "meta"]);
+    assert.equal("board" in fingerprint, false);
+    assert.equal("queue" in fingerprint, false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("fingerprint frame matching does not require binding name Ai and minified bindings are inspected", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  writeFileSync(paths.fingerprintPath, JSON.stringify({
+    script_url_basename: "game-main.deadbeef.js",
+    frame_function_name: "_tick",
+    call_frame_index: 1,
+    scope_index: 4,
+    scope_type: "closure",
+    local_binding_name: "Ai",
+    successful_locator: "Ai",
+    property_chain: ["Ai", "ejectState", "game", "board"]
+  }));
+  const getPropertiesCalls = [];
+  const inspectedObjectIds = [];
+  const objectMap = {
+    "binding-at": {
+      ejectState: {
+        game: {
+          board: createBoard(),
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          gameid: 7001,
+          seed: 8001,
+          userid: "user-1",
+          stats: { piecesplaced: 4 }
+        }
+      }
+    },
+    "binding-bs": {
+      state: {
+        board: createBoard(),
+        seed: 8101,
+        stats: { piecesplaced: 2 }
+      }
+    },
+    "binding-bc": {
+      foo: { bar: 1 }
+    }
+  };
+  const descriptorsByScope = {
+    "scope-vendor": [
+      { name: "console", value: { type: "object", objectId: "vendor-console", className: "Console" } },
+      { name: "window", value: { type: "object", objectId: "vendor-window", className: "Window" } },
+      { name: "counter", value: { type: "number", value: 1 } },
+      { name: "fn", value: { type: "function" } }
+    ],
+    "scope-game-3": [
+      { name: "older", value: { type: "object", objectId: "older-binding", className: "Object" } }
+    ],
+    "scope-game-4": [
+      { name: "at", value: { type: "object", objectId: "binding-at", className: "Object" } },
+      { name: "bc", value: { type: "object", objectId: "binding-bc", className: "Object" } },
+      { name: "bs", value: { type: "object", objectId: "binding-bs", className: "Object" } },
+      { name: "Jl", value: { type: "function" } },
+      { name: "Qi", value: { type: "number", value: 7 } }
+    ]
+  };
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        getPropertiesCalls.push(params.objectId);
+        return {
+          result: descriptorsByScope[params.objectId] ?? []
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        inspectedObjectIds.push(params.objectId);
+        const target = objectMap[params.objectId];
+        if (!target) {
+          throw new Error(`unexpected inspection ${params.objectId}`);
+        }
+        return {
+          result: {
+            value: executeObjectFunction(params.functionDeclaration, target)
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      cdp,
+      {
+        callFrames: [
+          {
+            callFrameId: "frame-vendor",
+            functionName: "track",
+            url: "https://cdn.vendor.example/tracker.12345678.js",
+            location: { scriptId: "201", lineNumber: 1, columnNumber: 1 },
+            scopeChain: [{ type: "local", object: { objectId: "scope-vendor" } }]
+          },
+          ...Array.from({ length: 12 }, (_, index) => ({
+            callFrameId: `frame-noise-${index}`,
+            functionName: index === 3 ? "sentryWrapped" : "noise",
+            url: `https://cdn.vendor.example/noise-${index}.js`,
+            location: { scriptId: `${300 + index}`, lineNumber: 1, columnNumber: 1 },
+            scopeChain: [{ type: "local", object: { objectId: `scope-noise-${index}` } }]
+          })),
+          {
+            callFrameId: "frame-game",
+            functionName: "_tick",
+            url: "https://tetr.io/assets/game-main.00112233.js",
+            location: { scriptId: "101", lineNumber: 4, columnNumber: 2 },
+            scopeChain: [
+              { type: "local", object: { objectId: "scope-game-0" } },
+              { type: "local", object: { objectId: "scope-game-1" } },
+              { type: "local", object: { objectId: "scope-game-2" } },
+              { type: "closure", object: { objectId: "scope-game-3" } },
+              { type: "closure", object: { objectId: "scope-game-4" } }
+            ]
+          }
+        ]
+      },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500
+      }
+    );
+
+    const inventoryLines = readFileSync(paths.callframePath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    assert.equal(inventoryLines.length, 14);
+    assert.deepEqual(
+      inventoryLines[0].scopes[0].binding_names,
+      ["console", "window", "counter", "fn"]
+    );
+    assert.equal(result.framesScanned, 1);
+    assert.equal(result.scopesScanned, 1);
+    assert.equal(result.tickFramesSeen, 1);
+    assert.equal(result.selectedTickFrames, 1);
+    assert.equal(result.candidateClosureScopesSeen, 2);
+    assert.equal(result.selectedPrimaryScopes, 1);
+    assert.equal(result.selectedSecondaryScopes, 1);
+    assert.deepEqual(inspectedObjectIds, ["binding-at", "binding-bc", "binding-bs"]);
+    assert.ok(!inspectedObjectIds.includes("vendor-console"));
+    assert.ok(!inspectedObjectIds.includes("vendor-window"));
+    assert.deepEqual(result.targetedBindingInspection, {
+      attempt: 1,
+      selected_function_name: "_tick",
+      selected_call_frame_index: 13,
+      selected_scope_index: 4,
+      selected_scope_type: "closure",
+      inventory_binding_count: 5,
+      properties_binding_count: 5,
+      inspected_object_bindings: ["at", "bc", "bs"],
+      skipped_primitive_bindings: ["Qi"],
+      skipped_function_bindings: ["Jl"],
+      result: "accepted_candidates_found"
+    });
+    assert.equal(result.acceptedCandidates.length, 1);
+    assert.ok(
+      result.acceptedCandidates.some(
+        (candidate) =>
+          candidate.bindingName === "at" &&
+          candidate.fullPath === "frame[13].scope[4].at.ejectState.game.board" &&
+          candidate.matchedShape === "ejectState.game.board"
+      )
+    );
+    assert.ok(
+      result.rawCandidates.some(
+        (candidate) =>
+          candidate.bindingName === "bs" &&
+          candidate.fullPath === "frame[13].scope[4].bs.state.board" &&
+          candidate.matchedShape === "state.board" &&
+          candidate.hasBoardLike === true &&
+          candidate.rejectedReason?.includes("queue_missing")
+      )
+    );
+    assert.ok(getPropertiesCalls.includes("scope-game-4"));
+    assert.ok(getPropertiesCalls.includes("scope-vendor"));
+    assert.ok(!inspectedObjectIds.includes("Qi"));
+    assert.ok(!inspectedObjectIds.includes("Jl"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("targeted scope handoff mismatch is reported when inventory bindings disappear at inspection time", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  writeFileSync(paths.fingerprintPath, JSON.stringify({
+    script_url_basename: "game-main.deadbeef.js",
+    frame_function_name: "_tick",
+    call_frame_index: 1,
+    scope_index: 4,
+    scope_type: "closure"
+  }));
+  let scopeGame4Reads = 0;
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        if (params.objectId === "scope-vendor") {
+          return {
+            result: [{ name: "console", value: { type: "object", objectId: "vendor-console" } }]
+          };
+        }
+        if (params.objectId === "scope-game-4") {
+          scopeGame4Reads += 1;
+          return scopeGame4Reads === 1
+            ? {
+                result: [
+                  { name: "at", value: { type: "object", objectId: "binding-at", className: "Object" } },
+                  { name: "bc", value: { type: "object", objectId: "binding-bc", className: "Object" } },
+                  { name: "bs", value: { type: "object", objectId: "binding-bs", className: "Object" } },
+                  { name: "Jl", value: { type: "function" } },
+                  { name: "Qi", value: { type: "number", value: 7 } }
+                ]
+              }
+            : { result: [] };
+        }
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      cdp,
+      {
+        callFrames: [
+          {
+            callFrameId: "frame-vendor",
+            functionName: "track",
+            url: "https://cdn.vendor.example/tracker.12345678.js",
+            location: { scriptId: "201", lineNumber: 1, columnNumber: 1 },
+            scopeChain: [{ type: "local", object: { objectId: "scope-vendor" } }]
+          },
+          ...Array.from({ length: 12 }, (_, index) => ({
+            callFrameId: `frame-noise-${index}`,
+            functionName: "noise",
+            url: `https://cdn.vendor.example/noise-${index}.js`,
+            location: { scriptId: `${300 + index}`, lineNumber: 1, columnNumber: 1 },
+            scopeChain: [{ type: "local", object: { objectId: `scope-noise-${index}` } }]
+          })),
+          {
+            callFrameId: "frame-game",
+            functionName: "_tick",
+            url: "https://tetr.io/assets/game-main.00112233.js",
+            location: { scriptId: "101", lineNumber: 4, columnNumber: 2 },
+            scopeChain: [
+              { type: "local", object: { objectId: "scope-game-0" } },
+              { type: "local", object: { objectId: "scope-game-1" } },
+              { type: "local", object: { objectId: "scope-game-2" } },
+              { type: "closure", object: { objectId: "scope-game-3" } },
+              { type: "closure", object: { objectId: "scope-game-4" } }
+            ]
+          }
+        ]
+      },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "target_handoff_mismatch");
+    assert.deepEqual(result.targetedBindingInspection, {
+      attempt: 1,
+      selected_function_name: "_tick",
+      selected_call_frame_index: 13,
+      selected_scope_index: 4,
+      selected_scope_type: "closure",
+      inventory_binding_count: 5,
+      properties_binding_count: 0,
+      inspected_object_bindings: [],
+      skipped_primitive_bindings: [],
+      skipped_function_bindings: [],
+      result: "target_handoff_mismatch"
+    });
+    assert.equal(result.rawCandidates.length, 0);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("_tick scope4 primary falls back to scope3 in the same frame when scope4 has no accepted candidates", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  writeFileSync(paths.fingerprintPath, JSON.stringify({
+    script_url_basename: "game-main.deadbeef.js",
+    frame_function_name: "_tick",
+    call_frame_index: 1,
+    scope_index: 4,
+    scope_type: "closure"
+  }));
+  const inspectedObjectIds = [];
+  const descriptorsByScope = {
+    "scope-game-3": [
+      { name: "lr", value: { type: "object", objectId: "binding-lr", className: "Object" } }
+    ],
+    "scope-game-4": [
+      { name: "noise", value: { type: "object", objectId: "binding-noise", className: "Object" } }
+    ]
+  };
+  const objectMap = {
+    "binding-noise": { foo: { bar: 1 } },
+    "binding-lr": {
+      ejectState: {
+        game: {
+          board: createBoard(),
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          gameid: 7002,
+          seed: 8002,
+          userid: "user-2",
+          stats: { piecesplaced: 7 }
+        }
+      }
+    }
+  };
+  const cdp = {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        return { result: descriptorsByScope[params.objectId] ?? [] };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        inspectedObjectIds.push(params.objectId);
+        return {
+          result: {
+            value: executeObjectFunction(params.functionDeclaration, objectMap[params.objectId])
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      cdp,
+      {
+        callFrames: [
+          ...Array.from({ length: 13 }, (_, index) => ({
+            callFrameId: `frame-${index}`,
+            functionName: index === 12 ? "_tick" : "noise",
+            url: index === 12 ? "https://tetr.io/assets/game-main.00112233.js" : `https://cdn.vendor.example/${index}.js`,
+            location: { scriptId: `${100 + index}`, lineNumber: 1, columnNumber: 1 },
+            scopeChain: index === 12
+              ? [
+                  { type: "local", object: { objectId: "scope-game-0" } },
+                  { type: "closure", object: { objectId: "scope-game-1" } },
+                  { type: "closure", object: { objectId: "scope-game-2" } },
+                  { type: "closure", object: { objectId: "scope-game-3" } },
+                  { type: "closure", object: { objectId: "scope-game-4" } }
+                ]
+              : [{ type: "local", object: { objectId: `scope-noise-${index}` } }]
+          }))
+        ]
+      },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "accepted_candidates_found");
+    assert.equal(result.scopesScanned, 2);
+    assert.deepEqual(inspectedObjectIds, ["binding-noise", "binding-lr"]);
+    assert.ok(
+      result.acceptedCandidates.some(
+        (candidate) => candidate.fullPath === "frame[12].scope[3].lr.ejectState.game.board"
+      )
+    );
+    assert.deepEqual(result.targetedBindingInspection, {
+      attempt: 1,
+      selected_function_name: "_tick",
+      selected_call_frame_index: 12,
+      selected_scope_index: 3,
+      selected_scope_type: "closure",
+      inventory_binding_count: 1,
+      properties_binding_count: 1,
+      inspected_object_bindings: ["lr"],
+      skipped_primitive_bindings: [],
+      skipped_function_bindings: [],
+      result: "accepted_candidates_found"
+    });
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("self remains unresolved without explicit evidence and known userid is never hardcoded", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    diagnosticState.wsPlayers.set("localish", {
+      userid: "6a5042ff2dfdb4928a8950fe",
+      username: null,
+      gameid: 2722,
+      seed: 1147220906,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    diagnosticState.sessionCandidates.set("window.app.room.root.user", {
+      path: "window.app.room.root.user",
+      userid: "6a5042ff2dfdb4928a8950fe",
+      username: "not-self",
+      userid_present: true,
+      username_present: true,
+      screen_username_matches: false,
+      candidate_kind: "participant_candidate",
+      evidence: ["contains_roster_or_game_fields"],
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.ws_self_evidence.status, "unresolved");
+    assert.equal(report.local_resolution, null);
+    assert.ok(
+      report.ws_self_evidence.rejected_strategies.includes(
+        "no_verified_storage_identity_candidate"
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("resolved self requires non-empty userid and gameid even when evidence count is high", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    diagnosticState.wsEnvelopes = Array.from({ length: 59 }, (_, index) => ({
+      direction: "inbound",
+      request_id: `req-${index}`,
+      root_keys: ["self"],
+      payload_keys: ["player"],
+      candidate_paths: ["root.self"],
+      players: [
+        {
+          userid: null,
+          username: `player-${index}`,
+          gameid: null
+        }
+      ]
+    }));
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.ws_self_evidence.status, "unresolved");
+    assert.equal(report.ws_self_evidence.userid, null);
+    assert.equal(report.ws_self_evidence.gameid, null);
+    assert.equal(report.ws_self_evidence.evidence.length, 59);
+    assert.ok(
+      report.ws_self_evidence.rejected_strategies.includes(
+        "resolved_identity_invariant_failed"
+      )
+    );
+    assert.equal(report.local_resolution, null);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("resolved self without closure match reports identity resolved but closure unresolved", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    diagnosticState.sessionCandidates.set("localStorage.userConfig", {
+      path: "localStorage.userConfig",
+      userid: "user-7",
+      username: "ExactLocal",
+      userid_present: true,
+      username_present: true,
+      screen_username_matches: true,
+      candidate_kind: "storage_identity",
+      evidence: ["storage_identity"],
+      firstSeen: 1,
+      lastSeen: 2
+    });
+    diagnosticState.wsPlayers.set("player", {
+      userid: "user-7",
+      username: "ExactLocal",
+      gameid: 7007,
+      seed: 9007,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.ws_self_evidence.status, "resolved");
+    assert.deepEqual(report.local_resolution, {
+      status: "identity_resolved_closure_unresolved",
+      userid: "user-7",
+      gameid: 7007,
+      session_candidate_path: "localStorage.userConfig",
+      ws_player_id: "user-7|7007|ExactLocal",
+      closure_candidate_id: null,
+      matched_by: ["storage_identity_userid"],
+      confidence: "medium"
+    });
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("unique accepted _tick closure binds resolved self identity and writes passive snapshot", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 13;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 1_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.nextClosureSurveyAt = 1_000;
+    diagnosticState.closureScanState.pendingReason = "retry";
+    diagnosticState.wsEnvelopes.push({
+      direction: "inbound",
+      root_keys: ["self"],
+      payload_keys: ["player"],
+      players: [{ userid: "user-7", username: "ExactLocal", gameid: 7007 }]
+    });
+    diagnosticState.wsPlayers.set("player", {
+      userid: "user-7",
+      username: "ExactLocal",
+      gameid: 7007,
+      seed: 9007,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method, params = {}) {
+          if (method === "Runtime.callFunctionOn") {
+            if (params.returnByValue === false) {
+              return { result: { objectId: "retained-1" } };
+            }
+            if (
+              params.objectId === "candidate-1" &&
+              String(params.functionDeclaration).includes("retained_object_stage")
+            ) {
+              return {
+                result: {
+                  value: {
+                    requested_path: ["state"],
+                    resolved_segments: ["state"],
+                    failed_segment: null,
+                    path_resolved: true,
+                    accessor_exception: false,
+                    value_type: "object",
+                    retained_object_stage: "state",
+                    root_diagnostics: {
+                      raw_type: "object",
+                      constructor: "Object",
+                      own_keys: ["board", "current", "hold", "queue"],
+                      has_board: true,
+                      has_falling: false,
+                      has_hold: true,
+                      has_bag: false,
+                      has_game: false,
+                      has_state: false
+                    }
+                  }
+                }
+              };
+            }
+            return {
+              result: {
+                value: {
+                  status: "ready",
+                  board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                  current: "t",
+                  hold: "i",
+                  queue: ["o", "s", "z"],
+                  playing: true,
+                  started: true,
+                  countdown_started: false,
+                  paused: false,
+                  destroyed: false,
+                  successful: null,
+                  gameoverreason: null,
+                  piece_counter: 4,
+                  board_width: 10,
+                  board_height: 40,
+                  current_path: ["state", "current"],
+                  hold_path: ["state", "hold"],
+                  queue_path: ["state", "queue"],
+                  board_normalized: true,
+                  current_normalized: true,
+                  hold_normalized: true,
+                  queue_normalized: true
+                }
+              }
+            };
+          }
+          if (method === "Runtime.releaseObject" || method === "Runtime.releaseObjectGroup") {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 1_000,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: true,
+        resultType: "accepted_candidates_found",
+        callframesSeen: 20,
+        tickFramesSeen: 1,
+        selectedTickFrames: 1,
+        matchingFramesSeen: 1,
+        matchingScopesSeen: 1,
+        candidateClosureScopesSeen: 2,
+        selectedPrimaryScopes: 1,
+        selectedSecondaryScopes: 1,
+        targetedInspections: 1,
+        targetHandoffMismatches: 0,
+        inventoryRowsWritten: 20,
+        rawCandidates: [{
+          candidateId: "cand-1",
+          locator: "ra",
+          functionName: "_tick",
+          callFrameIndex: 13,
+          scopeIndex: 4,
+          scopeType: "closure",
+          bindingName: "ra",
+          fullPath: "frame[13].scope[4].ra.state.board",
+          matchedShape: "state.board",
+          hasBoardLike: true,
+          hasCurrentLike: true,
+          hasQueueLike: true,
+          hasHoldLike: true,
+          rootObjectId: "candidate-1",
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          pieceCounter: 4,
+          boardWidth: 10,
+          boardHeight: 40,
+          boardHash: "abcd1234",
+          rowOccupancy: [0, 0, 1],
+          playing: true,
+          ended: false,
+          accepted: true,
+          rejectedReason: []
+        }],
+        acceptedCandidates: [{
+          candidateId: "cand-1",
+          locator: "ra",
+          functionName: "_tick",
+          callFrameIndex: 13,
+          scopeIndex: 4,
+          scopeType: "closure",
+          bindingName: "ra",
+          fullPath: "frame[13].scope[4].ra.state.board",
+          matchedShape: "state.board",
+          rootObjectId: "candidate-1",
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          pieceCounter: 4,
+          boardWidth: 10,
+          boardHeight: 40,
+          boardHash: "abcd1234",
+          rowOccupancy: [0, 0, 1],
+          playing: true,
+          ended: false,
+          objectKeys: []
+        }]
+      }),
+      log: () => {}
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.deepEqual(report.local_resolution, {
+      status: "resolved",
+      userid: "user-7",
+      gameid: 7007,
+      session_candidate_path: null,
+      ws_player_id: "user-7|7007|ExactLocal",
+      closure_candidate_id: "cand-1",
+      matched_by: ["explicit_ws_marker", "unique_local_tick_closure"],
+      confidence: "high"
+    });
+    assert.equal(report.diagnostics.passive_snapshot.candidate_bound, true);
+    assert.equal(report.diagnostics.passive_snapshot.identity_bound, true);
+    assert.equal(report.diagnostics.passive_snapshot.reads_succeeded, 1);
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.source, "quick_play_closure");
+    assert.equal(snapshot.snapshot.userid, "user-7");
+    assert.equal(snapshot.snapshot.gameid, 7007);
+    assert.equal(snapshot.snapshot.current?.type, "t");
+    assert.deepEqual(snapshot.snapshot.queue, ["o", "s", "z"]);
+    assert.equal(JSON.stringify(snapshot).includes("retained-1"), false);
+    assert.equal(JSON.stringify(report).includes("retained-1"), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multiple accepted candidates remain unresolved and passive snapshot stays unavailable", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.nextClosureSurveyAt = 2_000;
+    diagnosticState.closureScanState.pendingReason = "retry";
+    diagnosticState.wsEnvelopes.push({
+      direction: "inbound",
+      root_keys: ["self"],
+      payload_keys: ["player"],
+      players: [{ userid: "user-8", username: "Local", gameid: 8008 }]
+    });
+    diagnosticState.wsPlayers.set("player", {
+      userid: "user-8",
+      username: "Local",
+      gameid: 8008,
+      seed: 9108,
+      firstSeen: 1,
+      lastSeen: 2
+    });
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          if (method === "Runtime.releaseObject" || method === "Runtime.releaseObjectGroup") {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 2_000,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: true,
+        resultType: "accepted_candidates_found",
+        rawCandidates: [],
+        acceptedCandidates: [
+          { candidateId: "cand-a", rootObjectId: "obj-a", functionName: "_tick", callFrameIndex: 13, scopeIndex: 4, scopeType: "closure", bindingName: "a", matchedShape: "state.board", playing: true, ended: false },
+          { candidateId: "cand-b", rootObjectId: "obj-b", functionName: "_tick", callFrameIndex: 13, scopeIndex: 4, scopeType: "closure", bindingName: "b", matchedShape: "state.board", playing: true, ended: false }
+        ]
+      }),
+      log: () => {}
+    });
+
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    assert.equal(report.local_resolution.status, "identity_resolved_closure_unresolved");
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.deepEqual(snapshot, {
+      status: "unavailable",
+      reason: "ambiguous_accepted_candidates"
+    });
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("timeout path releases retained passive candidate handle", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  const methods = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 3_000,
+      log: () => {}
+    });
+    diagnosticState.boundLocalClosureCandidate.rootObjectId = "retained-2";
+    diagnosticState.boundLocalClosureCandidate.candidateId = "cand-timeout";
+    diagnosticState.stopAt = 3_001;
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method) {
+          methods.push(method);
+          return {};
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 3_002,
+      log: () => {}
+    });
+
+    assert.ok(methods.includes("Runtime.releaseObject"));
+    assert.ok(methods.includes("Runtime.releaseObjectGroup"));
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.deepEqual(snapshot, {
+      status: "unavailable",
+      reason: "duration_elapsed"
+    });
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("candidate first and identity later binds successfully once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 21;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_000,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 21,
+      candidateId: "cand-late-identity",
+      rootObjectId: "retained-late-identity",
+      capturedAt: 4_000
+    });
+    diagnosticState.closureCandidates.set("cand-late-identity", {
+      candidate_id: "cand-late-identity",
+      function_name: "_tick",
+      scope_type: "closure",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false,
+      firstSeen: 4_000,
+      lastSeen: 4_000
+    });
+
+    const deferred = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "accepted_candidate",
+      browserControlState: controlState,
+      now: 4_000,
+      log: () => {}
+    });
+    assert.equal(deferred.result, "deferred");
+    assert.equal(deferred.deferredReason, "identity_not_ready");
+    assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-late-identity");
+
+    const identityUpdate = updateQuickPlayPendingIdentity(
+      diagnosticState,
+      { status: "resolved", userid: "user-late", gameid: 4021 },
+      4_010
+    );
+    assert.equal(identityUpdate.changed, true);
+    const bound = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: identityUpdate.reason,
+      browserControlState: controlState,
+      now: 4_010,
+      log: () => {}
+    });
+    assert.equal(bound.result, "bound");
+    assert.equal(bound.shouldStartPolling, true);
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.bind_succeeded, 1);
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.bind_deferred_reasons.identity_not_ready,
+      1
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("accepted candidate is retained before Debugger.resume and diagnostic cleanup", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 29;
+  const diagnosticState = makeQuickPlayState(paths);
+  const calls = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 3_900,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.roundObserved = true;
+
+    const pausedEvent = {
+      callFrames: [
+        {
+          callFrameId: "frame-1",
+          functionName: "_tick",
+          location: {
+            scriptId: "1",
+            lineNumber: 14,
+            columnNumber: 0
+          },
+          scopeChain: [null, null, null, null, {
+            type: "closure",
+            object: { objectId: "scope-4" }
+          }]
+        }
+      ]
+    };
+    const cdp = {
+      async send(method, params = {}) {
+        calls.push({ method, params });
+        if (
+          method === "Debugger.enable" ||
+          method === "Debugger.pause" ||
+          method === "Debugger.resume" ||
+          method === "Debugger.disable"
+        ) {
+          return {};
+        }
+        if (method === "Runtime.getProperties" && params.objectId === "scope-4") {
+          return {
+            result: [
+              {
+                name: "Ai",
+                value: {
+                  type: "object",
+                  objectId: "candidate-root"
+                }
+              }
+            ]
+          };
+        }
+      if (
+        method === "Runtime.callFunctionOn" &&
+        params.objectId === "candidate-root"
+      ) {
+        if (params.returnByValue === false) {
+          return {
+            result: {
+              objectId: "retained-root"
+            }
+          };
+        }
+        return {
+          result: {
+            value: {
+              ...executeObjectFunction(
+                params.functionDeclaration,
+                {
+                  state: {
+                    board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                    current: "t",
+                    hold: "i",
+                    queue: ["o", "s", "z"],
+                    destroyed: false
+                  }
+                },
+                (params.arguments ?? []).map((entry) => entry?.value)
+              ),
+              candidateId: "paused:0:4:0:Ai",
+              locator: "Ai",
+              bindingName: "Ai",
+              fullPath: "frame[0].scope[4].Ai.state.board",
+              matchedShape: "state.board",
+              objectKeys: ["state"],
+              typeof: "object",
+              hasBoardLike: true,
+              hasCurrentLike: true,
+              hasQueueLike: true,
+              hasHoldLike: true,
+              hasGameId: false,
+              hasSeed: false,
+              hasUserId: false,
+              rejectedReason: [],
+              current: "t",
+              hold: "i",
+              queue: ["o", "s", "z"],
+              pieceCounter: 1,
+              boardWidth: 10,
+              boardHeight: 40,
+              boardHash: "abcd1234",
+              rowOccupancy: [0, 0, 0],
+              playing: true,
+              ended: false,
+              accepted: true
+            }
+          }
+        };
+        }
+        if (
+          method === "Runtime.releaseObjectGroup" &&
+          params.objectGroup === "fusion-quick-play-diagnostic"
+        ) {
+          return {};
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      async waitForEvent(method) {
+        assert.equal(method, "Debugger.paused");
+        return pausedEvent;
+      }
+    };
+
+    const scan = await scanQuickPlayClosureCandidates(
+      cdp,
+      { lastRuntimeError: "" },
+      () => {},
+      diagnosticState,
+      4
+    );
+
+    assert.equal(scan.retainResult?.ok, true);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-root");
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), ["state"]);
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.boardPath), ["board"]);
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.currentPath), ["current"]);
+    const retainCallIndex = calls.findIndex(
+      (entry) =>
+        entry.method === "Runtime.callFunctionOn" &&
+        entry.params.returnByValue === false &&
+        Array.isArray(entry.params.arguments) &&
+        entry.params.arguments[0]?.value?.[0] === "state"
+    );
+    const resumeIndex = calls.findIndex((entry) => entry.method === "Debugger.resume");
+    const releaseGroupIndex = calls.findIndex(
+      (entry) =>
+        entry.method === "Runtime.releaseObjectGroup" &&
+        entry.params.objectGroup === "fusion-quick-play-diagnostic"
+    );
+    assert.ok(retainCallIndex >= 0);
+    assert.ok(resumeIndex > retainCallIndex);
+    assert.ok(releaseGroupIndex > resumeIndex);
+    assert.ok(
+      !calls.some(
+        (entry) =>
+          entry.method === "Runtime.releaseObjectGroup" &&
+          entry.params.objectGroup === "fusion-quick-play-passive"
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("missing runtime handle records candidate_retain_failed diagnostics", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 30;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_500,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const result = await retainQuickPlayPassiveCandidateHandle(
+      {
+        async send() {
+          throw new Error("send should not be called");
+        }
+      },
+      diagnosticState,
+      {
+        candidateId: "cand-missing-handle",
+        matchedShape: "state.board",
+        functionName: "_tick",
+        scopeIndex: 4,
+        scopeType: "closure",
+        bindingName: "Ai"
+      },
+      {
+        generation: 30,
+        targetId: "https://tetr.io/",
+        capturedAt: 4_500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "missing_runtime_object_handle");
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.candidate_retain_attempts, 1);
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.candidate_retain_failed, 1);
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.last_candidate_retain_failure,
+      "missing_runtime_object_handle"
+    );
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.last_failure_reason,
+      "candidate_retain_failed"
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("report sanitization keeps internal retained handle private", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 31;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_800,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const acceptedCandidate = {
+      candidateId: "cand-report",
+      rootObjectId: "raw-root",
+      functionName: "_tick",
+      callFrameIndex: 14,
+      scopeIndex: 4,
+      scopeType: "closure",
+      bindingName: "Ai",
+      matchedShape: "state.board",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false
+    };
+    recordQuickPlayClosureCandidates(
+      diagnosticState,
+      {
+        acceptedCandidates: [acceptedCandidate],
+        rawCandidates: [acceptedCandidate]
+      },
+      4_800
+    );
+
+    const retain = await retainQuickPlayPassiveCandidateHandle(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.callFunctionOn") {
+            return params.returnByValue === false
+              ? {
+                  result: {
+                    objectId: "retained-report"
+                  }
+                }
+              : {
+                  result: {
+                    value: {
+                      requested_path: ["state"],
+                      resolved_segments: ["state"],
+                      failed_segment: null,
+                      path_resolved: true,
+                      accessor_exception: false,
+                      value_type: "object",
+                      retained_object_stage: "state",
+                      root_diagnostics: {
+                        raw_type: "object",
+                        constructor: "Object",
+                        own_keys: ["board", "current", "hold", "queue"],
+                        has_board: true,
+                        has_falling: false,
+                        has_hold: true,
+                        has_bag: false,
+                        has_game: false,
+                        has_state: false
+                      }
+                    }
+                  }
+                };
+          }
+          if (method === "Runtime.releaseObject") {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      diagnosticState,
+      acceptedCandidate,
+      {
+        generation: 31,
+        targetId: "https://tetr.io/",
+        capturedAt: 4_800,
+        log: () => {}
+      }
+    );
+    const report = buildQuickPlayRuntimeReport(diagnosticState);
+    const serialized = JSON.stringify(report);
+
+    assert.equal(retain.ok, true);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-report");
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(report.closure_candidates[0], "rootObjectId"),
+      false
+    );
+    assert.ok(!serialized.includes("raw-root"));
+    assert.ok(!serialized.includes("retained-report"));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("retained passive candidate traverses root path before cloning", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 32;
+  const diagnosticState = makeQuickPlayState(paths);
+  const bindingRoot = {
+    state: {
+      board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"]
+    }
+  };
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_100,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const retain = await retainQuickPlayPassiveCandidateHandle(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.callFunctionOn" && params.returnByValue === true) {
+            return {
+              result: {
+                value: executeObjectFunction(
+                  params.functionDeclaration,
+                  bindingRoot,
+                  (params.arguments ?? []).map((entry) => entry?.value)
+                )
+              }
+            };
+          }
+          if (method === "Runtime.callFunctionOn" && params.returnByValue === false) {
+            assert.ok(String(params.functionDeclaration).trim().startsWith("function("));
+            assert.deepEqual((params.arguments ?? []).map((entry) => entry?.value), [["state"]]);
+            return {
+              result: {
+                objectId: "retained-state"
+              }
+            };
+          }
+          if (method === "Runtime.releaseObject") {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      diagnosticState,
+      {
+        candidateId: "cand-retain-state",
+        rootObjectId: "binding-root",
+        functionName: "_tick",
+        scopeIndex: 4,
+        scopeType: "closure",
+        bindingName: "Ai",
+        matchedShape: "state.board",
+        current: "t",
+        hold: "i",
+        queue: ["o", "s", "z"]
+      },
+      {
+        generation: 32,
+        targetId: "https://tetr.io/",
+        capturedAt: 5_100,
+        log: () => {}
+      }
+    );
+
+    assert.equal(retain.ok, true);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-state");
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), ["state"]);
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.boardPath), ["board"]);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("root path invariant mismatch rejects board handle retained as state", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 33;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_200,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const retain = await retainQuickPlayPassiveCandidateHandle(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.callFunctionOn" && params.returnByValue === true) {
+            return {
+              result: {
+                value: {
+                  requested_path: ["state"],
+                  resolved_segments: [],
+                  failed_segment: "state",
+                  path_resolved: false,
+                  accessor_exception: false,
+                  value_type: "undefined",
+                  retained_object_stage: "board",
+                  root_diagnostics: null
+                }
+              }
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      diagnosticState,
+      {
+        candidateId: "cand-board-mismatch",
+        rootObjectId: "board-root",
+        functionName: "_tick",
+        scopeIndex: 4,
+        scopeType: "closure",
+        bindingName: "Ai",
+        matchedShape: "state.board",
+        current: "t",
+        hold: "i",
+        queue: ["o", "s", "z"]
+      },
+      {
+        generation: 33,
+        targetId: "https://tetr.io/",
+        capturedAt: 5_200,
+        log: () => {}
+      }
+    );
+
+    assert.equal(retain.ok, false);
+    assert.equal(retain.reason, "root_path_invariant_failed");
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.last_candidate_retain_failure,
+      "root_path_invariant_failed"
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("undefined final board value is unresolved and root probe logs only once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 34;
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  const retainedRoot = {
+    current: "t",
+    hold: "i",
+    queue: ["o", "s", "z"],
+    started: true,
+    playing: true
+  };
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_300,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 34,
+      candidateId: "cand-root-probe",
+      rootObjectId: "retained-state",
+      rootPath: ["state"],
+      retainedRootPath: ["state"],
+      retainedRootKind: "state",
+      boardPath: ["board"],
+      currentPath: ["current"],
+      holdPath: ["hold"],
+      queuePath: ["queue"],
+      userid: "user-root",
+      gameid: 5034,
+      identityBound: true
+    });
+
+    const cdp = {
+      async send(method, params = {}) {
+        if (method === "Runtime.callFunctionOn") {
+          return {
+            result: {
+              value: executeObjectFunction(
+                params.functionDeclaration,
+                retainedRoot,
+                (params.arguments ?? []).map((entry) => entry?.value)
+              )
+            }
+          };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }
+    };
+
+    const first = await pollQuickPlayPassiveSnapshotNow(cdp, diagnosticState, {
+      now: 5_301,
+      log: (line) => logs.push(line)
+    });
+    const second = await pollQuickPlayPassiveSnapshotNow(cdp, diagnosticState, {
+      now: 5_302,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(first.status, "unavailable");
+    assert.equal(first.reason, "accessor_path_unresolved");
+    assert.equal(second.status, "unavailable");
+    assert.equal(second.reason, "accessor_path_unresolved");
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.field_diagnostics?.board?.path_resolved,
+      false
+    );
+    assert.deepEqual(
+      Array.from(
+        diagnosticState.diagnostics.passive_snapshot.field_diagnostics?.board?.resolved_segments ??
+          []
+      ),
+      []
+    );
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.field_diagnostics?.board?.failed_segment,
+      "board"
+    );
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.field_diagnostics?.board?.raw_type,
+      "undefined"
+    );
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.field_diagnostics?.root?.raw_type,
+      "object"
+    );
+    assert.equal(
+      logs.filter((line) => line.startsWith("[quick-play] passive root probe")).length,
+      1
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("identity first and candidate later binds successfully", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 22;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 5_000,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const identityUpdate = updateQuickPlayPendingIdentity(
+      diagnosticState,
+      { status: "resolved", userid: "user-first", gameid: 5022 },
+      5_000
+    );
+    assert.equal(identityUpdate.changed, true);
+    const deferred = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: identityUpdate.reason,
+      browserControlState: controlState,
+      now: 5_000,
+      log: () => {}
+    });
+    assert.equal(deferred.result, "deferred");
+    assert.equal(deferred.deferredReason, "candidate_not_ready");
+
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 22,
+      candidateId: "cand-late-candidate",
+      rootObjectId: "retained-late-candidate",
+      callFrameIndex: 6,
+      bindingName: "Rb",
+      capturedAt: 5_010
+    });
+    diagnosticState.closureCandidates.set("cand-late-candidate", {
+      candidate_id: "cand-late-candidate",
+      function_name: "_tick",
+      scope_type: "closure",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false,
+      firstSeen: 5_010,
+      lastSeen: 5_010
+    });
+
+    const bound = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "accepted_candidate",
+      browserControlState: controlState,
+      now: 5_010,
+      log: () => {}
+    });
+    assert.equal(bound.result, "bound");
+    assert.equal(bound.shouldStartPolling, true);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.userid, "user-first");
+    assert.equal(
+      diagnosticState.diagnostics.passive_snapshot.bind_deferred_reasons.candidate_not_ready,
+      1
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("duplicate reconciliation binds exactly once and first poll starts immediately", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 23;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 6_000,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 23,
+      candidateId: "cand-dup",
+      rootObjectId: "retained-dup",
+      callFrameIndex: 7,
+      bindingName: "Rc",
+      capturedAt: 6_000
+    });
+    diagnosticState.closureCandidates.set("cand-dup", {
+      candidate_id: "cand-dup",
+      function_name: "_tick",
+      scope_type: "closure",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false,
+      firstSeen: 6_000,
+      lastSeen: 6_000
+    });
+    updateQuickPlayPendingIdentity(
+      diagnosticState,
+      { status: "resolved", userid: "user-dup", gameid: 6023 },
+      6_001
+    );
+
+    const first = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "simultaneous",
+      browserControlState: controlState,
+      now: 6_001,
+      log: () => {}
+    });
+    const second = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "simultaneous",
+      browserControlState: controlState,
+      now: 6_002,
+      log: () => {}
+    });
+    assert.equal(first.result, "bound");
+    assert.equal(first.shouldStartPolling, true);
+    assert.equal(second.result, "bound");
+    assert.equal(second.shouldStartPolling, false);
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.bind_succeeded, 1);
+
+    await pollQuickPlayPassiveSnapshotNow(
+      {
+        async send(method) {
+          if (method === "Runtime.callFunctionOn") {
+            return {
+              result: {
+                value: {
+                  status: "ready",
+                  board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                  current: "t",
+                  hold: "i",
+                  queue: ["o", "s", "z"],
+                  playing: true,
+                  started: true,
+                  countdown_started: false,
+                  paused: false,
+                  destroyed: false,
+                  successful: null,
+                  gameoverreason: null,
+                  piece_counter: 2,
+                  board_width: 10,
+                  board_height: 40,
+                  current_path: ["game", "state", "current"],
+                  hold_path: ["game", "state", "hold"],
+                  queue_path: ["game", "state", "queue"],
+                  board_normalized: true,
+                  current_normalized: true,
+                  hold_normalized: true,
+                  queue_normalized: true
+                }
+              }
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      diagnosticState,
+      {
+        now: 6_003,
+        log: () => {}
+      }
+    );
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.polling_started, true);
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.reads_attempted, 1);
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.reads_succeeded, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("generation mismatch and inactive capture cannot bind", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 24;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 7_000,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 23,
+      candidateId: "cand-stale",
+      rootObjectId: "retained-stale",
+      callFrameIndex: 8,
+      bindingName: "Rd",
+      capturedAt: 7_000
+    });
+    diagnosticState.closureCandidates.set("cand-stale", {
+      candidate_id: "cand-stale",
+      function_name: "_tick",
+      scope_type: "closure",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false,
+      firstSeen: 7_000,
+      lastSeen: 7_000
+    });
+    updateQuickPlayPendingIdentity(
+      diagnosticState,
+      { status: "resolved", userid: "user-stale", gameid: 7024 },
+      7_001
+    );
+    let result = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "identity_resolved",
+      browserControlState: controlState,
+      now: 7_001,
+      log: () => {}
+    });
+    assert.equal(result.result, "rejected");
+    assert.equal(result.deferredReason, "generation_mismatch");
+
+    stopQuickPlayDiagnosticCapture(diagnosticState, {
+      now: 7_010,
+      reason: "duration_elapsed",
+      log: () => {}
+    });
+    result = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "identity_updated",
+      browserControlState: controlState,
+      now: 7_011,
+      log: () => {}
+    });
+    assert.equal(result.result, "rejected");
+    assert.equal(result.deferredReason, "capture_inactive");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("cleanup preserves cumulative diagnostics and final duration reason is not overwritten", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 25;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 8_000,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 25,
+      candidateId: "cand-final",
+      rootObjectId: "retained-final",
+      callFrameIndex: 9,
+      bindingName: "Re",
+      capturedAt: 8_000,
+      userid: "user-final",
+      gameid: 8025,
+      wsPlayerId: "user-final|8025|Final",
+      identityBound: true
+    });
+    diagnosticState.diagnostics.passive_snapshot.bind_succeeded = 1;
+    diagnosticState.diagnostics.passive_snapshot.reads_attempted = 1;
+    diagnosticState.diagnostics.passive_snapshot.reads_succeeded = 1;
+    diagnosticState.diagnostics.passive_snapshot.ever_candidate_bound = true;
+    diagnosticState.diagnostics.passive_snapshot.ever_identity_bound = true;
+
+    stopQuickPlayDiagnosticCapture(diagnosticState, {
+      now: 8_010,
+      reason: "duration_elapsed",
+      log: () => {}
+    });
+    await releaseQuickPlayPassiveState(
+      {
+        async send() {
+          return {};
+        }
+      },
+      diagnosticState,
+      {
+        reason: "execution_context_reset",
+        writeSnapshotStatus: false,
+        preserveDiagnostics: true,
+        log: () => {}
+      }
+    );
+
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    const report = JSON.parse(readFileSync(paths.reportPath, "utf8"));
+    assert.equal(snapshot.reason, "duration_elapsed");
+    assert.equal(report.stop_reason, "duration_elapsed");
+    assert.equal(report.diagnostics.passive_snapshot.bind_succeeded, 1);
+    assert.equal(report.diagnostics.passive_snapshot.reads_attempted, 1);
+    assert.equal(report.diagnostics.passive_snapshot.ever_candidate_bound, true);
+    assert.equal(report.diagnostics.passive_snapshot.ever_identity_bound, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("matching_frame_missing schedules bounded timing-miss retry", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 26;
+  const diagnosticState = makeQuickPlayState(paths);
+  diagnosticState.closureRetryJitterMsFn = () => 0;
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 9_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.pendingIdentity = {
+      generation: 26,
+      userid: "user-retry",
+      gameid: 9026,
+      wsPlayerId: "user-retry|9026|Retry",
+      resolvedAt: 9_000
+    };
+    diagnosticState.nextClosureSurveyAt = 9_000;
+    diagnosticState.closureScanState.pendingReason = "gameplay_signal";
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          return {};
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 9_000,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: false,
+        resultType: "matching_frame_missing",
+        callframesSeen: 6,
+        noTickAttempt: {
+          attempt: 1,
+          callframes_seen: 6,
+          top_functions: ["render", "updateStyle", "sentryWrapped"],
+          render_like_count: 1,
+          update_like_count: 1,
+          tick_like_count: 0
+        },
+        rawCandidates: [],
+        acceptedCandidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.closureScanState.pendingReason, "timing_miss");
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_160);
+    assert.equal(diagnosticState.diagnostics.closure_scan.timing_miss_count, 1);
+    assert.equal(
+      diagnosticState.diagnostics.closure_scan.timing_miss_reasons.matching_frame_missing,
+      1
+    );
+    assert.equal(diagnosticState.diagnostics.closure_scan.last_no_tick_callframes, 6);
+    assert.deepEqual(
+      diagnosticState.diagnostics.closure_scan.no_tick_attempts[0]?.top_functions,
+      ["render", "updateStyle", "sentryWrapped"]
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("gameplay packet for local gameid rearms scan and unrelated packet does not", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 27;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 10_000,
+      log: () => {}
+    });
+    diagnosticState.pendingIdentity = {
+      generation: 27,
+      userid: "user-local",
+      gameid: 10027,
+      wsPlayerId: "user-local|10027|Local",
+      resolvedAt: 10_000
+    };
+    diagnosticState.roundObserved = true;
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 10_010,
+      direction: "inbound",
+      root_keys: ["state", "players"],
+      payload_keys: ["countdown", "playing"],
+      players: [{ userid: "other-user", gameid: 99999, username: "Other" }]
+    });
+    assert.equal(diagnosticState.nextClosureSurveyAt, 0);
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 10_020,
+      direction: "inbound",
+      root_keys: ["state", "players"],
+      payload_keys: ["countdown", "playing"],
+      players: [{ userid: "user-local", gameid: 10027, username: "Local" }]
+    });
+    assert.equal(diagnosticState.nextClosureSurveyAt, 10_020);
+    assert.equal(diagnosticState.closureScanState.pendingReason, "gameplay_signal");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("retained candidate stops gameplay-triggered retry scheduling", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 11_000,
+      log: () => {}
+    });
+    diagnosticState.pendingIdentity = {
+      generation: 0,
+      userid: "user-bound",
+      gameid: 11028,
+      wsPlayerId: "user-bound|11028|Bound",
+      resolvedAt: 11_000
+    };
+    diagnosticState.roundObserved = true;
+    diagnosticState.boundLocalClosureCandidate.rootObjectId = "retained-present";
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 11_020,
+      direction: "inbound",
+      root_keys: ["player", "state"],
+      payload_keys: ["piece", "playing"],
+      players: [{ userid: "user-bound", gameid: 11028, username: "Bound" }]
+    });
+    assert.equal(diagnosticState.nextClosureSurveyAt, 0);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("retry exhaustion records specific timing-miss stop reason", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 28;
+  const diagnosticState = makeQuickPlayState(paths);
+  diagnosticState.closureRetryJitterMsFn = () => 0;
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 12_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.pendingIdentity = {
+      generation: 28,
+      userid: "user-exhaust",
+      gameid: 12028,
+      wsPlayerId: "user-exhaust|12028|Exhaust",
+      resolvedAt: 12_000
+    };
+    diagnosticState.closureScanState.nonproductiveAttempts =
+      diagnosticState.closureScanState.maxNonproductiveAttempts - 1;
+    diagnosticState.nextClosureSurveyAt = 12_000;
+    diagnosticState.closureScanState.pendingReason = "timing_miss";
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          return {};
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 12_000,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: false,
+        resultType: "pause_timeout",
+        callframesSeen: 0,
+        rawCandidates: [],
+        acceptedCandidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.closureScanState.retryExhausted, true);
+    assert.equal(diagnosticState.diagnostics.closure_scan.retry_exhausted, true);
+    assert.equal(diagnosticState.stopReason, "pause_timeout_exhausted");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("Zenith Bot Off never performs bootstrap check", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 1;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  let reads = 0;
+
+  assert.equal(
+    ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+      now: 10_000,
+      log: () => {}
+    }),
+    false
+  );
+
+  const result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState: createBootstrapState(0),
+    now: 10_000,
+    readBootstrapPageStateFn: async () => {
+      reads += 1;
+      return { readyState: "complete", href: "https://tetr.io/" };
+    },
+    log: () => {}
+  });
+
+  assert.equal(result.ran, false);
+  assert.equal(reads, 0);
+});
+
+test("Zenith Bot On performs one bounded bootstrap check loop", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 7;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  const bootstrapState = createBootstrapState(0);
+  const logs = [];
+  let reads = 0;
+  let readyNotifications = 0;
+
+  assert.equal(
+    ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+      now: 100,
+      log: (line) => logs.push(line)
+    }),
+    true
+  );
+
+  let result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 100,
+    nowFn: () => 100,
+    readBootstrapPageStateFn: async () => {
+      reads += 1;
+      updateBootstrapDocumentState(
+        bootstrapState,
+        { readyState: "loading", href: "https://tetr.io/" },
+        100
+      );
+      return { readyState: "loading", href: "https://tetr.io/" };
+    },
+    onBootstrapReady: () => {
+      readyNotifications += 1;
+    },
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(result.ran, true);
+  assert.equal(result.ready, false);
+  assert.equal(zenithBootstrapCheckState.scheduled, true);
+  assert.equal(zenithBootstrapCheckState.nextCheckAt, 350);
+
+  result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 350,
+    nowFn: () => 1_800,
+    readBootstrapPageStateFn: async () => {
+      reads += 1;
+      updateBootstrapDocumentState(
+        bootstrapState,
+        { readyState: "complete", href: "https://tetr.io/" },
+        350
+      );
+      bootstrapState.transportReadyAt = 250;
+      return { readyState: "complete", href: "https://tetr.io/" };
+    },
+    onBootstrapReady: () => {
+      readyNotifications += 1;
+    },
+    log: (line) => logs.push(line)
+  });
+
+  assert.equal(result.ran, true);
+  assert.equal(result.ready, true);
+  assert.equal(reads, 2);
+  assert.equal(readyNotifications, 1);
+  assert.ok(logs.some((line) => line.startsWith("[zenith] bootstrap check scheduled")));
+  assert.ok(logs.some((line) => line.startsWith("[zenith] bootstrap ready generation=7")));
+});
+
+test("non-Solo gating does not prevent Zenith bootstrap notification", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 3;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  const bootstrapState = readyBootstrapState(20_000);
+  let notified = 0;
+
+  ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+    now: 20_000,
+    log: () => {}
+  });
+
+  const result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 20_000,
+    nowFn: () => 20_000,
+    readBootstrapPageStateFn: async () => ({
+      readyState: "complete",
+      href: "https://tetr.io/"
+    }),
+    onBootstrapReady: () => {
+      notified += 1;
+    },
+    log: () => {}
+  });
+
+  assert.equal(result.ready, true);
+  assert.equal(notified, 1);
+});
+
+test("stale mode generation cannot complete bootstrap probe", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 11;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  const bootstrapState = readyBootstrapState(20_000);
+  let notified = 0;
+
+  ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+    now: 20_000,
+    log: () => {}
+  });
+
+  const result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 20_000,
+    readBootstrapPageStateFn: async () => {
+      controlState.modeGeneration = 12;
+      return { readyState: "complete", href: "https://tetr.io/" };
+    },
+    onBootstrapReady: () => {
+      notified += 1;
+    },
+    log: () => {}
+  });
+
+  assert.equal(result.reason, "stale_generation");
+  assert.equal(notified, 0);
+});
+
+test("Bot Off and mode switching cancel Zenith bootstrap retry", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 9;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  const bootstrapState = createBootstrapState(0);
+
+  ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+    now: 50,
+    log: () => {}
+  });
+  await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 50,
+    nowFn: () => 50,
+    readBootstrapPageStateFn: async () => {
+      updateBootstrapDocumentState(
+        bootstrapState,
+        { readyState: "loading", href: "https://tetr.io/" },
+        50
+      );
+      return { readyState: "loading", href: "https://tetr.io/" };
+    },
+    log: () => {}
+  });
+
+  assert.equal(zenithBootstrapCheckState.scheduled, true);
+  controlState.botEnabled = false;
+  resetZenithBootstrapCheckState(zenithBootstrapCheckState);
+  let result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 300,
+    readBootstrapPageStateFn: async () => {
+      throw new Error("should not run");
+    },
+    log: () => {}
+  });
+  assert.equal(result.ran, false);
+
+  controlState.botEnabled = true;
+  controlState.selectedMode = "zenith";
+  ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+    now: 400,
+    log: () => {}
+  });
+  controlState.selectedMode = "solo";
+  resetZenithBootstrapCheckState(zenithBootstrapCheckState);
+  result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState,
+    now: 650,
+    readBootstrapPageStateFn: async () => {
+      throw new Error("should not run");
+    },
+    log: () => {}
+  });
+  assert.equal(result.ran, false);
+});
+
+test("Solo mode does not run Zenith bootstrap checks", async () => {
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "solo";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 1;
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  let reads = 0;
+
+  assert.equal(
+    ensureZenithBootstrapCheckScheduled(zenithBootstrapCheckState, controlState, {
+      now: 10_000,
+      log: () => {}
+    }),
+    false
+  );
+
+  const result = await maybeRunZenithBootstrapCheck({
+    zenithBootstrapCheckState,
+    browserControlState: controlState,
+    bootstrapState: readyBootstrapState(10_000),
+    now: 10_000,
+    readBootstrapPageStateFn: async () => {
+      reads += 1;
+      return { readyState: "complete", href: "https://tetr.io/" };
+    },
+    log: () => {}
+  });
+
+  assert.equal(result.ran, false);
+  assert.equal(reads, 0);
+});
 
 test("game ended handling is triggered only once per ended session", () => {
   const endedState = {
@@ -1291,6 +4999,18 @@ test("locator hint failure falls back to the paused scope scan", async () => {
       }
       if (method === "Runtime.callFunctionOn") {
         assert.equal(params.objectId, "candidate-1");
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState"],
+                ejectKeys: ["game"],
+                stateKeys: ["board"],
+                boardStateKeys: ["b"]
+              }
+            }
+          };
+        }
         return {
           result: {
             value: {
@@ -1317,7 +5037,7 @@ test("locator hint failure falls back to the paused scope scan", async () => {
 
   assert.equal(result.ok, true);
   assert.deepEqual(
-    methods.map((entry) => entry.method),
+    methods.map((entry) => entry.method).slice(0, 3),
     [
       "Debugger.evaluateOnCallFrame",
       "Runtime.getProperties",
@@ -1396,6 +5116,18 @@ test("targeted paused-location hint hits before the broad full scan", async () =
       }
       if (method === "Runtime.callFunctionOn") {
         assert.equal(params.objectId, "candidate-77");
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState"],
+                ejectKeys: ["game"],
+                stateKeys: ["board"],
+                boardStateKeys: ["b"]
+              }
+            }
+          };
+        }
         return {
           result: {
             value: {
@@ -1432,7 +5164,7 @@ test("targeted paused-location hint hits before the broad full scan", async () =
 
   assert.equal(result.ok, true);
   assert.deepEqual(
-    methods.map((entry) => entry.method),
+    methods.map((entry) => entry.method).slice(0, 2),
     ["Runtime.getProperties", "Runtime.callFunctionOn"]
   );
   assert.ok(
@@ -1448,7 +5180,7 @@ test("targeted paused-location hint miss falls back to the broad full scan", asy
   const logs = [];
   let callFunctionOnCount = 0;
   const cdp = {
-    async send(method) {
+    async send(method, params = {}) {
       if (method === "Runtime.getProperties") {
         return {
           result: [
@@ -1460,6 +5192,18 @@ test("targeted paused-location hint miss falls back to the broad full scan", asy
         };
       }
       if (method === "Runtime.callFunctionOn") {
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState"],
+                ejectKeys: ["game"],
+                stateKeys: ["board"],
+                boardStateKeys: ["b"]
+              }
+            }
+          };
+        }
         callFunctionOnCount += 1;
         return {
           result: {
@@ -1729,6 +5473,18 @@ test("first solo full scan resumes from the saved cursor without rechecking cand
         return { result: descriptors };
       }
       if (method === "Runtime.callFunctionOn") {
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState"],
+                ejectKeys: ["game"],
+                stateKeys: ["board"],
+                boardStateKeys: ["b"]
+              }
+            }
+          };
+        }
         visitedCandidates.push(params.objectId);
         fakeNow += 180;
         return {
@@ -1802,6 +5558,18 @@ test("paused scan continuation preserves cursor and remaining cumulative budget"
         return { result: descriptors };
       }
       if (method === "Runtime.callFunctionOn") {
+        if (String(params.functionDeclaration).includes("rootObjectKeys")) {
+          return {
+            result: {
+              value: {
+                rootObjectKeys: ["ejectState", "ejectBoardState"],
+                ejectKeys: ["game"],
+                stateKeys: ["board"],
+                boardStateKeys: ["b"]
+              }
+            }
+          };
+        }
         visitedCandidates.push(params.objectId);
         fakeNow += 175;
         return {

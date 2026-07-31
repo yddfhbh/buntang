@@ -38,6 +38,26 @@ pub struct ChromiumHostProcess {
 }
 
 impl ProviderProcess {
+    fn send_control_payload(
+        &mut self,
+        payload: &[u8],
+        context: &str,
+    ) -> Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Ok(());
+        };
+        stdin
+            .write_all(payload)
+            .with_context(|| format!("failed to send browser provider {context} control message"))?;
+        stdin.write_all(b"\n").with_context(|| {
+            format!("failed to terminate browser provider {context} control message")
+        })?;
+        stdin.flush().with_context(|| {
+            format!("failed to flush browser provider {context} control message")
+        })?;
+        Ok(())
+    }
+
     pub fn start(
         paths: &AppPaths,
         config: &AutomationConfig,
@@ -81,30 +101,15 @@ impl ProviderProcess {
     }
 
     pub fn set_bot_enabled(&mut self, enabled: bool) -> Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Ok(());
-        };
         let payload: &[u8] = if enabled {
             br#"{"type":"bot_enabled","enabled":true}"#
         } else {
             br#"{"type":"bot_enabled","enabled":false}"#
         };
-        stdin
-            .write_all(payload)
-            .context("failed to send browser provider bot_enabled control message")?;
-        stdin
-            .write_all(b"\n")
-            .context("failed to terminate browser provider control message")?;
-        stdin
-            .flush()
-            .context("failed to flush browser provider control message")?;
-        Ok(())
+        self.send_control_payload(payload, "bot_enabled")
     }
 
     pub fn set_selected_mode(&mut self, mode: &str, generation: u64) -> Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Ok(());
-        };
         let payload = serde_json::json!({
             "type": "selected_mode",
             "mode": mode,
@@ -112,16 +117,26 @@ impl ProviderProcess {
         });
         let serialized = serde_json::to_vec(&payload)
             .context("failed to encode browser provider selected_mode control message")?;
-        stdin
-            .write_all(&serialized)
-            .context("failed to send browser provider selected_mode control message")?;
-        stdin
-            .write_all(b"\n")
-            .context("failed to terminate browser provider selected_mode control message")?;
-        stdin
-            .flush()
-            .context("failed to flush browser provider selected_mode control message")?;
-        Ok(())
+        self.send_control_payload(&serialized, "selected_mode")
+    }
+
+    pub fn start_quick_play_diagnostic(
+        &mut self,
+        username_hint: Option<&str>,
+    ) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "type": "quick_play_diagnostic",
+            "enabled": true
+        });
+        if let Some(username_hint) = username_hint {
+            let trimmed = username_hint.trim();
+            if !trimmed.is_empty() {
+                payload["username_hint"] = Value::String(trimmed.to_owned());
+            }
+        }
+        let serialized = serde_json::to_vec(&payload)
+            .context("failed to encode browser provider quick_play_diagnostic control message")?;
+        self.send_control_payload(&serialized, "quick_play_diagnostic")
     }
 
     pub fn start_prewarmed(

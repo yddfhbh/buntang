@@ -6,3 +6,9 @@ options.yaml
 replay.dat
 *.ccbook
 *.ccdb
+automation/quick-play-runtime-report.json
+automation/quick-play-ws-raw.jsonl
+automation/quick-play-closure-candidates.jsonl
+automation/quick-play-callframes.jsonl
+automation/quick-play-passive-snapshot.json
+automation/solo-closure-fingerprint.json

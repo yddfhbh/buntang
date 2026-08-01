@@ -1061,15 +1061,20 @@ pub(crate) struct DryRunPlanSummary {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum DryRunPlanResult {
-    Ready(DryRunPlanSummary),
+pub(crate) struct PreparedSnapshotExecution {
+    pub summary: DryRunPlanSummary,
+    pub execution_plan: ExecutionPlan,
+}
+
+pub(crate) enum PreparedSnapshotExecutionResult {
+    Ready(PreparedSnapshotExecution),
     Skipped { reason: String },
 }
 
-pub(crate) fn plan_snapshot_dry_run(
+pub(crate) fn prepare_snapshot_execution(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
-) -> Result<DryRunPlanResult> {
+) -> Result<PreparedSnapshotExecutionResult> {
     let sprint_state = SprintState::default();
     let active_piece = snapshot
         .queue
@@ -1080,7 +1085,7 @@ pub(crate) fn plan_snapshot_dry_run(
     let Some((planned_move, planner_info)) =
         plan_move_for_mode(config, snapshot, config.bot.movement_mode, &sprint_state)?
     else {
-        return Ok(DryRunPlanResult::Skipped {
+        return Ok(PreparedSnapshotExecutionResult::Skipped {
             reason: "planner_returned_none".to_owned(),
         });
     };
@@ -1089,23 +1094,35 @@ pub(crate) fn plan_snapshot_dry_run(
     let planner_label = format_planner_info(&planner_info);
     let _planner_elapsed_ms = planner_started_at.elapsed().as_millis();
     match execution_result {
-        Ok(plan) => Ok(DryRunPlanResult::Ready(DryRunPlanSummary {
-            token: snapshot.token.clone(),
-            piece: active_piece,
-            hold_piece: snapshot.hold,
-            use_hold: planned_move.hold,
-            target_x: planned_move.expected_location.x,
-            target_rotation: rotation_token_from_state(planned_move.expected_location.kind.1),
-            action_count: route_actions_with_hard_drop(&plan.execution_plan).len(),
-            actions: route_actions_with_hard_drop(&plan.execution_plan),
-            route_kind: plan.route_selection.route_kind.to_owned(),
-            planner: planner_label,
-        })),
-        Err(BuildExecutionError::NoSafeRoute(failure)) => Ok(DryRunPlanResult::Skipped {
-            reason: failure
-                .representative_reject_reason
-                .unwrap_or_else(|| "no_safe_route".to_owned()),
-        }),
+        Ok(plan) => {
+            let actions = route_actions_with_hard_drop(&plan.execution_plan);
+            Ok(PreparedSnapshotExecutionResult::Ready(
+                PreparedSnapshotExecution {
+                    summary: DryRunPlanSummary {
+                        token: snapshot.token.clone(),
+                        piece: active_piece,
+                        hold_piece: snapshot.hold,
+                        use_hold: planned_move.hold,
+                        target_x: planned_move.expected_location.x,
+                        target_rotation: rotation_token_from_state(
+                            planned_move.expected_location.kind.1,
+                        ),
+                        action_count: actions.len(),
+                        actions,
+                        route_kind: plan.route_selection.route_kind.to_owned(),
+                        planner: planner_label,
+                    },
+                    execution_plan: plan.execution_plan,
+                },
+            ))
+        }
+        Err(BuildExecutionError::NoSafeRoute(failure)) => {
+            Ok(PreparedSnapshotExecutionResult::Skipped {
+                reason: failure
+                    .representative_reject_reason
+                    .unwrap_or_else(|| "no_safe_route".to_owned()),
+            })
+        }
         Err(BuildExecutionError::Fatal(err)) => Err(err),
     }
 }

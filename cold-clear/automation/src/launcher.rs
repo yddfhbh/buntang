@@ -18,10 +18,13 @@ use crate::config::{
     SpawnRuleConfig,
 };
 use crate::driver::{
-    BrowserCdpInputBackend, DebugLogBackend, InputBackend, SharedBrowserCdpInputBackend,
+    execute_plan, BrowserCdpInputBackend, DebugLogBackend, ExecutionTimings, InputBackend,
+    SharedBrowserCdpInputBackend,
 };
 use crate::paths::AppPaths;
-use crate::runner::{plan_snapshot_dry_run, DryRunPlanResult};
+use crate::runner::{
+    prepare_snapshot_execution, PreparedSnapshotExecution, PreparedSnapshotExecutionResult,
+};
 use crate::runtime::run_automation_with_resources_and_live_pps;
 use crate::scanner::{
     read_snapshot_file, read_zenith_passive_snapshot_file_with_age, JsonFileScanner,
@@ -63,6 +66,7 @@ const BOT_UI_HIDDEN_LABELS: &[&str] = &[
     "Planner",
 ];
 const ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH: &str = "automation/quick-play-passive-snapshot.json";
+const ZENITH_LIVE_LOCK_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
@@ -188,6 +192,8 @@ struct LauncherState {
     python_command: String,
     browser: BrowserCdpConfig,
     always_on_top: bool,
+    zenith_live_input_enabled: bool,
+    zenith_live_max_pieces: u32,
     dry_run: bool,
     play_style: PlayStyleConfig,
     poll_interval_ms: u64,
@@ -223,6 +229,8 @@ impl Default for LauncherState {
             python_command: "python".to_owned(),
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
+            zenith_live_input_enabled: false,
+            zenith_live_max_pieces: 1,
             dry_run: true,
             play_style: PlayStyleConfig::Normal,
             poll_interval_ms: 4,
@@ -453,6 +461,9 @@ impl LauncherState {
             self.target_pps = 3.0;
         }
         self.target_pps = self.target_pps.clamp(0.25, 20.0);
+        if self.zenith_live_max_pieces == 0 {
+            self.zenith_live_max_pieces = 1;
+        }
     }
 
     fn effective_target_pps(&self) -> f32 {
@@ -461,6 +472,10 @@ impl LauncherState {
         } else {
             self.target_pps
         }
+    }
+
+    fn effective_zenith_live_max_pieces(&self) -> u32 {
+        self.zenith_live_max_pieces.max(1).min(1)
     }
 }
 
@@ -717,6 +732,153 @@ fn zenith_semantic_skip_key(error: &str) -> String {
     format!("semantic_invalid:{error}")
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ZenithLiveStage {
+    Idle,
+    Planned,
+    Executing,
+    AwaitingLock,
+    Completed,
+    Aborted,
+}
+
+impl Default for ZenithLiveStage {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ZenithLiveController {
+    stage: ZenithLiveStage,
+    executed_pieces: u32,
+    active_piece_counter: Option<u32>,
+    active_snapshot_token: Option<String>,
+    active_game_id: Option<String>,
+    active_candidate_id: Option<String>,
+    active_capture_generation: Option<u64>,
+    active_provider_generation: Option<u64>,
+    started_at: Option<Instant>,
+    last_skip_key: Option<String>,
+    last_abort_key: Option<String>,
+    last_completed_piece_counter: Option<u32>,
+    last_aborted_piece_counter: Option<u32>,
+}
+
+impl ZenithLiveController {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn clear_skip_reason(&mut self) {
+        self.last_skip_key = None;
+    }
+
+    fn clear_abort_reason(&mut self) {
+        self.last_abort_key = None;
+    }
+
+    fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
+        if self.last_skip_key.as_deref() == Some(key) {
+            return None;
+        }
+        self.last_skip_key = Some(key.to_owned());
+        Some(line)
+    }
+
+    fn note_abort(&mut self, key: &str, line: String) -> Option<String> {
+        if self.last_abort_key.as_deref() == Some(key) {
+            return None;
+        }
+        self.last_abort_key = Some(key.to_owned());
+        Some(line)
+    }
+
+    fn start_planned(
+        &mut self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+        provider_generation: u64,
+        stage: ZenithLiveStage,
+    ) {
+        self.stage = stage;
+        self.active_piece_counter = snapshot.snapshot.piece_counter;
+        self.active_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.active_game_id = Some(snapshot.gameid.clone());
+        self.active_candidate_id = Some(snapshot.candidate_id.clone());
+        self.active_capture_generation = Some(snapshot.capture_generation);
+        self.active_provider_generation = Some(provider_generation);
+        self.started_at = Some(Instant::now());
+        self.clear_skip_reason();
+        self.clear_abort_reason();
+    }
+
+    fn mark_completed(&mut self, after_piece_counter: Option<u32>) {
+        self.stage = ZenithLiveStage::Completed;
+        self.executed_pieces = self.executed_pieces.saturating_add(1);
+        self.last_completed_piece_counter = after_piece_counter;
+        self.clear_skip_reason();
+        self.clear_abort_reason();
+        self.active_piece_counter = None;
+        self.active_snapshot_token = None;
+        self.active_game_id = None;
+        self.active_candidate_id = None;
+        self.active_capture_generation = None;
+        self.active_provider_generation = None;
+        self.started_at = None;
+    }
+
+    fn mark_aborted(&mut self, piece_counter: Option<u32>) {
+        self.stage = ZenithLiveStage::Aborted;
+        self.last_aborted_piece_counter = piece_counter;
+        self.active_piece_counter = None;
+        self.active_snapshot_token = None;
+        self.active_game_id = None;
+        self.active_candidate_id = None;
+        self.active_capture_generation = None;
+        self.active_provider_generation = None;
+        self.started_at = None;
+        self.clear_skip_reason();
+    }
+
+    fn is_waiting_for_lock(&self) -> bool {
+        self.stage == ZenithLiveStage::AwaitingLock
+    }
+
+    fn is_executing_piece(&self, piece_counter: Option<u32>) -> bool {
+        self.active_piece_counter == piece_counter
+            && matches!(
+                self.stage,
+                ZenithLiveStage::Planned
+                    | ZenithLiveStage::Executing
+                    | ZenithLiveStage::AwaitingLock
+            )
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct ZenithLiveTestHook {
+    dispatch_count: Arc<AtomicU32>,
+    release_count: Arc<AtomicU32>,
+}
+
+#[cfg(test)]
+struct ZenithLiveTestBackend {
+    hook: ZenithLiveTestHook,
+}
+
+#[cfg(test)]
+impl InputBackend for ZenithLiveTestBackend {
+    fn tap(&mut self, _action: crate::driver::GameAction, _duration: Duration) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_all_keys(&mut self) -> Result<()> {
+        self.hook.release_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 pub struct LauncherApp {
     paths: AppPaths,
     state: LauncherState,
@@ -738,6 +900,9 @@ pub struct LauncherApp {
     bot_restart_pending: bool,
     passive_provider: PassiveProviderController,
     zenith_dry_run: ZenithDryRunController,
+    zenith_live: ZenithLiveController,
+    #[cfg(test)]
+    zenith_live_test_hook: ZenithLiveTestHook,
 }
 
 impl LauncherApp {
@@ -768,6 +933,9 @@ impl LauncherApp {
             bot_restart_pending: false,
             passive_provider: PassiveProviderController::default(),
             zenith_dry_run: ZenithDryRunController::default(),
+            zenith_live: ZenithLiveController::default(),
+            #[cfg(test)]
+            zenith_live_test_hook: ZenithLiveTestHook::default(),
         }
     }
 
@@ -836,6 +1004,179 @@ impl LauncherApp {
                 format_target_pps_label(effective_target_pps)
             ));
         }
+    }
+
+    fn zenith_live_max_pieces(&self) -> u32 {
+        self.state.effective_zenith_live_max_pieces()
+    }
+
+    fn zenith_live_input_allowed(&self) -> bool {
+        self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
+    }
+
+    fn zenith_execution_timings(config: &AutomationConfig) -> ExecutionTimings {
+        ExecutionTimings {
+            tap_duration: Duration::from_millis(config.tap_duration_ms),
+            movement_tap_duration: Duration::from_millis(config.movement_tap_duration_ms),
+            rotate_tap_duration: Duration::from_millis(config.rotate_tap_duration_ms),
+            hold_tap_duration: Duration::from_millis(config.hold_tap_duration_ms),
+            hard_drop_tap_duration: Duration::from_millis(config.hard_drop_tap_duration_ms),
+            soft_drop_tap_duration: Duration::from_millis(config.soft_drop_tap_duration_ms),
+            movement_interval: Duration::from_millis(config.movement_interval_ms),
+            rotation_interval: Duration::from_millis(config.rotation_interval_ms),
+            piece_interval: Duration::from_millis(config.piece_interval_ms),
+            hard_drop_interval: Duration::from_millis(config.hard_drop_interval_ms),
+        }
+    }
+
+    fn execute_zenith_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        prepared: &PreparedSnapshotExecution,
+    ) -> Result<()> {
+        let timings = Self::zenith_execution_timings(config);
+
+        #[cfg(test)]
+        if self.browser_session.is_none() {
+            self.zenith_live_test_hook
+                .dispatch_count
+                .fetch_add(1, Ordering::Relaxed);
+            let mut backend = ZenithLiveTestBackend {
+                hook: self.zenith_live_test_hook.clone(),
+            };
+            return execute_plan(
+                &mut backend,
+                &prepared.execution_plan,
+                &config.handling,
+                timings,
+                |line| self.push_log(line),
+            );
+        }
+
+        let shared = self
+            .browser_session
+            .as_ref()
+            .map(|session| session.input_backend.clone())
+            .context("browser input backend missing for zenith live execution")?;
+        let mut backend = BrowserCdpInputBackend::from_shared(shared);
+        execute_plan(
+            &mut backend,
+            &prepared.execution_plan,
+            &config.handling,
+            timings,
+            |line| self.push_log(line),
+        )
+    }
+
+    fn release_live_input_now(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.browser_session.is_none() {
+            self.zenith_live_test_hook
+                .release_count
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        self.release_shared_input_now()
+    }
+
+    fn release_live_input_with_log(&mut self) {
+        match self.release_live_input_now() {
+            Ok(()) => self.push_log("[input] released all keys"),
+            Err(err) => self.push_log(format!("[input] failed to release all keys: {err:#}")),
+        }
+    }
+
+    fn suppress_zenith_live_input(&mut self, reason: &str, piece_counter: Option<u32>) {
+        let skip_key = format!("{reason}:{}", piece_counter_label(piece_counter));
+        if let Some(line) = self.zenith_live.note_skip(
+            &skip_key,
+            format!(
+                "[zenith-live] input suppressed reason={reason} piece_counter={}",
+                piece_counter_label(piece_counter)
+            ),
+        ) {
+            self.push_log(line);
+        }
+    }
+
+    fn cancel_zenith_live_execution(&mut self, reason: &str) {
+        if !matches!(
+            self.zenith_live.stage,
+            ZenithLiveStage::Planned | ZenithLiveStage::Executing | ZenithLiveStage::AwaitingLock
+        ) {
+            return;
+        }
+        let piece_counter = self.zenith_live.active_piece_counter;
+        let abort_key = format!("{reason}:{}", piece_counter_label(piece_counter));
+        if let Some(line) = self.zenith_live.note_abort(
+            &abort_key,
+            format!(
+                "[zenith-live] execution aborted reason={reason} piece_counter={}",
+                piece_counter_label(piece_counter)
+            ),
+        ) {
+            self.push_log(line);
+        }
+        if let Err(err) = self.release_live_input_now() {
+            self.push_log(format!("[input] failed to release all keys: {err:#}"));
+        }
+        self.zenith_live.mark_aborted(piece_counter);
+    }
+
+    fn update_zenith_live_lock_state(&mut self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
+        if !self.zenith_live.is_waiting_for_lock() {
+            return false;
+        }
+        if self.zenith_live.active_provider_generation
+            != Some(self.passive_provider.activation_generation)
+        {
+            self.cancel_zenith_live_execution("provider_generation_changed");
+            return true;
+        }
+        if self.zenith_live.active_game_id.as_deref() != Some(snapshot.gameid.as_str()) {
+            self.cancel_zenith_live_execution("gameid_changed");
+            return true;
+        }
+        if self.zenith_live.active_candidate_id.as_deref() != Some(snapshot.candidate_id.as_str()) {
+            self.cancel_zenith_live_execution("identity_mismatch");
+            return true;
+        }
+        if self.zenith_live.active_capture_generation != Some(snapshot.capture_generation) {
+            self.cancel_zenith_live_execution("generation_mismatch");
+            return true;
+        }
+        let before_piece_counter = self.zenith_live.active_piece_counter;
+        if let (Some(before), Some(after)) = (before_piece_counter, snapshot.snapshot.piece_counter)
+        {
+            if after > before {
+                let max_pieces = self.zenith_live_max_pieces();
+                self.zenith_live.mark_completed(Some(after));
+                self.push_log(format!(
+                    "[zenith-live] piece completed piece_counter_before={} piece_counter_after={} executed={} max={}",
+                    before,
+                    after,
+                    self.zenith_live.executed_pieces,
+                    max_pieces
+                ));
+                if self.zenith_live.executed_pieces >= max_pieces {
+                    self.push_log("[zenith-live] execution suspended reason=max_pieces_reached");
+                }
+                return false;
+            }
+        }
+        let timed_out = self
+            .zenith_live
+            .started_at
+            .map(|started_at| {
+                started_at.elapsed() >= Duration::from_millis(ZENITH_LIVE_LOCK_TIMEOUT_MS)
+            })
+            .unwrap_or(false);
+        if timed_out {
+            self.cancel_zenith_live_execution("lock_timeout");
+            return true;
+        }
+        true
     }
 
     fn open_browser(&mut self) {
@@ -989,6 +1330,7 @@ impl LauncherApp {
             self.bot_waiting_for_next_game = false;
             self.bot_restart_pending = false;
             self.zenith_dry_run.reset();
+            self.zenith_live.reset();
             self.push_log(format!(
                 "[mode] bot enabled mode={} generation={}",
                 self.state.selected_mode.control_value(),
@@ -1160,19 +1502,20 @@ impl LauncherApp {
         self.bot_desired_enabled = false;
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
+        self.cancel_zenith_live_execution("bot_off");
         self.zenith_dry_run.reset();
+        self.zenith_live.reset();
+        let had_runner = self.bot_session.is_some();
         if let Some(mut bot) = self.bot_session.take() {
             self.ignore_next_bot_exit = true;
             bot.stop();
             self.push_log("[bot] runner stopped");
-            if let Err(err) = self.release_shared_input_now() {
-                self.push_log(format!("[input] failed to release all keys: {err:#}"));
-            } else {
-                self.push_log("[input] released all keys");
-            }
             if browser_remains_open {
                 self.push_log("[snapshot] provider remains active");
             }
+        }
+        if browser_remains_open || had_runner {
+            self.release_live_input_with_log();
         }
         if let Some(session) = self.browser_session.as_mut() {
             if let Err(err) = session.snapshot_provider.set_bot_enabled(false) {
@@ -1201,6 +1544,7 @@ impl LauncherApp {
             self.clear_passive_provider_owners();
         }
         self.zenith_dry_run.reset();
+        self.zenith_live.reset();
         self.push_log(format!(
             "[mode] selected mode={}",
             self.state.selected_mode.control_value()
@@ -1222,6 +1566,7 @@ impl LauncherApp {
         if self.bot_session.is_some() {
             self.stop_bot_with_browser_hint(false);
         }
+        self.cancel_zenith_live_execution("launcher_shutdown");
 
         if let Some(mut session) = self.browser_session.take() {
             self.push_log("[launcher] closing Chromium");
@@ -1243,6 +1588,7 @@ impl LauncherApp {
         self.latest_snapshot_age_ms = None;
         self.passive_provider.reset();
         self.zenith_dry_run.reset();
+        self.zenith_live.reset();
     }
 
     fn release_shared_input_now(&self) -> Result<()> {
@@ -1524,17 +1870,20 @@ impl LauncherApp {
     fn poll_zenith_dry_run(&mut self) {
         if self.state.selected_mode != RuntimeMode::Zenith {
             self.zenith_dry_run.reset();
+            self.zenith_live.reset();
             return;
         }
         if !self
             .passive_provider
             .is_requested(PassiveProviderOwner::ZenithDryRun)
         {
+            self.cancel_zenith_live_execution("provider_owner_missing");
             self.zenith_dry_run.reset();
             return;
         }
         if !self.bot_desired_enabled || self.bot_status != BotStatus::On {
             self.zenith_dry_run.reset();
+            self.zenith_live.reset();
             return;
         }
         let runtime_ready = self.browser_status == BrowserStatus::Ready
@@ -1544,6 +1893,14 @@ impl LauncherApp {
                 SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
             );
         if !runtime_ready {
+            let reason = if self.browser_status != BrowserStatus::Ready {
+                "provider_child_exited"
+            } else if self.input_status != InputStatus::Ready {
+                "input_unavailable"
+            } else {
+                "capture_stopped"
+            };
+            self.cancel_zenith_live_execution(reason);
             return;
         }
         let path = self.zenith_passive_snapshot_path();
@@ -1562,6 +1919,7 @@ impl LauncherApp {
             }
             Err(err) => {
                 let error = format!("{err:#}");
+                self.cancel_zenith_live_execution("semantic_invalid");
                 let skip_key = zenith_semantic_skip_key(&error);
                 if let Some(line) = self.zenith_dry_run.note_skip(
                     &skip_key,
@@ -1577,6 +1935,13 @@ impl LauncherApp {
         };
         let (envelope, age) = read_result;
         let Some(snapshot) = envelope.snapshot.as_ref() else {
+            if self.zenith_live.is_waiting_for_lock() {
+                if envelope.capture_status.as_deref() == Some("stopped") {
+                    self.cancel_zenith_live_execution("capture_stopped");
+                } else {
+                    self.cancel_zenith_live_execution("semantic_invalid");
+                }
+            }
             let skip = if envelope.capture_status.as_deref() == Some("stopped") {
                 (
                     "capture_stopped".to_owned(),
@@ -1615,6 +1980,7 @@ impl LauncherApp {
         }
 
         if envelope.status != "ready" {
+            self.cancel_zenith_live_execution("semantic_invalid");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "semantic_invalid",
                 "[zenith-dry-run] snapshot skipped reason=semantic_invalid".to_owned(),
@@ -1624,6 +1990,7 @@ impl LauncherApp {
             return;
         }
         if envelope.capture_status.as_deref() != Some("running") {
+            self.cancel_zenith_live_execution("capture_stopped");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "capture_stopped",
                 "[zenith-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
@@ -1637,6 +2004,7 @@ impl LauncherApp {
             .map(|value| value.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
             .unwrap_or(false)
         {
+            self.cancel_zenith_live_execution("snapshot_stale");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "stale",
                 "[zenith-dry-run] snapshot skipped reason=stale".to_owned(),
@@ -1646,6 +2014,7 @@ impl LauncherApp {
             return;
         }
         if !snapshot.playing || !snapshot.started {
+            self.cancel_zenith_live_execution("playing_false");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "not_playing",
                 "[zenith-dry-run] snapshot skipped reason=not_playing".to_owned(),
@@ -1656,6 +2025,7 @@ impl LauncherApp {
             return;
         }
         if snapshot.countdown_started {
+            self.cancel_zenith_live_execution("countdown");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "countdown",
                 "[zenith-dry-run] snapshot skipped reason=countdown".to_owned(),
@@ -1666,6 +2036,7 @@ impl LauncherApp {
             return;
         }
         if snapshot.paused == Some(true) {
+            self.cancel_zenith_live_execution("paused");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "paused",
                 "[zenith-dry-run] snapshot skipped reason=paused".to_owned(),
@@ -1676,6 +2047,7 @@ impl LauncherApp {
             return;
         }
         if snapshot.destroyed || snapshot.gameoverreason.is_some() {
+            self.cancel_zenith_live_execution("destroyed");
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "destroyed",
                 "[zenith-dry-run] snapshot skipped reason=destroyed".to_owned(),
@@ -1683,6 +2055,9 @@ impl LauncherApp {
                 self.push_log(line);
             }
             self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if self.update_zenith_live_lock_state(snapshot) {
             return;
         }
         if self.zenith_dry_run.last_snapshot_token.as_deref()
@@ -1720,11 +2095,10 @@ impl LauncherApp {
                 .unwrap_or("-"),
             snapshot.snapshot.queue.len().saturating_sub(1)
         ));
-        match plan_snapshot_dry_run(
-            &self.state.to_automation_config(&self.paths),
-            &snapshot.snapshot,
-        ) {
-            Ok(DryRunPlanResult::Ready(plan)) => {
+        let config = self.state.to_automation_config(&self.paths);
+        match prepare_snapshot_execution(&config, &snapshot.snapshot) {
+            Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => {
+                let plan = &prepared.summary;
                 self.push_log(format!(
                     "[zenith-dry-run] plan ready token={} piece={} hold_piece={} use_hold={} target_x={} rotation={:?} action_count={} actions={:?} route={} planner={}",
                     plan.token,
@@ -1738,9 +2112,64 @@ impl LauncherApp {
                     plan.route_kind,
                     plan.planner
                 ));
-                self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
+                let piece_counter = snapshot.snapshot.piece_counter;
+                if !self.zenith_live_input_allowed() {
+                    self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
+                } else if self.zenith_live.executed_pieces >= self.zenith_live_max_pieces() {
+                    self.suppress_zenith_live_input("max_pieces_reached", piece_counter);
+                } else if self.zenith_live.last_aborted_piece_counter == piece_counter {
+                    self.suppress_zenith_live_input("aborted_piece", piece_counter);
+                } else if self.zenith_live.last_completed_piece_counter == piece_counter {
+                    self.suppress_zenith_live_input("completed_piece", piece_counter);
+                } else if self.zenith_live.is_executing_piece(piece_counter) {
+                    self.suppress_zenith_live_input("already_executing", piece_counter);
+                } else if snapshot.userid.trim().is_empty() {
+                    self.suppress_zenith_live_input("identity_mismatch", piece_counter);
+                } else {
+                    self.zenith_live.clear_skip_reason();
+                    self.push_log(format!(
+                        "[zenith-live] plan accepted piece_counter={} generation={}",
+                        piece_counter_label(piece_counter),
+                        snapshot.capture_generation
+                    ));
+                    self.zenith_live.start_planned(
+                        snapshot,
+                        self.passive_provider.activation_generation,
+                        ZenithLiveStage::Planned,
+                    );
+                    self.push_log(format!(
+                        "[zenith-live] execution started piece_counter={} max_pieces={}",
+                        piece_counter_label(piece_counter),
+                        self.zenith_live_max_pieces()
+                    ));
+                    self.zenith_live.stage = ZenithLiveStage::Executing;
+                    match self.execute_zenith_live_plan(&config, &prepared) {
+                        Ok(()) => {
+                            self.push_log(format!(
+                                "[zenith-live] input dispatched piece_counter={}",
+                                piece_counter_label(piece_counter)
+                            ));
+                            self.zenith_live.start_planned(
+                                snapshot,
+                                self.passive_provider.activation_generation,
+                                ZenithLiveStage::AwaitingLock,
+                            );
+                            self.push_log(format!(
+                                "[zenith-live] awaiting lock piece_counter={}",
+                                piece_counter_label(piece_counter)
+                            ));
+                        }
+                        Err(err) => {
+                            self.push_log(format!(
+                                "[zenith-live] dispatch error piece_counter={} error={err:#}",
+                                piece_counter_label(piece_counter)
+                            ));
+                            self.cancel_zenith_live_execution("dispatch_failed");
+                        }
+                    }
+                }
             }
-            Ok(DryRunPlanResult::Skipped { reason }) => {
+            Ok(PreparedSnapshotExecutionResult::Skipped { reason }) => {
                 self.push_log(format!(
                     "[zenith-dry-run] plan skipped token={} piece={} reason={reason}",
                     snapshot.snapshot.token,
@@ -2040,6 +2469,21 @@ impl eframe::App for LauncherApp {
             });
             if self.state.selected_mode == RuntimeMode::Zenith {
                 ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!bot_locked, |ui| {
+                        ui.checkbox(
+                            &mut self.state.zenith_live_input_enabled,
+                            "Zenith 실제 입력",
+                        );
+                    });
+                    ui.label(format!(
+                        "최대 자동 배치: {}",
+                        self.state.effective_zenith_live_max_pieces()
+                    ));
+                });
+                ui.small(
+                    "기본값은 OFF이며, 현재 단계에서는 Bot ON마다 최대 1피스만 실제 입력합니다.",
+                );
+                ui.horizontal(|ui| {
                     ui.label("Diagnostic local username");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.quick_play_diagnostic_username)
@@ -2152,6 +2596,12 @@ fn format_target_pps_label(target_pps: f32) -> String {
     } else {
         "unlimited".to_owned()
     }
+}
+
+fn piece_counter_label(piece_counter: Option<u32>) -> String {
+    piece_counter
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn spawn_rule_label(rule: SpawnRuleConfig) -> &'static str {
@@ -2270,6 +2720,40 @@ mod tests {
         hold_piece: serde_json::Value,
         queue: &[&str],
     ) {
+        write_zenith_passive_snapshot_with_metadata(
+            paths,
+            status,
+            capture_status,
+            5,
+            "user-zenith",
+            "game-zenith",
+            "candidate-1",
+            piece_counter,
+            paused,
+            current_piece,
+            current_x,
+            current_y,
+            hold_piece,
+            queue,
+        );
+    }
+
+    fn write_zenith_passive_snapshot_with_metadata(
+        paths: &AppPaths,
+        status: &str,
+        capture_status: &str,
+        capture_generation: u64,
+        userid: &str,
+        gameid: &str,
+        candidate_id: &str,
+        piece_counter: u32,
+        paused: serde_json::Value,
+        current_piece: &str,
+        current_x: serde_json::Value,
+        current_y: serde_json::Value,
+        hold_piece: serde_json::Value,
+        queue: &[&str],
+    ) {
         let path = zenith_passive_snapshot_path(paths);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -2280,11 +2764,11 @@ mod tests {
             "capture_status": capture_status,
             "snapshot": {
                 "source": "zenith_passive",
-                "capture_generation": 5,
+                "capture_generation": capture_generation,
                 "timestamp": 1722422400123u64,
-                "userid": "user-zenith",
-                "gameid": "game-zenith",
-                "candidate_id": "candidate-1",
+                "userid": userid,
+                "gameid": gameid,
+                "candidate_id": candidate_id,
                 "playing": true,
                 "started": true,
                 "countdown_started": false,
@@ -2720,6 +3204,284 @@ mod tests {
             .logs
             .iter()
             .any(|line| line == "[bot] runner resumed for game epoch=2"));
+    }
+
+    #[test]
+    fn zenith_live_disabled_keeps_dry_run_only() {
+        let paths = test_paths("zenith-live-disabled");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] plan ready")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] input suppressed reason=dry_run"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_valid_snapshot_dispatches_once_and_waits_for_lock() {
+        let paths = test_paths("zenith-live-dispatch-once");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::AwaitingLock);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-live] plan accepted piece_counter=6 generation=5")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line
+                .contains("[zenith-live] execution started piece_counter=6 max_pieces=1")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-live] input dispatched piece_counter=6")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-live] awaiting lock piece_counter=6")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_same_piece_counter_and_current_y_change_do_not_replay() {
+        let paths = test_paths("zenith-live-no-replay-same-piece");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        let (x, _y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            12,
+            json!(false),
+            "J",
+            json!(x),
+            json!(18.0),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            12,
+            json!(false),
+            "J",
+            json!(x),
+            json!(18.4125),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_lock_completion_suspends_after_max_piece() {
+        let paths = test_paths("zenith-live-max-piece");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 20, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 21, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.executed_pieces, 1);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains(
+                "[zenith-live] piece completed piece_counter_before=20 piece_counter_after=21 executed=1 max=1"
+            )
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-live] execution suspended reason=max_pieces_reached"));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 22, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| line.contains(
+            "[zenith-live] input suppressed reason=max_pieces_reached piece_counter=22"
+        )));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_bot_off_then_on_resets_executed_counter() {
+        let paths = test_paths("zenith-live-bot-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 30, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 31, json!(false));
+        app.poll_zenith_dry_run();
+        assert_eq!(app.zenith_live.executed_pieces, 1);
+
+        app.stop_bot_with_browser_hint(false);
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 32, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.executed_pieces, 0);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_lock_timeout_aborts_without_retrying_same_piece() {
+        let paths = test_paths("zenith-live-lock-timeout");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 40, json!(false));
+
+        app.poll_zenith_dry_run();
+        app.zenith_live.started_at =
+            Some(Instant::now() - Duration::from_millis(ZENITH_LIVE_LOCK_TIMEOUT_MS + 50));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 40, json!(false));
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution aborted reason=lock_timeout piece_counter=40")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_generation_mismatch_aborts_awaiting_lock() {
+        let paths = test_paths("zenith-live-generation-mismatch");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 50, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        let (x, y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_metadata(
+            &paths,
+            "ready",
+            "running",
+            6,
+            "user-zenith",
+            "game-zenith",
+            "candidate-1",
+            50,
+            json!(false),
+            "J",
+            json!(x),
+            json!(y),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains(
+                "[zenith-live] execution aborted reason=generation_mismatch piece_counter=50",
+            )
+        }));
+
+        cleanup_test_paths(&paths);
     }
 
     #[test]

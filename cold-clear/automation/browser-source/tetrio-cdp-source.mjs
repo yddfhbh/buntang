@@ -87,6 +87,8 @@ const DEFAULT_SOLO_CLOSURE_FINGERPRINT_PATH = path.join(
   "automation",
   "solo-closure-fingerprint.json"
 );
+const QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC = "manual_diagnostic";
+const QUICK_PLAY_OWNER_ZENITH_DRY_RUN = "zenith_dry_run";
 export const RUNTIME_MODE_SOLO = "solo";
 export const RUNTIME_MODE_ZENITH = "zenith";
 export const RUNTIME_MODE_FRIENDLY_VS = "friendly_vs";
@@ -1327,8 +1329,13 @@ export function createBrowserControlState() {
 export function createQuickPlayDiagnosticState() {
   return {
     active: false,
+    ownerRequests: {
+      [QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC]: false,
+      [QUICK_PLAY_OWNER_ZENITH_DRY_RUN]: false
+    },
     startedAt: 0,
     stopAt: 0,
+    manualOwnerStopAt: 0,
     finishedAt: 0,
     maxDurationMs: DEFAULT_QUICK_PLAY_DIAGNOSTIC_DURATION_MS,
     maxWsPackets: DEFAULT_QUICK_PLAY_DIAGNOSTIC_PACKET_LIMIT,
@@ -1524,6 +1531,129 @@ export function createQuickPlayDiagnosticState() {
   };
 }
 
+function normalizeQuickPlayPassiveOwner(owner) {
+  const normalized = String(owner ?? "").trim().toLowerCase();
+  if (normalized === QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC) {
+    return QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC;
+  }
+  if (normalized === QUICK_PLAY_OWNER_ZENITH_DRY_RUN) {
+    return QUICK_PLAY_OWNER_ZENITH_DRY_RUN;
+  }
+  return "";
+}
+
+function quickPlayPassiveOwnerRequested(quickPlayDiagnosticState, owner) {
+  const normalized = normalizeQuickPlayPassiveOwner(owner);
+  if (!normalized) {
+    return false;
+  }
+  return quickPlayDiagnosticState?.ownerRequests?.[normalized] === true;
+}
+
+function hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState) {
+  return (
+    quickPlayPassiveOwnerRequested(
+      quickPlayDiagnosticState,
+      QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC
+    ) ||
+    quickPlayPassiveOwnerRequested(
+      quickPlayDiagnosticState,
+      QUICK_PLAY_OWNER_ZENITH_DRY_RUN
+    )
+  );
+}
+
+function quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState) {
+  if (
+    !quickPlayDiagnosticState ||
+    !hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState)
+  ) {
+    return true;
+  }
+  return quickPlayPassiveOwnerRequested(
+    quickPlayDiagnosticState,
+    QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC
+  );
+}
+
+function quickPlayPassiveAllowsBotEnabled(quickPlayDiagnosticState) {
+  return quickPlayPassiveOwnerRequested(
+    quickPlayDiagnosticState,
+    QUICK_PLAY_OWNER_ZENITH_DRY_RUN
+  );
+}
+
+function quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState) {
+  return quickPlayPassiveOwnerRequested(
+    quickPlayDiagnosticState,
+    QUICK_PLAY_OWNER_ZENITH_DRY_RUN
+  );
+}
+
+function quickPlayPassivePacketLimit(quickPlayDiagnosticState) {
+  if (quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState)) {
+    return null;
+  }
+  return Math.max(
+    1,
+    Number(
+      quickPlayDiagnosticState?.maxWsPackets ??
+        DEFAULT_QUICK_PLAY_DIAGNOSTIC_PACKET_LIMIT
+    )
+  );
+}
+
+function syncQuickPlayPassiveStopDeadline(
+  quickPlayDiagnosticState,
+  now = Date.now()
+) {
+  if (!quickPlayDiagnosticState) {
+    return false;
+  }
+  if (
+    quickPlayPassiveOwnerRequested(
+      quickPlayDiagnosticState,
+      QUICK_PLAY_OWNER_ZENITH_DRY_RUN
+    )
+  ) {
+    quickPlayDiagnosticState.stopAt = Number.MAX_SAFE_INTEGER;
+    return true;
+  }
+  if (
+    !hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState) ||
+    quickPlayPassiveOwnerRequested(
+      quickPlayDiagnosticState,
+      QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC
+    )
+  ) {
+    if (Number(quickPlayDiagnosticState.manualOwnerStopAt ?? 0) <= 0) {
+      const startedAt = Math.max(
+        0,
+        Number(quickPlayDiagnosticState.startedAt ?? now ?? Date.now())
+      );
+      quickPlayDiagnosticState.manualOwnerStopAt =
+        startedAt +
+        Math.max(
+          1,
+          Number(
+            quickPlayDiagnosticState.maxDurationMs ??
+              DEFAULT_QUICK_PLAY_DIAGNOSTIC_DURATION_MS
+          )
+        );
+    }
+    quickPlayDiagnosticState.stopAt = Math.max(
+      1,
+      Number(quickPlayDiagnosticState.manualOwnerStopAt ?? 0)
+    );
+    return true;
+  }
+  quickPlayDiagnosticState.stopAt = Math.max(
+    now,
+    Number(quickPlayDiagnosticState.manualOwnerStopAt ?? 0)
+  );
+  return true;
+}
+
 function clampQuickPlayClosureScanAttemptCount(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -1587,6 +1717,7 @@ function scheduleQuickPlayClosureSurvey(
     log = quickPlayDiagnosticState?.logFn ?? console.log
   } = {}
 ) {
+  const artifactsEnabled = quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState);
   if (!quickPlayDiagnosticState?.active) {
     return false;
   }
@@ -1773,20 +1904,53 @@ export function startQuickPlayDiagnosticCapture(
     usernameHint = null
   } = {}
 ) {
+  return requestQuickPlayPassiveProviderOwner(
+    quickPlayDiagnosticState,
+    browserControlState,
+    {
+      owner: QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC,
+      enabled: true,
+      now,
+      log,
+      usernameHint
+    }
+  );
+}
+
+function activateQuickPlayPassiveCapture(
+  quickPlayDiagnosticState,
+  browserControlState,
+  {
+    now = Date.now(),
+    log = console.log,
+    usernameHint = null
+  } = {}
+) {
   if (!quickPlayDiagnosticState) {
     return { started: false, reason: "state_missing" };
   }
   if (!isZenithModeSelected(browserControlState)) {
     return { started: false, reason: "mode_not_zenith" };
   }
-  if (browserControlState?.botEnabled) {
+  if (browserControlState?.botEnabled && !quickPlayPassiveAllowsBotEnabled(quickPlayDiagnosticState)) {
     return { started: false, reason: "bot_enabled" };
   }
   quickPlayDiagnosticState.active = true;
   quickPlayDiagnosticState.startedAt = Math.max(0, Number(now ?? Date.now()));
-  quickPlayDiagnosticState.stopAt =
-    quickPlayDiagnosticState.startedAt +
-    Math.max(1, Number(quickPlayDiagnosticState.maxDurationMs ?? DEFAULT_QUICK_PLAY_DIAGNOSTIC_DURATION_MS));
+  quickPlayDiagnosticState.manualOwnerStopAt = quickPlayPassiveOwnerRequested(
+    quickPlayDiagnosticState,
+    QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC
+  )
+    ? quickPlayDiagnosticState.startedAt +
+      Math.max(
+        1,
+        Number(
+          quickPlayDiagnosticState.maxDurationMs ??
+            DEFAULT_QUICK_PLAY_DIAGNOSTIC_DURATION_MS
+        )
+      )
+    : 0;
+  syncQuickPlayPassiveStopDeadline(quickPlayDiagnosticState, quickPlayDiagnosticState.startedAt);
   quickPlayDiagnosticState.finishedAt = 0;
   quickPlayDiagnosticState.nextSessionSurveyAt = 0;
   quickPlayDiagnosticState.nextClosureSurveyAt = 0;
@@ -1851,9 +2015,11 @@ export function startQuickPlayDiagnosticCapture(
     zenithRetryScheduled: false
   };
   quickPlayDiagnosticState.diagnostics = createQuickPlayDiagnosticState().diagnostics;
-  clearQuickPlayDiagnosticFiles(quickPlayDiagnosticState);
-  touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.closurePath);
-  touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.callframePath);
+  if (quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState)) {
+    clearQuickPlayDiagnosticFiles(quickPlayDiagnosticState);
+    touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.closurePath);
+    touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.callframePath);
+  }
   markQuickPlayPassiveSnapshotUnavailable(
     quickPlayDiagnosticState,
     "diagnostic_start"
@@ -1863,12 +2029,107 @@ export function startQuickPlayDiagnosticCapture(
     reason: "diagnostic_start"
   });
   log?.(
-    `[quick-play] diagnostic capture started duration_ms=${Math.max(
-      0,
-      quickPlayDiagnosticState.stopAt - quickPlayDiagnosticState.startedAt
-    )}`
+    `[quick-play] diagnostic capture started duration_ms=${
+      quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState)
+        ? "owner_lifecycle"
+        : Math.max(
+            0,
+            Number.isFinite(Number(quickPlayDiagnosticState.stopAt))
+              ? quickPlayDiagnosticState.stopAt - quickPlayDiagnosticState.startedAt
+              : 0
+          )
+    } packet_limit=${
+      quickPlayPassivePacketLimit(quickPlayDiagnosticState) === null
+        ? "unlimited"
+        : quickPlayPassivePacketLimit(quickPlayDiagnosticState)
+    }`
   );
   return { started: true };
+}
+
+function requestQuickPlayPassiveProviderOwner(
+  quickPlayDiagnosticState,
+  browserControlState,
+  {
+    owner,
+    enabled = true,
+    now = Date.now(),
+    log = console.log,
+    usernameHint = null
+  } = {}
+) {
+  if (!quickPlayDiagnosticState) {
+    return { started: false, reason: "state_missing" };
+  }
+  const normalizedOwner = normalizeQuickPlayPassiveOwner(owner);
+  if (!normalizedOwner) {
+    return { started: false, reason: "owner_invalid" };
+  }
+  const previousRequested = quickPlayPassiveOwnerRequested(
+    quickPlayDiagnosticState,
+    normalizedOwner
+  );
+  const previousHadOwners = hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState);
+  if (
+    quickPlayDiagnosticState.ownerRequests &&
+    quickPlayDiagnosticState.ownerRequests[normalizedOwner] === Boolean(enabled)
+  ) {
+    return { started: false, changed: false, active: quickPlayDiagnosticState.active === true };
+  }
+  quickPlayDiagnosticState.ownerRequests[normalizedOwner] = Boolean(enabled);
+  if (normalizedOwner === QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC && enabled) {
+    quickPlayDiagnosticState.diagnosticUsernameHint =
+      normalizedScalar(usernameHint) ?? quickPlayDiagnosticState.diagnosticUsernameHint;
+    if (Number(quickPlayDiagnosticState.manualOwnerStopAt ?? 0) <= 0) {
+      quickPlayDiagnosticState.manualOwnerStopAt =
+        Math.max(0, Number(now ?? Date.now())) +
+        Math.max(
+          1,
+          Number(
+            quickPlayDiagnosticState.maxDurationMs ??
+              DEFAULT_QUICK_PLAY_DIAGNOSTIC_DURATION_MS
+          )
+        );
+    }
+  }
+  const nextHasOwners = hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState);
+  if (!nextHasOwners) {
+    if (!quickPlayDiagnosticState.active) {
+      return { stopped: false, changed: previousRequested, active: false };
+    }
+    const stopped = stopQuickPlayDiagnosticCapture(quickPlayDiagnosticState, {
+      now,
+      reason: "disabled",
+      log
+    });
+    return { stopped, changed: true, active: false };
+  }
+  if (!quickPlayDiagnosticState.active) {
+    const result = activateQuickPlayPassiveCapture(
+      quickPlayDiagnosticState,
+      browserControlState,
+      {
+        now,
+        log,
+        usernameHint
+      }
+    );
+    if (!result.started) {
+      quickPlayDiagnosticState.ownerRequests[normalizedOwner] = previousRequested;
+      return result;
+    }
+    return { ...result, changed: true };
+  }
+  syncQuickPlayPassiveStopDeadline(quickPlayDiagnosticState, now);
+  if (quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState)) {
+    touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.closurePath);
+    touchQuickPlayDiagnosticFile(quickPlayDiagnosticState.callframePath);
+  }
+  return {
+    started: false,
+    changed: !previousHadOwners || previousRequested !== Boolean(enabled),
+    active: true
+  };
 }
 
 export function stopQuickPlayDiagnosticCapture(
@@ -1879,10 +2140,17 @@ export function stopQuickPlayDiagnosticCapture(
     log = console.log
   } = {}
 ) {
+  const artifactsEnabled = quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState);
   if (!quickPlayDiagnosticState?.active) {
+    if (quickPlayDiagnosticState?.ownerRequests) {
+      quickPlayDiagnosticState.ownerRequests[QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC] = false;
+      quickPlayDiagnosticState.ownerRequests[QUICK_PLAY_OWNER_ZENITH_DRY_RUN] = false;
+    }
     return false;
   }
   quickPlayDiagnosticState.active = false;
+  quickPlayDiagnosticState.ownerRequests[QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC] = false;
+  quickPlayDiagnosticState.ownerRequests[QUICK_PLAY_OWNER_ZENITH_DRY_RUN] = false;
   quickPlayDiagnosticState.finishedAt = Math.max(0, Number(now ?? Date.now()));
   quickPlayDiagnosticState.stopReason = String(reason ?? "completed");
   quickPlayDiagnosticState.logFn = null;
@@ -1891,11 +2159,17 @@ export function stopQuickPlayDiagnosticCapture(
     quickPlayDiagnosticState.stopReason
   );
   finalizeQuickPlayPassiveSnapshotDiagnostics(quickPlayDiagnosticState);
-  const report = buildQuickPlayRuntimeReport(quickPlayDiagnosticState);
-  writeSnapshot(quickPlayDiagnosticState.reportPath, report);
-  log?.(
-    `[quick-play] diagnostic capture stopped reason=${quickPlayDiagnosticState.stopReason} report=${quickPlayDiagnosticState.reportPath.replace(/\\/g, "/")}`
-  );
+  if (artifactsEnabled) {
+    const report = buildQuickPlayRuntimeReport(quickPlayDiagnosticState);
+    writeSnapshot(quickPlayDiagnosticState.reportPath, report);
+    log?.(
+      `[quick-play] diagnostic capture stopped reason=${quickPlayDiagnosticState.stopReason} report=${quickPlayDiagnosticState.reportPath.replace(/\\/g, "/")}`
+    );
+  } else {
+    log?.(
+      `[quick-play] passive provider stopped reason=${quickPlayDiagnosticState.stopReason}`
+    );
+  }
   return true;
 }
 
@@ -1984,9 +2258,10 @@ export function recordQuickPlayDiagnosticEnvelope(
   if (!quickPlayDiagnosticState?.active || !envelope || typeof envelope !== "object") {
     return false;
   }
+  const packetLimit = quickPlayPassivePacketLimit(quickPlayDiagnosticState);
   if (
-    quickPlayDiagnosticState.wsEnvelopes.length >=
-    Math.max(1, Number(quickPlayDiagnosticState.maxWsPackets ?? DEFAULT_QUICK_PLAY_DIAGNOSTIC_PACKET_LIMIT))
+    packetLimit !== null &&
+    quickPlayDiagnosticState.wsEnvelopes.length >= packetLimit
   ) {
     quickPlayDiagnosticState.roundCompleted = true;
     quickPlayDiagnosticState.stopReason = "packet_limit_reached";
@@ -1994,7 +2269,9 @@ export function recordQuickPlayDiagnosticEnvelope(
   }
   const record = JSON.parse(JSON.stringify(envelope));
   quickPlayDiagnosticState.wsEnvelopes.push(record);
-  appendJsonLine(quickPlayDiagnosticState.rawWsPath, record);
+  if (quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState)) {
+    appendJsonLine(quickPlayDiagnosticState.rawWsPath, record);
+  }
   for (const player of record.players ?? []) {
     const key = [
       player?.userid ?? "",
@@ -2160,6 +2437,7 @@ export function recordQuickPlayClosureCandidates(
   let changed = false;
   let anyPlaying = false;
   let endedTransition = false;
+  const artifactsEnabled = quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState);
   closureDiagnostics.raw_candidate_count += rawCandidates.length;
   for (const rawCandidate of rawCandidates) {
     const rejectedReasons = Array.isArray(rawCandidate?.rejectedReason)
@@ -2175,73 +2453,75 @@ export function recordQuickPlayClosureCandidates(
       closureDiagnostics.rejection_counts[key] =
         Math.max(0, Number(closureDiagnostics.rejection_counts[key] ?? 0)) + 1;
     }
-    appendJsonLine(quickPlayDiagnosticState.closurePath, {
-      timestamp: now,
-      attempt: Math.max(0, Number(scan.attempt ?? 0)),
-      result_type: normalizedScalar(scan.resultType) ?? "completed",
-      function_name:
-        normalizedScalar(rawCandidate?.functionName ?? rawCandidate?.function_name) ?? null,
-      call_frame_index: Number.isFinite(Number(rawCandidate?.callFrameIndex ?? rawCandidate?.call_frame_index))
-        ? Math.max(0, Number(rawCandidate?.callFrameIndex ?? rawCandidate?.call_frame_index))
-        : null,
-      scope_index: Number.isFinite(Number(rawCandidate?.scopeIndex ?? rawCandidate?.scope_index))
-        ? Math.max(0, Number(rawCandidate?.scopeIndex ?? rawCandidate?.scope_index))
-        : null,
-      scope_type:
-        normalizedScalar(rawCandidate?.scopeType ?? rawCandidate?.scope_type) ?? null,
-      candidate_id: normalizedScalar(rawCandidate?.candidateId ?? rawCandidate?.candidate_id),
-      locator: normalizedScalar(rawCandidate?.locator) ?? null,
-      binding_name:
-        normalizedScalar(rawCandidate?.bindingName ?? rawCandidate?.binding_name) ?? null,
-      retained_root_kind:
-        normalizedScalar(rawCandidate?.retainedRootKind ?? rawCandidate?.retained_root_kind) ??
-        null,
-      retained_root_path: Array.isArray(rawCandidate?.retainedRootPath)
-        ? rawCandidate.retainedRootPath.slice(0, 8)
-        : Array.isArray(rawCandidate?.retained_root_path)
-          ? rawCandidate.retained_root_path.slice(0, 8)
-          : [],
-      full_path:
-        normalizedScalar(rawCandidate?.fullPath ?? rawCandidate?.full_path) ?? null,
-      matched_shape:
-        normalizedScalar(rawCandidate?.matchedShape ?? rawCandidate?.matched_shape) ?? null,
-      discovered_paths:
-        rawCandidate?.discoveredPaths && typeof rawCandidate.discoveredPaths === "object"
-          ? {
-              board: Array.isArray(rawCandidate.discoveredPaths.board)
-                ? rawCandidate.discoveredPaths.board.slice(0, 8)
-                : [],
-              current: Array.isArray(rawCandidate.discoveredPaths.current)
-                ? rawCandidate.discoveredPaths.current.slice(0, 8)
-                : [],
-              hold: Array.isArray(rawCandidate.discoveredPaths.hold)
-                ? rawCandidate.discoveredPaths.hold.slice(0, 8)
-                : [],
-              queue: Array.isArray(rawCandidate.discoveredPaths.queue)
-                ? rawCandidate.discoveredPaths.queue.slice(0, 8)
-                : []
-            }
-          : rawCandidate?.discovered_paths && typeof rawCandidate.discovered_paths === "object"
-            ? rawCandidate.discovered_paths
-            : null,
-      object_keys: Array.isArray(rawCandidate?.objectKeys)
-        ? rawCandidate.objectKeys.slice(0, 20)
-        : Array.isArray(rawCandidate?.object_keys)
-          ? rawCandidate.object_keys.slice(0, 20)
-          : [],
-      typeof: normalizedScalar(rawCandidate?.typeof) ?? null,
-      has_board_like: rawCandidate?.hasBoardLike === true,
-      has_current_like: rawCandidate?.hasCurrentLike === true,
-      has_queue_like: rawCandidate?.hasQueueLike === true,
-      has_hold_like: rawCandidate?.hasHoldLike === true,
-      has_gameid: rawCandidate?.hasGameId === true,
-      has_seed: rawCandidate?.hasSeed === true,
-      has_userid: rawCandidate?.hasUserId === true,
-      rejected_reason: rejectedReasons
-        .map((entry) => normalizedScalar(entry))
-        .filter((entry) => typeof entry === "string")
-        .slice(0, 8)
-    });
+    if (artifactsEnabled) {
+      appendJsonLine(quickPlayDiagnosticState.closurePath, {
+        timestamp: now,
+        attempt: Math.max(0, Number(scan.attempt ?? 0)),
+        result_type: normalizedScalar(scan.resultType) ?? "completed",
+        function_name:
+          normalizedScalar(rawCandidate?.functionName ?? rawCandidate?.function_name) ?? null,
+        call_frame_index: Number.isFinite(Number(rawCandidate?.callFrameIndex ?? rawCandidate?.call_frame_index))
+          ? Math.max(0, Number(rawCandidate?.callFrameIndex ?? rawCandidate?.call_frame_index))
+          : null,
+        scope_index: Number.isFinite(Number(rawCandidate?.scopeIndex ?? rawCandidate?.scope_index))
+          ? Math.max(0, Number(rawCandidate?.scopeIndex ?? rawCandidate?.scope_index))
+          : null,
+        scope_type:
+          normalizedScalar(rawCandidate?.scopeType ?? rawCandidate?.scope_type) ?? null,
+        candidate_id: normalizedScalar(rawCandidate?.candidateId ?? rawCandidate?.candidate_id),
+        locator: normalizedScalar(rawCandidate?.locator) ?? null,
+        binding_name:
+          normalizedScalar(rawCandidate?.bindingName ?? rawCandidate?.binding_name) ?? null,
+        retained_root_kind:
+          normalizedScalar(rawCandidate?.retainedRootKind ?? rawCandidate?.retained_root_kind) ??
+          null,
+        retained_root_path: Array.isArray(rawCandidate?.retainedRootPath)
+          ? rawCandidate.retainedRootPath.slice(0, 8)
+          : Array.isArray(rawCandidate?.retained_root_path)
+            ? rawCandidate.retained_root_path.slice(0, 8)
+            : [],
+        full_path:
+          normalizedScalar(rawCandidate?.fullPath ?? rawCandidate?.full_path) ?? null,
+        matched_shape:
+          normalizedScalar(rawCandidate?.matchedShape ?? rawCandidate?.matched_shape) ?? null,
+        discovered_paths:
+          rawCandidate?.discoveredPaths && typeof rawCandidate.discoveredPaths === "object"
+            ? {
+                board: Array.isArray(rawCandidate.discoveredPaths.board)
+                  ? rawCandidate.discoveredPaths.board.slice(0, 8)
+                  : [],
+                current: Array.isArray(rawCandidate.discoveredPaths.current)
+                  ? rawCandidate.discoveredPaths.current.slice(0, 8)
+                  : [],
+                hold: Array.isArray(rawCandidate.discoveredPaths.hold)
+                  ? rawCandidate.discoveredPaths.hold.slice(0, 8)
+                  : [],
+                queue: Array.isArray(rawCandidate.discoveredPaths.queue)
+                  ? rawCandidate.discoveredPaths.queue.slice(0, 8)
+                  : []
+              }
+            : rawCandidate?.discovered_paths && typeof rawCandidate.discovered_paths === "object"
+              ? rawCandidate.discovered_paths
+              : null,
+        object_keys: Array.isArray(rawCandidate?.objectKeys)
+          ? rawCandidate.objectKeys.slice(0, 20)
+          : Array.isArray(rawCandidate?.object_keys)
+            ? rawCandidate.object_keys.slice(0, 20)
+            : [],
+        typeof: normalizedScalar(rawCandidate?.typeof) ?? null,
+        has_board_like: rawCandidate?.hasBoardLike === true,
+        has_current_like: rawCandidate?.hasCurrentLike === true,
+        has_queue_like: rawCandidate?.hasQueueLike === true,
+        has_hold_like: rawCandidate?.hasHoldLike === true,
+        has_gameid: rawCandidate?.hasGameId === true,
+        has_seed: rawCandidate?.hasSeed === true,
+        has_userid: rawCandidate?.hasUserId === true,
+        rejected_reason: rejectedReasons
+          .map((entry) => normalizedScalar(entry))
+          .filter((entry) => typeof entry === "string")
+          .slice(0, 8)
+      });
+    }
   }
   for (const candidate of scan.acceptedCandidates ?? scan.candidates ?? []) {
     const candidateId = String(candidate?.candidateId ?? "").trim();
@@ -3730,6 +4010,12 @@ function writeQuickPlayCallFrameInventory(
 ) {
   let rowsWritten = 0;
   try {
+    if (!quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState)) {
+      return {
+        ok: true,
+        rowsWritten: 0
+      };
+    }
     for (const row of Array.isArray(frameInventory) ? frameInventory : []) {
       appendJsonLine(quickPlayDiagnosticState?.callframePath, {
         ...row,
@@ -4599,9 +4885,15 @@ export async function reconcileQuickPlayPassiveBinding(
   if (!quickPlayDiagnosticState?.active) {
     result = "rejected";
     deferredReason = "capture_inactive";
-  } else if (!isZenithModeSelected(browserControlState) || browserControlState?.botEnabled) {
+  } else if (!isZenithModeSelected(browserControlState)) {
     result = "rejected";
     deferredReason = "mode_not_zenith";
+  } else if (
+    browserControlState?.botEnabled &&
+    !quickPlayPassiveAllowsBotEnabled(quickPlayDiagnosticState)
+  ) {
+    result = "rejected";
+    deferredReason = "bot_enabled";
   }
   if (!deferredReason && !candidateReady) {
     deferredReason = "candidate_not_ready";
@@ -4723,13 +5015,33 @@ async function readQuickPlayPassiveSnapshot(
   const result = await cdp.send("Runtime.callFunctionOn", {
     objectId: bound.rootObjectId,
     functionDeclaration: `function(retainedRootKind, boardPath, currentPath, holdPath, queuePath) {
-      const pieceNames = ["i", "o", "t", "s", "z", "j", "l"];
+      const pieceNames = ["I", "O", "T", "S", "Z", "J", "L"];
       const normalizePieceType = (value) => {
         if (value === null || value === undefined || value === false) return null;
         if (typeof value === "number") return pieceNames[value] ?? null;
         if (typeof value === "string") {
-          const token = value.trim().toLowerCase();
-          return pieceNames.includes(token) ? token : null;
+          const token = value.trim();
+          if (!token) {
+            return null;
+          }
+          switch (token.toLowerCase()) {
+            case "i":
+              return "I";
+            case "o":
+              return "O";
+            case "t":
+              return "T";
+            case "s":
+              return "S";
+            case "z":
+              return "Z";
+            case "j":
+              return "J";
+            case "l":
+              return "L";
+            default:
+              return null;
+          }
         }
         if (typeof value === "object") {
           return normalizePieceType(
@@ -4762,6 +5074,20 @@ async function readQuickPlayPassiveSnapshot(
           return false;
         }
       };
+      const readRawPauseState = (value) => {
+        if (!value || typeof value !== "object") {
+          return undefined;
+        }
+        if (hasOwn(value, "pause")) {
+          return value.pause;
+        }
+        if (hasOwn(value, "paused")) {
+          return value.paused;
+        }
+        return undefined;
+      };
+      const normalizePausedState = (value) =>
+        value !== null && value !== undefined && value !== false;
       const rowCells = (row) =>
         Array.isArray(row) ? row :
         Array.isArray(row?.cells) ? row.cells :
@@ -4901,10 +5227,14 @@ async function readQuickPlayPassiveSnapshot(
         if (!Array.isArray(value)) {
           return { ok: false, reason: "invalid_queue_shape", value: [] };
         }
-        const queue = value
-          .map((entry) => normalizePieceType(entry))
-          .filter(Boolean)
-          .slice(0, 20);
+        const queue = [];
+        for (const entry of value.slice(0, 20)) {
+          const normalized = normalizePieceType(entry);
+          if (!normalized) {
+            return { ok: false, reason: "invalid_queue_piece", value: [] };
+          }
+          queue.push(normalized);
+        }
         return { ok: true, value: queue };
       };
       const normalizeCell = (cell) => {
@@ -5130,16 +5460,17 @@ async function readQuickPlayPassiveSnapshot(
         ];
         const stateContext =
           contextLookups.find((entry) => entry?.ok && entry.value && typeof entry.value === "object")?.value ?? this;
+        const rawPauseState = readRawPauseState(stateContext);
+        const paused = normalizePausedState(rawPauseState);
         const playing =
           typeof this.isPlaying === "function" ? Boolean(this.isPlaying()) :
           typeof stateContext?.playing === "boolean" ? stateContext.playing :
-          typeof stateContext?.paused === "boolean" ? !stateContext.paused :
+          rawPauseState !== undefined ? !paused :
           null;
         const started =
           typeof this.isStarted === "function" ? Boolean(this.isStarted()) :
           typeof stateContext?.started === "boolean" ? stateContext.started :
           null;
-        const paused = typeof stateContext?.paused === "boolean" ? stateContext.paused : null;
         const destroyed = Boolean(stateContext?.destroyed || stateContext?.dead || stateContext?.gameover);
         const countdownStarted = Boolean(started && playing === false && destroyed === false);
         const currentDiagnostic = {
@@ -5320,7 +5651,7 @@ async function readQuickPlayPassiveSnapshot(
     playing: value.playing ?? null,
     started: value.started ?? null,
     countdown_started: value.countdown_started ?? null,
-    paused: value.paused ?? null,
+    paused: typeof value.paused === "boolean" ? value.paused : false,
     destroyed: value.destroyed ?? null,
     successful: value.successful ?? null,
     gameoverreason: normalizedScalar(value.gameoverreason),
@@ -7173,14 +7504,20 @@ export async function maybeRunQuickPlayDiagnosticCapture({
     return { ran: false, reason: "inactive" };
   }
   quickPlayDiagnosticState.currentTargetUrl = String(targetUrl ?? "");
-  if (!isZenithModeSelected(browserControlState) || browserControlState?.botEnabled) {
+  if (
+    !isZenithModeSelected(browserControlState) ||
+    (browserControlState?.botEnabled &&
+      !quickPlayPassiveAllowsBotEnabled(quickPlayDiagnosticState))
+  ) {
     stopQuickPlayDiagnosticCapture(quickPlayDiagnosticState, {
       now,
-      reason: !isZenithModeSelected(browserControlState) ? "mode_changed" : "bot_enabled",
+      reason:
+        !isZenithModeSelected(browserControlState) ? "mode_changed" : "bot_enabled",
       log
     });
     await releaseQuickPlayPassiveState(cdp, quickPlayDiagnosticState, {
-      reason: !isZenithModeSelected(browserControlState) ? "mode_changed" : "bot_enabled",
+      reason:
+        !isZenithModeSelected(browserControlState) ? "mode_changed" : "bot_enabled",
       writeSnapshotStatus: false,
       preserveDiagnostics: true,
       log
@@ -8659,38 +8996,77 @@ export function applyBrowserControlMessage({
   if (!message || typeof message !== "object") {
     return false;
   }
-  if (message.type === "quick_play_diagnostic") {
-    const enabled = message.enabled !== false;
-    if (enabled) {
-      const result = startQuickPlayDiagnosticCapture(
-        quickPlayDiagnosticState,
-        controlState,
-        {
-          now,
-          log,
-          usernameHint: normalizedScalar(message.username_hint)
-        }
-      );
-      if (result.started) {
-        onQuickPlayDiagnosticStart?.(result);
-      } else {
+  if (message.type === "quick_play_passive_provider") {
+    const result = requestQuickPlayPassiveProviderOwner(
+      quickPlayDiagnosticState,
+      controlState,
+      {
+        owner: normalizedScalar(message.owner),
+        enabled: message.enabled !== false,
+        now,
+        log,
+        usernameHint: normalizedScalar(message.username_hint)
+      }
+    );
+    if (result.started) {
+      if (
+        normalizedScalar(message.owner) === QUICK_PLAY_OWNER_ZENITH_DRY_RUN
+      ) {
         log?.(
-          `[quick-play] diagnostic capture rejected reason=${String(
-            result.reason ?? "unknown"
-          )}`
+          `[zenith-dry-run] passive provider active mode=${normalizeRuntimeMode(
+            controlState.selectedMode
+          )} packet_limit=${
+            quickPlayPassivePacketLimit(quickPlayDiagnosticState) === null
+              ? "unlimited"
+              : quickPlayPassivePacketLimit(quickPlayDiagnosticState)
+          } duration=${
+            quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState)
+              ? "owner_lifecycle"
+              : Math.max(
+                  0,
+                  Number(quickPlayDiagnosticState.stopAt) -
+                    Number(quickPlayDiagnosticState.startedAt)
+                )
+          }`
         );
       }
-      return result.started;
-    }
-    const stopped = stopQuickPlayDiagnosticCapture(quickPlayDiagnosticState, {
-      now,
-      reason: "disabled",
-      log
-    });
-    if (stopped) {
+      onQuickPlayDiagnosticStart?.(result);
+    } else if (result.stopped) {
       onQuickPlayDiagnosticStop?.();
+    } else if (result.reason) {
+      log?.(
+        `[quick-play] passive provider rejected owner=${String(
+          normalizedScalar(message.owner) ?? ""
+        )} reason=${String(result.reason)}` +
+          (result.reason === "mode_not_zenith"
+            ? ` actual_mode=${normalizeRuntimeMode(controlState.selectedMode)}`
+            : "")
+      );
     }
-    return stopped;
+    return result.changed === true || result.started === true || result.stopped === true;
+  }
+  if (message.type === "quick_play_diagnostic") {
+    return applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC,
+        enabled: message.enabled !== false,
+        username_hint: normalizedScalar(message.username_hint)
+      },
+      controlState,
+      closureCaptureState,
+      nextGameReacquireState,
+      quickPlayDiagnosticState,
+      onModeChanged,
+      onBotEnabled,
+      onBotDisabled,
+      onQuickPlayDiagnosticStart,
+      onQuickPlayDiagnosticStop,
+      now,
+      log,
+      windowMs,
+      bootstrapReady
+    });
   }
   if (message.type === "selected_mode") {
     const nextMode = normalizeRuntimeMode(message.mode);
@@ -8728,7 +9104,7 @@ export function applyBrowserControlMessage({
   }
   controlState.botEnabled = message.enabled;
   if (message.enabled) {
-    if (quickPlayDiagnosticState?.active) {
+    if (quickPlayDiagnosticState?.active && !quickPlayPassiveAllowsBotEnabled(quickPlayDiagnosticState)) {
       stopQuickPlayDiagnosticCapture(quickPlayDiagnosticState, {
         now,
         reason: "bot_enabled",

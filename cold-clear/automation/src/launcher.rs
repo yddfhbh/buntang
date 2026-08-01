@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -21,8 +21,12 @@ use crate::driver::{
     BrowserCdpInputBackend, DebugLogBackend, InputBackend, SharedBrowserCdpInputBackend,
 };
 use crate::paths::AppPaths;
+use crate::runner::{plan_snapshot_dry_run, DryRunPlanResult};
 use crate::runtime::run_automation_with_resources_and_live_pps;
-use crate::scanner::{read_snapshot_file, JsonFileScanner};
+use crate::scanner::{
+    read_snapshot_file, read_zenith_passive_snapshot_file_with_age, JsonFileScanner,
+    ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
+};
 
 const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Play Style",
@@ -58,6 +62,7 @@ const BOT_UI_HIDDEN_LABELS: &[&str] = &[
     "Max Nodes",
     "Planner",
 ];
+const ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH: &str = "automation/quick-play-passive-snapshot.json";
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
@@ -480,6 +485,126 @@ struct BrowserSession {
     last_used_token: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PassiveProviderOwner {
+    ManualDiagnostic,
+    ZenithDryRun,
+}
+
+impl PassiveProviderOwner {
+    fn control_value(self) -> &'static str {
+        match self {
+            PassiveProviderOwner::ManualDiagnostic => "manual_diagnostic",
+            PassiveProviderOwner::ZenithDryRun => "zenith_dry_run",
+        }
+    }
+
+    fn log_prefix(self) -> &'static str {
+        match self {
+            PassiveProviderOwner::ManualDiagnostic => "[quick-play]",
+            PassiveProviderOwner::ZenithDryRun => "[zenith-dry-run]",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PassiveProviderLifecycle {
+    Activated,
+    OwnerAdded,
+    OwnerReleased,
+    Deactivated,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PassiveProviderTransition {
+    owner: PassiveProviderOwner,
+    lifecycle: PassiveProviderLifecycle,
+    activation_generation: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct PassiveProviderController {
+    manual_diagnostic_requested: bool,
+    zenith_dry_run_requested: bool,
+    activation_generation: u64,
+}
+
+impl PassiveProviderController {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn has_any(&self) -> bool {
+        self.manual_diagnostic_requested || self.zenith_dry_run_requested
+    }
+
+    fn is_requested(&self, owner: PassiveProviderOwner) -> bool {
+        match owner {
+            PassiveProviderOwner::ManualDiagnostic => self.manual_diagnostic_requested,
+            PassiveProviderOwner::ZenithDryRun => self.zenith_dry_run_requested,
+        }
+    }
+
+    fn owners_label(&self) -> &'static str {
+        match (
+            self.manual_diagnostic_requested,
+            self.zenith_dry_run_requested,
+        ) {
+            (false, false) => "none",
+            (true, false) => "manual_diagnostic",
+            (false, true) => "zenith_dry_run",
+            (true, true) => "manual_diagnostic+zenith_dry_run",
+        }
+    }
+
+    fn request(&mut self, owner: PassiveProviderOwner) -> Option<PassiveProviderTransition> {
+        if self.is_requested(owner) {
+            return None;
+        }
+        let was_any = self.has_any();
+        self.set_requested(owner, true);
+        let lifecycle = if was_any {
+            PassiveProviderLifecycle::OwnerAdded
+        } else {
+            self.activation_generation = self.activation_generation.saturating_add(1);
+            PassiveProviderLifecycle::Activated
+        };
+        Some(PassiveProviderTransition {
+            owner,
+            lifecycle,
+            activation_generation: self.activation_generation,
+        })
+    }
+
+    fn release(&mut self, owner: PassiveProviderOwner) -> Option<PassiveProviderTransition> {
+        if !self.is_requested(owner) {
+            return None;
+        }
+        self.set_requested(owner, false);
+        let lifecycle = if self.has_any() {
+            PassiveProviderLifecycle::OwnerReleased
+        } else {
+            PassiveProviderLifecycle::Deactivated
+        };
+        Some(PassiveProviderTransition {
+            owner,
+            lifecycle,
+            activation_generation: self.activation_generation,
+        })
+    }
+
+    fn set_requested(&mut self, owner: PassiveProviderOwner, requested: bool) {
+        match owner {
+            PassiveProviderOwner::ManualDiagnostic => {
+                self.manual_diagnostic_requested = requested;
+            }
+            PassiveProviderOwner::ZenithDryRun => {
+                self.zenith_dry_run_requested = requested;
+            }
+        }
+    }
+}
+
 struct BotSession {
     stop: Arc<AtomicBool>,
     live_target_pps: Arc<AtomicU32>,
@@ -493,6 +618,103 @@ impl BotSession {
             let _ = thread.join();
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ZenithDryRunController {
+    last_game_id: Option<String>,
+    last_capture_generation: Option<u64>,
+    last_candidate_id: Option<String>,
+    last_snapshot_token: Option<String>,
+    last_piece_counter: Option<u32>,
+    last_current_signature: Option<String>,
+    last_planned_at: Option<Instant>,
+    active: bool,
+    last_skip_key: Option<String>,
+}
+
+impl ZenithDryRunController {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn reset_processed_state(&mut self) {
+        self.last_game_id = None;
+        self.last_capture_generation = None;
+        self.last_candidate_id = None;
+        self.last_snapshot_token = None;
+        self.last_piece_counter = None;
+        self.last_current_signature = None;
+        self.last_planned_at = None;
+        self.active = false;
+    }
+
+    fn clear_skip_reason(&mut self) {
+        self.last_skip_key = None;
+    }
+
+    fn record_processed(&mut self, snapshot: &ZenithPassivePlannerSnapshot) {
+        self.last_game_id = Some(snapshot.gameid.clone());
+        self.last_capture_generation = Some(snapshot.capture_generation);
+        self.last_candidate_id = Some(snapshot.candidate_id.clone());
+        self.last_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.last_piece_counter = snapshot.snapshot.piece_counter;
+        self.last_current_signature = Some(snapshot.current_signature.clone());
+        self.last_planned_at = Some(Instant::now());
+        self.active = true;
+        self.clear_skip_reason();
+    }
+
+    fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
+        if self.last_skip_key.as_deref() == Some(key) {
+            return None;
+        }
+        self.last_skip_key = Some(key.to_owned());
+        Some(line)
+    }
+}
+
+fn zenith_semantic_skip_key(error: &str) -> String {
+    if error.contains("missing current piece type") {
+        return "semantic_invalid:current.type:missing".to_owned();
+    }
+    if error.contains("invalid current piece") {
+        return "semantic_invalid:current.type:invalid_piece".to_owned();
+    }
+    if error.contains("invalid hold piece") {
+        return "semantic_invalid:hold:invalid_piece".to_owned();
+    }
+    if error.contains("invalid queue piece") {
+        return "semantic_invalid:queue:invalid_piece".to_owned();
+    }
+    if error.contains("missing current x coordinate") {
+        return "semantic_invalid:current.x:missing".to_owned();
+    }
+    if error.contains("null current x coordinate") {
+        return "semantic_invalid:current.x:null".to_owned();
+    }
+    if error.contains("invalid current x coordinate type") {
+        return "semantic_invalid:current.x:invalid_type".to_owned();
+    }
+    if error.contains("invalid current x coordinate non_integer") {
+        return "semantic_invalid:current.x:non_integer".to_owned();
+    }
+    if error.contains("invalid current x coordinate out_of_range") {
+        return "semantic_invalid:current.x:out_of_range".to_owned();
+    }
+    if error.contains("missing current y coordinate") {
+        return "semantic_invalid:current.y:missing".to_owned();
+    }
+    if error.contains("null current y coordinate") {
+        return "semantic_invalid:current.y:null".to_owned();
+    }
+    if error.contains("invalid current y coordinate type") {
+        return "semantic_invalid:current.y:invalid_type".to_owned();
+    }
+    if error.contains("invalid current y coordinate out_of_range") {
+        return "semantic_invalid:current.y:out_of_range".to_owned();
+    }
+    format!("semantic_invalid:{error}")
 }
 
 pub struct LauncherApp {
@@ -514,6 +736,8 @@ pub struct LauncherApp {
     bot_desired_enabled: bool,
     bot_waiting_for_next_game: bool,
     bot_restart_pending: bool,
+    passive_provider: PassiveProviderController,
+    zenith_dry_run: ZenithDryRunController,
 }
 
 impl LauncherApp {
@@ -542,6 +766,8 @@ impl LauncherApp {
             bot_desired_enabled: false,
             bot_waiting_for_next_game: false,
             bot_restart_pending: false,
+            passive_provider: PassiveProviderController::default(),
+            zenith_dry_run: ZenithDryRunController::default(),
         }
     }
 
@@ -728,26 +954,49 @@ impl LauncherApp {
                 self.save_state();
                 self.push_log("[launcher] bot on");
             }
-            if let Some(session) = self.browser_session.as_mut() {
-                if let Err(err) = session.snapshot_provider.set_bot_enabled(true) {
-                    self.push_log(format!(
-                        "[browser] failed to forward bot on state to snapshot provider: {err:#}"
-                    ));
-                    self.bot_status = BotStatus::Error;
-                    if mode == BotStartMode::UserInitiated {
-                        self.bot_desired_enabled = false;
-                    }
-                    return;
+            if self.state.selected_mode == RuntimeMode::Zenith
+                && !self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, true, None)
+            {
+                self.bot_status = BotStatus::Error;
+                if mode == BotStartMode::UserInitiated {
+                    self.bot_desired_enabled = false;
                 }
+                return;
+            }
+            let set_bot_enabled_result = if let Some(session) = self.browser_session.as_mut() {
+                session.snapshot_provider.set_bot_enabled(true)
+            } else {
+                Ok(())
+            };
+            if let Err(err) = set_bot_enabled_result {
+                self.push_log(format!(
+                    "[browser] failed to forward bot on state to snapshot provider: {err:#}"
+                ));
+                if self.state.selected_mode == RuntimeMode::Zenith {
+                    let _ = self.set_passive_provider_owner(
+                        PassiveProviderOwner::ZenithDryRun,
+                        false,
+                        None,
+                    );
+                }
+                self.bot_status = BotStatus::Error;
+                if mode == BotStartMode::UserInitiated {
+                    self.bot_desired_enabled = false;
+                }
+                return;
             }
             self.bot_status = BotStatus::On;
             self.bot_waiting_for_next_game = false;
             self.bot_restart_pending = false;
+            self.zenith_dry_run.reset();
             self.push_log(format!(
                 "[mode] bot enabled mode={} generation={}",
                 self.state.selected_mode.control_value(),
                 self.state.mode_generation
             ));
+            if self.state.selected_mode == RuntimeMode::Zenith {
+                self.push_log("[zenith-dry-run] controller armed");
+            }
             return;
         }
 
@@ -886,26 +1135,24 @@ impl LauncherApp {
             self.push_log("[quick-play] diagnostic blocked: bot is enabled");
             return;
         }
-        let Some(session) = self.browser_session.as_mut() else {
+        if self.browser_session.is_none() {
             self.push_log("[quick-play] diagnostic blocked: browser runtime is not ready");
             return;
-        };
+        }
         let username_hint = {
             let trimmed = self.quick_play_diagnostic_username.trim();
             if trimmed.is_empty() {
                 None
             } else {
-                Some(trimmed)
+                Some(trimmed.to_owned())
             }
         };
-        match session
-            .snapshot_provider
-            .start_quick_play_diagnostic(username_hint)
-        {
-            Ok(()) => self.push_log("[quick-play] diagnostic capture requested"),
-            Err(err) => self.push_log(format!(
-                "[quick-play] failed to request diagnostic capture: {err:#}"
-            )),
+        if self.set_passive_provider_owner(
+            PassiveProviderOwner::ManualDiagnostic,
+            true,
+            username_hint.as_deref(),
+        ) {
+            self.push_log("[quick-play] diagnostic capture requested");
         }
     }
 
@@ -913,6 +1160,7 @@ impl LauncherApp {
         self.bot_desired_enabled = false;
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
+        self.zenith_dry_run.reset();
         if let Some(mut bot) = self.bot_session.take() {
             self.ignore_next_bot_exit = true;
             bot.stop();
@@ -933,6 +1181,7 @@ impl LauncherApp {
                 ));
             }
         }
+        let _ = self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false, None);
         self.bot_status = BotStatus::Off;
     }
 
@@ -948,6 +1197,10 @@ impl LauncherApp {
         }
         self.state.selected_mode = next_mode;
         self.state.mode_generation = self.state.mode_generation.saturating_add(1);
+        if next_mode != RuntimeMode::Zenith {
+            self.clear_passive_provider_owners();
+        }
+        self.zenith_dry_run.reset();
         self.push_log(format!(
             "[mode] selected mode={}",
             self.state.selected_mode.control_value()
@@ -988,6 +1241,8 @@ impl LauncherApp {
         self.input_status = InputStatus::Closed;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
+        self.passive_provider.reset();
+        self.zenith_dry_run.reset();
     }
 
     fn release_shared_input_now(&self) -> Result<()> {
@@ -1139,7 +1394,380 @@ impl LauncherApp {
         self.bot_desired_enabled = false;
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
+        self.passive_provider.reset();
+        self.zenith_dry_run.reset();
         self.push_log("[launcher] browser closed");
+    }
+
+    fn log_passive_provider_transition(&mut self, transition: PassiveProviderTransition) {
+        match transition.lifecycle {
+            PassiveProviderLifecycle::Activated => self.push_log(format!(
+                "{} passive provider requested owner={} generation={} owners={}",
+                transition.owner.log_prefix(),
+                transition.owner.control_value(),
+                transition.activation_generation,
+                self.passive_provider.owners_label()
+            )),
+            PassiveProviderLifecycle::OwnerAdded => self.push_log(format!(
+                "[quick-play] passive provider owner added owner={} owners={}",
+                transition.owner.control_value(),
+                self.passive_provider.owners_label()
+            )),
+            PassiveProviderLifecycle::OwnerReleased => self.push_log(format!(
+                "{} passive provider owner released owner={} owners={}",
+                transition.owner.log_prefix(),
+                transition.owner.control_value(),
+                self.passive_provider.owners_label()
+            )),
+            PassiveProviderLifecycle::Deactivated => self.push_log(format!(
+                "{} passive provider stopped owner={} generation={}",
+                transition.owner.log_prefix(),
+                transition.owner.control_value(),
+                transition.activation_generation
+            )),
+        }
+    }
+
+    fn set_passive_provider_owner(
+        &mut self,
+        owner: PassiveProviderOwner,
+        enabled: bool,
+        username_hint: Option<&str>,
+    ) -> bool {
+        let previous = self.passive_provider.clone();
+        let transition = if enabled {
+            self.passive_provider.request(owner)
+        } else {
+            self.passive_provider.release(owner)
+        };
+        let Some(transition) = transition else {
+            return true;
+        };
+
+        let control_result = if let Some(session) = self.browser_session.as_mut() {
+            session.snapshot_provider.set_quick_play_passive_provider(
+                owner.control_value(),
+                enabled,
+                username_hint,
+            )
+        } else {
+            self.passive_provider = previous;
+            self.push_log(format!(
+                "{} passive provider unavailable owner={} reason=browser_runtime_not_ready",
+                owner.log_prefix(),
+                owner.control_value()
+            ));
+            return false;
+        };
+
+        match control_result {
+            Ok(()) => {
+                self.log_passive_provider_transition(transition);
+                true
+            }
+            Err(err) => {
+                self.passive_provider = previous;
+                self.push_log(format!(
+                    "{} passive provider unavailable owner={} error={err:#}",
+                    owner.log_prefix(),
+                    owner.control_value()
+                ));
+                false
+            }
+        }
+    }
+
+    fn clear_passive_provider_owners(&mut self) {
+        if self.browser_session.is_none() {
+            self.passive_provider.reset();
+            return;
+        }
+        let manual_requested = self
+            .passive_provider
+            .is_requested(PassiveProviderOwner::ManualDiagnostic);
+        let zenith_requested = self
+            .passive_provider
+            .is_requested(PassiveProviderOwner::ZenithDryRun);
+        if manual_requested {
+            let _ = self.set_passive_provider_owner(
+                PassiveProviderOwner::ManualDiagnostic,
+                false,
+                None,
+            );
+        }
+        if zenith_requested {
+            let _ =
+                self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false, None);
+        }
+    }
+
+    fn zenith_passive_snapshot_path(&self) -> std::path::PathBuf {
+        self.paths
+            .resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
+    }
+
+    fn zenith_passive_snapshot_file_signature(&self, path: &std::path::Path) -> String {
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                let modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|timestamp| timestamp.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(0);
+                format!("len={} modified_ms={modified_ms}", metadata.len())
+            }
+            Err(err) => format!("metadata_error={:?}", err.kind()),
+        }
+    }
+
+    fn poll_zenith_dry_run(&mut self) {
+        if self.state.selected_mode != RuntimeMode::Zenith {
+            self.zenith_dry_run.reset();
+            return;
+        }
+        if !self
+            .passive_provider
+            .is_requested(PassiveProviderOwner::ZenithDryRun)
+        {
+            self.zenith_dry_run.reset();
+            return;
+        }
+        if !self.bot_desired_enabled || self.bot_status != BotStatus::On {
+            self.zenith_dry_run.reset();
+            return;
+        }
+        let runtime_ready = self.browser_status == BrowserStatus::Ready
+            && self.input_status == InputStatus::Ready
+            && matches!(
+                self.snapshot_status,
+                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+            );
+        if !runtime_ready {
+            return;
+        }
+        let path = self.zenith_passive_snapshot_path();
+        let file_signature = self.zenith_passive_snapshot_file_signature(&path);
+        let read_result = match read_zenith_passive_snapshot_file_with_age(&path) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                let skip_key = format!("snapshot_missing:{file_signature}");
+                if let Some(line) = self.zenith_dry_run.note_skip(
+                    &skip_key,
+                    "[zenith-dry-run] snapshot skipped reason=snapshot_missing".to_owned(),
+                ) {
+                    self.push_log(line);
+                }
+                return;
+            }
+            Err(err) => {
+                let error = format!("{err:#}");
+                let skip_key = zenith_semantic_skip_key(&error);
+                if let Some(line) = self.zenith_dry_run.note_skip(
+                    &skip_key,
+                    format!(
+                        "[zenith-dry-run] snapshot skipped reason=semantic_invalid error={error}"
+                    ),
+                ) {
+                    self.push_log(line);
+                }
+                self.zenith_dry_run.reset_processed_state();
+                return;
+            }
+        };
+        let (envelope, age) = read_result;
+        let Some(snapshot) = envelope.snapshot.as_ref() else {
+            let skip = if envelope.capture_status.as_deref() == Some("stopped") {
+                (
+                    "capture_stopped".to_owned(),
+                    "capture_stopped".to_owned(),
+                    "[zenith-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
+                )
+            } else if let Some(error) = envelope.semantic_error.as_deref() {
+                let key = zenith_semantic_skip_key(error);
+                (
+                    key,
+                    "semantic_invalid".to_owned(),
+                    format!(
+                        "[zenith-dry-run] snapshot skipped reason=semantic_invalid error={error}"
+                    ),
+                )
+            } else {
+                (
+                    "semantic_invalid".to_owned(),
+                    "semantic_invalid".to_owned(),
+                    "[zenith-dry-run] snapshot skipped reason=semantic_invalid".to_owned(),
+                )
+            };
+            if let Some(line) = self.zenith_dry_run.note_skip(&skip.0, skip.2) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        };
+
+        if self.zenith_dry_run.last_game_id.as_deref() != Some(snapshot.gameid.as_str())
+            || self.zenith_dry_run.last_capture_generation != Some(snapshot.capture_generation)
+            || self.zenith_dry_run.last_candidate_id.as_deref()
+                != Some(snapshot.candidate_id.as_str())
+        {
+            self.zenith_dry_run.reset_processed_state();
+        }
+
+        if envelope.status != "ready" {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "semantic_invalid",
+                "[zenith-dry-run] snapshot skipped reason=semantic_invalid".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+        if envelope.capture_status.as_deref() != Some("running") {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "capture_stopped",
+                "[zenith-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if age
+            .map(|value| value.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
+            .unwrap_or(false)
+        {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "stale",
+                "[zenith-dry-run] snapshot skipped reason=stale".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+        if !snapshot.playing || !snapshot.started {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "not_playing",
+                "[zenith-dry-run] snapshot skipped reason=not_playing".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.countdown_started {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "countdown",
+                "[zenith-dry-run] snapshot skipped reason=countdown".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.paused == Some(true) {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "paused",
+                "[zenith-dry-run] snapshot skipped reason=paused".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.destroyed || snapshot.gameoverreason.is_some() {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "destroyed",
+                "[zenith-dry-run] snapshot skipped reason=destroyed".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.zenith_dry_run.reset_processed_state();
+            return;
+        }
+        if self.zenith_dry_run.last_snapshot_token.as_deref()
+            == Some(snapshot.snapshot.token.as_str())
+        {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "duplicate_piece",
+                "[zenith-dry-run] snapshot skipped reason=duplicate_piece".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+
+        self.zenith_dry_run.clear_skip_reason();
+        self.push_log(format!(
+            "[zenith-dry-run] snapshot accepted userid={} gameid={} generation={} candidate={} timestamp_ms={} piece_counter={} current={} hold={} queue_count={} board=10x40",
+            snapshot.userid,
+            snapshot.gameid,
+            snapshot.capture_generation,
+            snapshot.candidate_id,
+            snapshot.timestamp_ms,
+            snapshot.snapshot.piece_counter.unwrap_or_default(),
+            snapshot
+                .snapshot
+                .queue
+                .first()
+                .copied()
+                .map(|piece| piece.label())
+                .unwrap_or("?"),
+            snapshot
+                .snapshot
+                .hold
+                .map(|piece| piece.label())
+                .unwrap_or("-"),
+            snapshot.snapshot.queue.len().saturating_sub(1)
+        ));
+        match plan_snapshot_dry_run(
+            &self.state.to_automation_config(&self.paths),
+            &snapshot.snapshot,
+        ) {
+            Ok(DryRunPlanResult::Ready(plan)) => {
+                self.push_log(format!(
+                    "[zenith-dry-run] plan ready token={} piece={} hold_piece={} use_hold={} target_x={} rotation={:?} action_count={} actions={:?} route={} planner={}",
+                    plan.token,
+                    plan.piece.label(),
+                    plan.hold_piece.map(|piece| piece.label()).unwrap_or("-"),
+                    plan.use_hold,
+                    plan.target_x,
+                    plan.target_rotation,
+                    plan.action_count,
+                    plan.actions,
+                    plan.route_kind,
+                    plan.planner
+                ));
+                self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
+            }
+            Ok(DryRunPlanResult::Skipped { reason }) => {
+                self.push_log(format!(
+                    "[zenith-dry-run] plan skipped token={} piece={} reason={reason}",
+                    snapshot.snapshot.token,
+                    snapshot
+                        .snapshot
+                        .queue
+                        .first()
+                        .copied()
+                        .map(|piece| piece.label())
+                        .unwrap_or("?")
+                ));
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[zenith-dry-run] plan skipped token={} piece={} reason={err:#}",
+                    snapshot.snapshot.token,
+                    snapshot
+                        .snapshot
+                        .queue
+                        .first()
+                        .copied()
+                        .map(|piece| piece.label())
+                        .unwrap_or("?")
+                ));
+            }
+        }
+        self.zenith_dry_run.record_processed(snapshot);
     }
 
     fn maybe_resume_bot_runner(&mut self) {
@@ -1242,6 +1870,7 @@ impl eframe::App for LauncherApp {
         self.poll_browser_runtime();
         self.poll_events();
         self.maybe_resume_bot_runner();
+        self.poll_zenith_dry_run();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
         )));
@@ -1567,9 +2196,10 @@ fn extract_resumed_epoch_from_bot_log(line: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use libtetris::{Board, Piece, SpawnRule};
     use serde_json::json;
 
     fn test_paths(test_name: &str) -> AppPaths {
@@ -1602,6 +2232,136 @@ mod tests {
 
     fn cleanup_test_paths(paths: &AppPaths) {
         let _ = fs::remove_dir_all(&paths.workspace_root);
+    }
+
+    fn configure_zenith_runtime_ready(app: &mut LauncherApp) {
+        app.state.selected_mode = RuntimeMode::Zenith;
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        app.browser_status = BrowserStatus::Ready;
+        app.input_status = InputStatus::Ready;
+        app.snapshot_status = SnapshotStatus::Ready;
+        let _ = app
+            .passive_provider
+            .request(PassiveProviderOwner::ZenithDryRun);
+    }
+
+    fn zenith_passive_snapshot_path(paths: &AppPaths) -> std::path::PathBuf {
+        paths.resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
+    }
+
+    fn zenith_spawn_coordinates(piece: Piece) -> (i32, i32) {
+        let board = Board::<u16>::new();
+        let spawned = SpawnRule::Row19Or20
+            .spawn(piece, &board)
+            .expect("spawn position for test piece");
+        (spawned.x, spawned.y)
+    }
+
+    fn write_zenith_passive_snapshot_with_pieces(
+        paths: &AppPaths,
+        status: &str,
+        capture_status: &str,
+        piece_counter: u32,
+        paused: serde_json::Value,
+        current_piece: &str,
+        current_x: serde_json::Value,
+        current_y: serde_json::Value,
+        hold_piece: serde_json::Value,
+        queue: &[&str],
+    ) {
+        let path = zenith_passive_snapshot_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let board = vec![vec![serde_json::Value::Bool(false); 10]; 40];
+        let raw = json!({
+            "status": status,
+            "capture_status": capture_status,
+            "snapshot": {
+                "source": "zenith_passive",
+                "capture_generation": 5,
+                "timestamp": 1722422400123u64,
+                "userid": "user-zenith",
+                "gameid": "game-zenith",
+                "candidate_id": "candidate-1",
+                "playing": true,
+                "started": true,
+                "countdown_started": false,
+                "paused": paused,
+                "destroyed": false,
+                "gameoverreason": null,
+                "board": board,
+                "current": {
+                    "type": current_piece,
+                    "x": current_x,
+                    "y": current_y,
+                    "rotation": "north"
+                },
+                "hold": hold_piece,
+                "queue": queue,
+                "piece_counter": piece_counter
+            }
+        });
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    }
+
+    fn write_zenith_passive_snapshot(
+        paths: &AppPaths,
+        status: &str,
+        capture_status: &str,
+        piece_counter: u32,
+        paused: serde_json::Value,
+    ) {
+        let (x, y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_pieces(
+            paths,
+            status,
+            capture_status,
+            piece_counter,
+            paused,
+            "J",
+            json!(x),
+            json!(y),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+    }
+
+    fn write_zenith_invalid_passive_snapshot_missing_current_type(paths: &AppPaths) {
+        let path = zenith_passive_snapshot_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let board = vec![vec![serde_json::Value::Bool(false); 10]; 40];
+        let raw = json!({
+            "status": "ready",
+            "capture_status": "running",
+            "snapshot": {
+                "source": "zenith_passive",
+                "capture_generation": 5,
+                "timestamp": 1722422400123u64,
+                "userid": "user-zenith",
+                "gameid": "game-zenith",
+                "candidate_id": "candidate-1",
+                "playing": true,
+                "started": true,
+                "countdown_started": false,
+                "paused": false,
+                "destroyed": false,
+                "gameoverreason": null,
+                "board": board,
+                "current": {
+                    "x": 4,
+                    "y": 19,
+                    "rotation": "north"
+                },
+                "hold": null,
+                "queue": ["O", "T", "L", "S", "Z"],
+                "piece_counter": 7
+            }
+        });
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
     }
 
     #[test]
@@ -1718,10 +2478,7 @@ mod tests {
     #[test]
     fn diagnostic_username_hint_is_not_persisted_in_launcher_state() {
         let serialized = serde_json::to_value(LauncherState::default()).unwrap();
-        assert_eq!(
-            serialized.get("quick_play_diagnostic_username"),
-            None
-        );
+        assert_eq!(serialized.get("quick_play_diagnostic_username"), None);
     }
 
     #[test]
@@ -1839,6 +2596,76 @@ mod tests {
     }
 
     #[test]
+    fn passive_provider_controller_coalesces_owners_and_restart_cycles() {
+        let mut controller = PassiveProviderController::default();
+
+        assert!(!controller.has_any());
+        assert_eq!(controller.release(PassiveProviderOwner::ZenithDryRun), None);
+
+        let activated = controller
+            .request(PassiveProviderOwner::ZenithDryRun)
+            .expect("zenith owner should activate provider");
+        assert_eq!(activated.lifecycle, PassiveProviderLifecycle::Activated);
+        assert_eq!(activated.activation_generation, 1);
+        assert_eq!(controller.owners_label(), "zenith_dry_run");
+        assert_eq!(controller.request(PassiveProviderOwner::ZenithDryRun), None);
+
+        let manual_added = controller
+            .request(PassiveProviderOwner::ManualDiagnostic)
+            .expect("manual owner should join active provider");
+        assert_eq!(manual_added.lifecycle, PassiveProviderLifecycle::OwnerAdded);
+        assert_eq!(manual_added.activation_generation, 1);
+        assert_eq!(
+            controller.owners_label(),
+            "manual_diagnostic+zenith_dry_run"
+        );
+
+        let manual_released = controller
+            .release(PassiveProviderOwner::ManualDiagnostic)
+            .expect("manual owner should release while zenith remains");
+        assert_eq!(
+            manual_released.lifecycle,
+            PassiveProviderLifecycle::OwnerReleased
+        );
+        assert_eq!(controller.owners_label(), "zenith_dry_run");
+
+        let manual_readded = controller
+            .request(PassiveProviderOwner::ManualDiagnostic)
+            .expect("manual owner should rejoin");
+        assert_eq!(
+            manual_readded.lifecycle,
+            PassiveProviderLifecycle::OwnerAdded
+        );
+        assert_eq!(
+            controller.owners_label(),
+            "manual_diagnostic+zenith_dry_run"
+        );
+
+        let zenith_released = controller
+            .release(PassiveProviderOwner::ZenithDryRun)
+            .expect("zenith owner should release while manual remains");
+        assert_eq!(
+            zenith_released.lifecycle,
+            PassiveProviderLifecycle::OwnerReleased
+        );
+        assert_eq!(controller.owners_label(), "manual_diagnostic");
+        assert_eq!(controller.release(PassiveProviderOwner::ZenithDryRun), None);
+
+        let deactivated = controller
+            .release(PassiveProviderOwner::ManualDiagnostic)
+            .expect("final owner should stop provider");
+        assert_eq!(deactivated.lifecycle, PassiveProviderLifecycle::Deactivated);
+        assert!(!controller.has_any());
+
+        let reactivated = controller
+            .request(PassiveProviderOwner::ManualDiagnostic)
+            .expect("new activation should advance generation");
+        assert_eq!(reactivated.lifecycle, PassiveProviderLifecycle::Activated);
+        assert_eq!(reactivated.activation_generation, 2);
+        assert_eq!(controller.owners_label(), "manual_diagnostic");
+    }
+
+    #[test]
     fn mode_change_increments_generation_and_stops_active_bot_state() {
         let paths = test_paths("mode-change");
         let mut app = LauncherApp::new(paths.clone());
@@ -1869,8 +2696,7 @@ mod tests {
 
         app.event_tx
             .send(LauncherEvent::BotLog(
-                "[automation] idle waiting for next live game after token=browser-1-116"
-                    .to_owned(),
+                "[automation] idle waiting for next live game after token=browser-1-116".to_owned(),
             ))
             .unwrap();
         app.poll_events();
@@ -1894,5 +2720,381 @@ mod tests {
             .logs
             .iter()
             .any(|line| line == "[bot] runner resumed for game epoch=2"));
+    }
+
+    #[test]
+    fn zenith_dry_run_paused_null_remains_compatible() {
+        let paths = test_paths("zenith-dry-run-paused-null");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(null));
+
+        app.poll_zenith_dry_run();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] snapshot accepted")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] plan ready")));
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_paused_true_blocks_planning() {
+        let paths = test_paths("zenith-dry-run-paused-true");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(true));
+
+        app.poll_zenith_dry_run();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=paused"));
+        assert!(app.bot_session.is_none());
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] plan ready")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_capture_stopped_still_rejects_last_snapshot() {
+        let paths = test_paths("zenith-dry-run-stopped");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "stopped", 6, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=capture_stopped"));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] snapshot accepted")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_only_logs_duplicate_skip_once_for_same_piece() {
+        let paths = test_paths("zenith-dry-run-duplicate");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
+
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] snapshot accepted"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line == &&"[zenith-dry-run] snapshot skipped reason=duplicate_piece".to_owned()
+                })
+                .count(),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] input suppressed reason=dry_run")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] plan ready")));
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_schema_error_logs_once_for_identical_snapshot() {
+        let paths = test_paths("zenith-dry-run-schema-once");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_invalid_passive_snapshot_missing_current_type(&paths);
+
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "[zenith-dry-run] snapshot skipped reason=semantic_invalid error=missing current piece type"
+                    )
+                })
+                .count(),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_lowercase_snapshot_reaches_planner_once() {
+        let paths = test_paths("zenith-dry-run-lowercase");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        let (x, _y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            12,
+            json!(false),
+            "j",
+            json!(x),
+            json!(17.96),
+            json!("l"),
+            &["t", "S", "z"],
+        );
+
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            12,
+            json!(false),
+            "j",
+            json!(x),
+            json!(18.395631),
+            json!("l"),
+            &["t", "S", "z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] snapshot accepted"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] input suppressed reason=dry_run")));
+        assert!(app.bot_session.is_none());
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            13,
+            json!(false),
+            "j",
+            json!(x),
+            json!(18.001516),
+            json!("l"),
+            &["t", "S", "z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] snapshot accepted"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            2
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_successful_parse_clears_prior_error_dedupe() {
+        let paths = test_paths("zenith-dry-run-error-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_invalid_passive_snapshot_missing_current_type(&paths);
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 9, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_invalid_passive_snapshot_missing_current_type(&paths);
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "[zenith-dry-run] snapshot skipped reason=semantic_invalid error=missing current piece type"
+                    )
+                })
+                .count(),
+            2
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] snapshot accepted")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_snapshot_missing_logs_once_and_success_resets_dedupe() {
+        let paths = test_paths("zenith-dry-run-snapshot-missing");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line
+                    == &&"[zenith-dry-run] snapshot skipped reason=snapshot_missing".to_owned())
+                .count(),
+            1
+        );
+        assert!(app.bot_session.is_none());
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 11, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] snapshot accepted")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] input suppressed reason=dry_run")));
+
+        fs::remove_file(zenith_passive_snapshot_path(&paths)).unwrap();
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 11, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] snapshot accepted"))
+                .count(),
+            1
+        );
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line
+                    == &&"[zenith-dry-run] snapshot skipped reason=snapshot_missing".to_owned())
+                .count(),
+            2
+        );
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_skips_stale_snapshot_without_planning() {
+        let paths = test_paths("zenith-dry-run-stale");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 8, json!(false));
+        std::thread::sleep(Duration::from_millis(MAX_SNAPSHOT_AGE_MS + 100));
+
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line == &&"[zenith-dry-run] snapshot skipped reason=stale".to_owned())
+                .count(),
+            1
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] snapshot accepted")));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-dry-run] plan ready")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn solo_mode_ignores_zenith_passive_snapshot_file() {
+        let paths = test_paths("zenith-dry-run-solo-noop");
+        let mut app = LauncherApp::new(paths.clone());
+        app.browser_status = BrowserStatus::Ready;
+        app.input_status = InputStatus::Ready;
+        app.snapshot_status = SnapshotStatus::Ready;
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 10, json!(false));
+
+        app.poll_zenith_dry_run();
+
+        assert!(app.logs.is_empty());
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
     }
 }

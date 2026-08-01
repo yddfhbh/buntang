@@ -38,17 +38,13 @@ pub struct ChromiumHostProcess {
 }
 
 impl ProviderProcess {
-    fn send_control_payload(
-        &mut self,
-        payload: &[u8],
-        context: &str,
-    ) -> Result<()> {
+    fn send_control_payload(&mut self, payload: &[u8], context: &str) -> Result<()> {
         let Some(stdin) = self.stdin.as_mut() else {
             return Ok(());
         };
-        stdin
-            .write_all(payload)
-            .with_context(|| format!("failed to send browser provider {context} control message"))?;
+        stdin.write_all(payload).with_context(|| {
+            format!("failed to send browser provider {context} control message")
+        })?;
         stdin.write_all(b"\n").with_context(|| {
             format!("failed to terminate browser provider {context} control message")
         })?;
@@ -120,13 +116,16 @@ impl ProviderProcess {
         self.send_control_payload(&serialized, "selected_mode")
     }
 
-    pub fn start_quick_play_diagnostic(
+    pub fn set_quick_play_passive_provider(
         &mut self,
+        owner: &str,
+        enabled: bool,
         username_hint: Option<&str>,
     ) -> Result<()> {
         let mut payload = serde_json::json!({
-            "type": "quick_play_diagnostic",
-            "enabled": true
+            "type": "quick_play_passive_provider",
+            "owner": owner,
+            "enabled": enabled
         });
         if let Some(username_hint) = username_hint {
             let trimmed = username_hint.trim();
@@ -134,9 +133,10 @@ impl ProviderProcess {
                 payload["username_hint"] = Value::String(trimmed.to_owned());
             }
         }
-        let serialized = serde_json::to_vec(&payload)
-            .context("failed to encode browser provider quick_play_diagnostic control message")?;
-        self.send_control_payload(&serialized, "quick_play_diagnostic")
+        let serialized = serde_json::to_vec(&payload).context(
+            "failed to encode browser provider quick_play_passive_provider control message",
+        )?;
+        self.send_control_payload(&serialized, "quick_play_passive_provider")
     }
 
     pub fn start_prewarmed(

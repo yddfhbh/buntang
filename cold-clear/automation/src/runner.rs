@@ -248,7 +248,8 @@ where
                                         stop,
                                         &mut log,
                                     ) {
-                                        log("[automation] idle runner exit reason=stop_flag".to_owned());
+                                        log("[automation] idle runner exit reason=stop_flag"
+                                            .to_owned());
                                         return Ok(());
                                     }
                                     let hard_drop_started_at = Instant::now();
@@ -320,7 +321,8 @@ where
                                     if buffered_snapshot.is_none()
                                         && stop.load(AtomicOrdering::Relaxed)
                                     {
-                                        log("[automation] idle runner exit reason=stop_flag".to_owned());
+                                        log("[automation] idle runner exit reason=stop_flag"
+                                            .to_owned());
                                         return Ok(());
                                     }
                                 }
@@ -1041,6 +1043,70 @@ where
                 }
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DryRunPlanSummary {
+    pub token: String,
+    pub piece: PieceToken,
+    pub hold_piece: Option<PieceToken>,
+    pub use_hold: bool,
+    pub target_x: i32,
+    pub target_rotation: RotationToken,
+    pub action_count: usize,
+    pub actions: Vec<GameAction>,
+    pub route_kind: String,
+    pub planner: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum DryRunPlanResult {
+    Ready(DryRunPlanSummary),
+    Skipped { reason: String },
+}
+
+pub(crate) fn plan_snapshot_dry_run(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+) -> Result<DryRunPlanResult> {
+    let sprint_state = SprintState::default();
+    let active_piece = snapshot
+        .queue
+        .first()
+        .copied()
+        .context("snapshot queue must include the active piece as the first element")?;
+    let planner_started_at = Instant::now();
+    let Some((planned_move, planner_info)) =
+        plan_move_for_mode(config, snapshot, config.bot.movement_mode, &sprint_state)?
+    else {
+        return Ok(DryRunPlanResult::Skipped {
+            reason: "planner_returned_none".to_owned(),
+        });
+    };
+    let execution_result =
+        build_execution_plan(config, snapshot, &planned_move, config.bot.movement_mode);
+    let planner_label = format_planner_info(&planner_info);
+    let _planner_elapsed_ms = planner_started_at.elapsed().as_millis();
+    match execution_result {
+        Ok(plan) => Ok(DryRunPlanResult::Ready(DryRunPlanSummary {
+            token: snapshot.token.clone(),
+            piece: active_piece,
+            hold_piece: snapshot.hold,
+            use_hold: planned_move.hold,
+            target_x: planned_move.expected_location.x,
+            target_rotation: rotation_token_from_state(planned_move.expected_location.kind.1),
+            action_count: route_actions_with_hard_drop(&plan.execution_plan).len(),
+            actions: route_actions_with_hard_drop(&plan.execution_plan),
+            route_kind: plan.route_selection.route_kind.to_owned(),
+            planner: planner_label,
+        })),
+        Err(BuildExecutionError::NoSafeRoute(failure)) => Ok(DryRunPlanResult::Skipped {
+            reason: failure
+                .representative_reject_reason
+                .unwrap_or_else(|| "no_safe_route".to_owned()),
+        }),
+        Err(BuildExecutionError::Fatal(err)) => Err(err),
     }
 }
 
@@ -2060,7 +2126,7 @@ fn estimate_game_action_cost(actions: &[GameAction]) -> usize {
 }
 
 impl PieceToken {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             PieceToken::I => "I",
             PieceToken::O => "O",
@@ -2301,9 +2367,9 @@ mod tests {
         assert!(collected.iter().any(|line| {
             line.contains("[automation] idle waiting for next live game after token=browser-1-103")
         }));
-        assert!(collected.iter().any(|line| {
-            line.contains("[automation] live game resumed token=browser-2-0")
-        }));
+        assert!(collected
+            .iter()
+            .any(|line| { line.contains("[automation] live game resumed token=browser-2-0") }));
     }
 
     #[test]
@@ -2379,7 +2445,8 @@ mod tests {
     }
 
     fn basic_queue_board_summary(snapshot: &GameSnapshot) -> String {
-        let board = board_from_snapshot(snapshot).expect("basic queue snapshot should build a board");
+        let board =
+            board_from_snapshot(snapshot).expect("basic queue snapshot should build a board");
         let heights = board.column_heights();
         if heights.iter().all(|&height| height == 0) {
             "empty".to_owned()
@@ -2394,7 +2461,9 @@ mod tests {
         snapshot: &GameSnapshot,
         planned_move: Option<&Move>,
         info: Option<&Info>,
-        execution_result: Option<&std::result::Result<ExecutionPlanBuildResult, BuildExecutionError>>,
+        execution_result: Option<
+            &std::result::Result<ExecutionPlanBuildResult, BuildExecutionError>,
+        >,
         spawn_equivalent: Option<bool>,
         note: &str,
     ) -> String {
@@ -2463,8 +2532,9 @@ mod tests {
         let snapshot = basic_queue_snapshot();
         let config = AutomationConfig::default();
         let sprint_state = SprintState::default();
-        let planned = plan_move_for_mode(&config, &snapshot, config.bot.movement_mode, &sprint_state)
-            .expect("basic queue planning should succeed");
+        let planned =
+            plan_move_for_mode(&config, &snapshot, config.bot.movement_mode, &sprint_state)
+                .expect("basic queue planning should succeed");
         let Some((planned_move, info)) = planned else {
             panic!(
                 "{}",

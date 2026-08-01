@@ -344,6 +344,195 @@ function makeBoundQuickPlayCandidate(overrides = {}) {
   };
 }
 
+function makeQuickPlayPassiveRetainedRoot({
+  pause = null,
+  paused = undefined,
+  board = Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+  current = { type: "j", x: 4, y: 19, rotation: 1 },
+  hold = "i",
+  queue = ["o", "s", "z"],
+  playing = true,
+  started = true,
+  destroyed = false,
+  pieceCounter = 12
+} = {}) {
+  const state = {
+    board: board.map((row) => row.slice()),
+    current: { ...current },
+    hold,
+    queue: queue.slice(),
+    playing,
+    started,
+    pause,
+    destroyed,
+    successful: null,
+    gameoverreason: null,
+    pieceCounter
+  };
+  if (paused !== undefined) {
+    state.paused = paused;
+  }
+  return {
+    game: {
+      state
+    }
+  };
+}
+
+function createPassiveSnapshotEvalCdp(retainedRoot) {
+  return {
+    async send(method, params = {}) {
+      if (method === "Runtime.callFunctionOn") {
+        const call = vm.runInThisContext(`(${params.functionDeclaration})`);
+        const args = Array.isArray(params.arguments)
+          ? params.arguments.map((entry) => entry?.value)
+          : [];
+        return {
+          result: {
+            value: call.call(retainedRoot, ...args)
+          }
+        };
+      }
+      if (method === "Runtime.releaseObject" || method === "Runtime.releaseObjectGroup") {
+        return {};
+      }
+      throw new Error(`unexpected method ${method}`);
+    }
+  };
+}
+
+async function pollPassiveSnapshotForRetainedRoot(retainedRoot) {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const state = makeQuickPlayState(paths);
+  state.active = true;
+  state.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+    identityBound: true,
+    userid: "user-passive",
+    gameid: "game-passive"
+  });
+  const logs = [];
+  try {
+    const result = await pollQuickPlayPassiveSnapshotNow(
+      createPassiveSnapshotEvalCdp(retainedRoot),
+      state,
+      {
+        now: 9_001,
+        log: (line) => logs.push(line)
+      }
+    );
+    const written = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    return { result, written, logs };
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+}
+
+test("raw pause null produces paused=false", async () => {
+  const { result, written } = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({ pause: null })
+  );
+
+  assert.equal(result.status, "ready");
+  assert.equal(written.status, "ready");
+  assert.equal(written.capture_status, "running");
+  assert.equal(written.snapshot.paused, false);
+});
+
+test("raw pause active representation produces paused=true", async () => {
+  const { written } = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({
+      pause: {
+        reason: "manual_pause",
+        startedAt: 123
+      }
+    })
+  );
+
+  assert.equal(written.snapshot.paused, true);
+});
+
+test("paused output is always boolean", async () => {
+  const normal = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({ pause: null })
+  );
+  const paused = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({ pause: { reason: "manual_pause" } })
+  );
+
+  assert.equal(typeof normal.written.snapshot.paused, "boolean");
+  assert.equal(typeof paused.written.snapshot.paused, "boolean");
+});
+
+test("passive snapshot canonicalizes current hold and queue piece casing", async () => {
+  const { result, written } = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({
+      current: { type: "i", x: 4, y: 19, rotation: 1 },
+      hold: "j",
+      queue: ["t", "S", "z"]
+    })
+  );
+
+  assert.equal(result.status, "ready");
+  assert.equal(written.snapshot.current.type, "I");
+  assert.equal(written.snapshot.current.x, 4);
+  assert.equal(written.snapshot.current.y, 19);
+  assert.equal(written.snapshot.current.rotation, 1);
+  assert.equal(written.snapshot.hold, "J");
+  assert.deepEqual(written.snapshot.queue, ["T", "S", "Z"]);
+});
+
+test("passive snapshot preserves null hold", async () => {
+  const { result, written } = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({ hold: null })
+  );
+
+  assert.equal(result.status, "ready");
+  assert.equal(written.snapshot.hold, null);
+});
+
+test("passive snapshot rejects unknown queue piece semantically", async () => {
+  const { result, written } = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({ queue: ["t", "garbage", "z"] })
+  );
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.reason, "invalid_queue_piece");
+  assert.equal(written.status, "unavailable");
+});
+
+test("raw pause normalization keeps board current hold and queue unchanged", async () => {
+  const board = Array.from({ length: 40 }, (_, rowIndex) =>
+    Array.from({ length: 10 }, (_, colIndex) => (rowIndex === 0 && colIndex === 0 ? 1 : 0))
+  );
+  const current = { type: "t", x: 3, y: 18, rotation: 2 };
+  const hold = "l";
+  const queue = ["j", "o", "s"];
+  const normal = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({
+      pause: null,
+      board,
+      current,
+      hold,
+      queue
+    })
+  );
+  const paused = await pollPassiveSnapshotForRetainedRoot(
+    makeQuickPlayPassiveRetainedRoot({
+      pause: { reason: "manual_pause" },
+      board,
+      current,
+      hold,
+      queue
+    })
+  );
+
+  assert.deepEqual(paused.written.snapshot.board, normal.written.snapshot.board);
+  assert.deepEqual(paused.written.snapshot.current, normal.written.snapshot.current);
+  assert.equal(paused.written.snapshot.hold, normal.written.snapshot.hold);
+  assert.deepEqual(paused.written.snapshot.queue, normal.written.snapshot.queue);
+  assert.deepEqual(paused.written.snapshot.queue, ["J", "O", "S"]);
+});
+
 function createStorageMock(entries = {}) {
   const map = new Map(Object.entries(entries));
   const keys = [...map.keys()];
@@ -435,6 +624,203 @@ test("diagnostic capture works only in Zenith mode and does not change bot state
     assert.equal(controlState.botEnabled, false);
     assert.equal(controlState.selectedMode, "zenith");
     assert.equal(diagnosticState.active, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("zenith passive owner starts while bot is enabled and avoids manual artifacts", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  try {
+    controlState.selectedMode = "zenith";
+    controlState.botEnabled = true;
+
+    const applied = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_000,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(applied, true);
+    assert.equal(diagnosticState.active, true);
+    assert.equal(diagnosticState.ownerRequests.zenith_dry_run, true);
+    assert.equal(diagnosticState.ownerRequests.manual_diagnostic, false);
+    assert.ok(
+      logs.includes(
+        "[zenith-dry-run] passive provider active mode=zenith packet_limit=unlimited duration=owner_lifecycle"
+      )
+    );
+    assert.equal(existsSync(paths.reportPath), false);
+    assert.equal(existsSync(paths.rawWsPath), false);
+    assert.equal(existsSync(paths.closurePath), false);
+    assert.equal(existsSync(paths.callframePath), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("wrong mode still rejects zenith passive owner with actual mode in logs", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  try {
+    controlState.selectedMode = "friendly_vs";
+    controlState.botEnabled = true;
+
+    const applied = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_200,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(applied, false);
+    assert.equal(diagnosticState.active, false);
+    assert.ok(
+      logs.includes(
+        "[quick-play] passive provider rejected owner=zenith_dry_run reason=mode_not_zenith actual_mode=friendly_vs"
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("selected_mode control message delivers zenith mode before automatic owner start", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    const modeApplied = applyBrowserControlMessage({
+      message: { type: "selected_mode", mode: "zenith", generation: 44 },
+      controlState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      quickPlayDiagnosticState: diagnosticState,
+      now: 2_250,
+      log: () => {}
+    });
+    assert.equal(modeApplied, true);
+    assert.equal(controlState.selectedMode, "zenith");
+    assert.equal(controlState.modeGeneration, 44);
+
+    controlState.botEnabled = true;
+    const started = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_251,
+      log: () => {}
+    });
+
+    assert.equal(started, true);
+    assert.equal(diagnosticState.active, true);
+    assert.equal(diagnosticState.captureGeneration, 44);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("manual owner can join and leave zenith passive provider without stopping capture", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    controlState.selectedMode = "zenith";
+    controlState.botEnabled = true;
+
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 3_000,
+      log: () => {}
+    });
+
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "manual_diagnostic",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 3_100,
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.active, true);
+    assert.equal(diagnosticState.ownerRequests.zenith_dry_run, true);
+    assert.equal(diagnosticState.ownerRequests.manual_diagnostic, true);
+    assert.equal(existsSync(paths.closurePath), true);
+    assert.equal(existsSync(paths.callframePath), true);
+
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "manual_diagnostic",
+        enabled: false
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 3_200,
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.active, true);
+    assert.equal(diagnosticState.ownerRequests.zenith_dry_run, true);
+    assert.equal(diagnosticState.ownerRequests.manual_diagnostic, false);
+
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: false
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 3_300,
+      log: () => {}
+    });
+
+    assert.equal(diagnosticState.active, false);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }
@@ -899,6 +1285,52 @@ test("diagnostic start schedules session scan and creates empty closure and call
     assert.equal(readFileSync(paths.closurePath, "utf8"), "");
     assert.ok(existsSync(paths.callframePath));
     assert.equal(readFileSync(paths.callframePath, "utf8"), "");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("automatic zenith provider does not stop at manual packet limit", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  const diagnosticState = makeQuickPlayState(paths);
+  diagnosticState.maxWsPackets = 1;
+  try {
+    const started = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_500,
+      log: () => {}
+    });
+
+    assert.equal(started, true);
+    assert.equal(
+      recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+        timestamp: 2_500,
+        players: [],
+        candidates: []
+      }),
+      true
+    );
+    assert.equal(
+      recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+        timestamp: 2_501,
+        players: [],
+        candidates: []
+      }),
+      true
+    );
+    assert.equal(diagnosticState.stopReason, "");
+    assert.equal(diagnosticState.roundCompleted, false);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }
@@ -2285,9 +2717,9 @@ test("unique accepted _tick closure binds resolved self identity and writes pass
                 value: {
                   status: "ready",
                   board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
-                  current: "t",
-                  hold: "i",
-                  queue: ["o", "s", "z"],
+                  current: "T",
+                  hold: "I",
+                  queue: ["O", "S", "Z"],
                   playing: true,
                   started: true,
                   countdown_started: false,
@@ -2414,8 +2846,8 @@ test("unique accepted _tick closure binds resolved self identity and writes pass
     assert.equal(snapshot.snapshot.source, "quick_play_closure");
     assert.equal(snapshot.snapshot.userid, "user-7");
     assert.equal(snapshot.snapshot.gameid, 7007);
-    assert.equal(snapshot.snapshot.current?.type, "t");
-    assert.deepEqual(snapshot.snapshot.queue, ["o", "s", "z"]);
+    assert.equal(snapshot.snapshot.current?.type, "T");
+    assert.deepEqual(snapshot.snapshot.queue, ["O", "S", "Z"]);
     assert.equal(JSON.stringify(snapshot).includes("retained-1"), false);
     assert.equal(JSON.stringify(report).includes("retained-1"), false);
   } finally {
@@ -3233,6 +3665,74 @@ test("identity first and candidate later binds successfully", async () => {
       diagnosticState.diagnostics.passive_snapshot.bind_deferred_reasons.candidate_not_ready,
       1
     );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("zenith automatic owner binds successfully while bot is enabled", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 122;
+  controlState.botEnabled = true;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    const started = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 5_500,
+      log: () => {}
+    });
+    assert.equal(started, true);
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+
+    const identityUpdate = updateQuickPlayPendingIdentity(
+      diagnosticState,
+      { status: "resolved", userid: "user-auto", gameid: 5122 },
+      5_500
+    );
+    assert.equal(identityUpdate.changed, true);
+
+    diagnosticState.boundLocalClosureCandidate = makeBoundQuickPlayCandidate({
+      generation: 122,
+      candidateId: "cand-auto-zenith",
+      rootObjectId: "retained-auto-zenith",
+      callFrameIndex: 6,
+      bindingName: "Ra",
+      capturedAt: 5_510
+    });
+    diagnosticState.closureCandidates.set("cand-auto-zenith", {
+      candidate_id: "cand-auto-zenith",
+      function_name: "_tick",
+      scope_type: "closure",
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false,
+      firstSeen: 5_510,
+      lastSeen: 5_510
+    });
+
+    const bound = await reconcileQuickPlayPassiveBinding(diagnosticState, {
+      reason: "accepted_candidate",
+      browserControlState: controlState,
+      now: 5_510,
+      log: () => {}
+    });
+    assert.equal(bound.result, "bound");
+    assert.equal(bound.deferredReason, "");
+    assert.equal(bound.shouldStartPolling, true);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.userid, "user-auto");
+    assert.equal(diagnosticState.boundLocalClosureCandidate.gameid, 5122);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }

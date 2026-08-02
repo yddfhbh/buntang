@@ -670,6 +670,36 @@ test("zenith passive owner starts while bot is enabled and avoids manual artifac
   }
 });
 
+test("zenith passive owner stores shared local username hint", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    controlState.selectedMode = "zenith";
+    controlState.botEnabled = true;
+
+    const applied = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true,
+        username_hint: "ExactLocal"
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_050,
+      log: () => {}
+    });
+
+    assert.equal(applied, true);
+    assert.equal(diagnosticState.diagnosticUsernameHint, "ExactLocal");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
 test("wrong mode still rejects zenith passive owner with actual mode in logs", () => {
   const controlState = createBrowserControlState();
   const paths = makeQuickPlayDiagnosticTempPaths();

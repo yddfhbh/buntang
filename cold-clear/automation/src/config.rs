@@ -97,6 +97,11 @@ pub struct BrowserCdpConfig {
     pub cdp_port: u16,
     pub url: String,
     pub target_hint: String,
+    #[serde(
+        alias = "local_player_username",
+        alias = "quick_play_diagnostic_username"
+    )]
+    pub local_tetrio_username: String,
     pub connect_only: bool,
     pub probe_page_state: bool,
     pub use_ribbon_websocket: bool,
@@ -112,6 +117,7 @@ impl Default for BrowserCdpConfig {
             cdp_port: 9222,
             url: "https://tetr.io/".to_owned(),
             target_hint: "TETR.IO".to_owned(),
+            local_tetrio_username: String::new(),
             connect_only: false,
             probe_page_state: true,
             use_ribbon_websocket: true,

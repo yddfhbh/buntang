@@ -882,7 +882,6 @@ impl InputBackend for ZenithLiveTestBackend {
 pub struct LauncherApp {
     paths: AppPaths,
     state: LauncherState,
-    quick_play_diagnostic_username: String,
     logs: Vec<String>,
     event_tx: Sender<LauncherEvent>,
     event_rx: Receiver<LauncherEvent>,
@@ -915,7 +914,6 @@ impl LauncherApp {
         Self {
             paths,
             state,
-            quick_play_diagnostic_username: String::new(),
             logs: vec!["Launcher ready".to_owned()],
             event_tx,
             event_rx,
@@ -1003,6 +1001,15 @@ impl LauncherApp {
                 "[bot] target PPS changed {}",
                 format_target_pps_label(effective_target_pps)
             ));
+        }
+    }
+
+    fn local_tetrio_username_hint(&self) -> Option<String> {
+        let trimmed = self.state.browser.local_tetrio_username.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
         }
     }
 
@@ -1296,7 +1303,7 @@ impl LauncherApp {
                 self.push_log("[launcher] bot on");
             }
             if self.state.selected_mode == RuntimeMode::Zenith
-                && !self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, true, None)
+                && !self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, true)
             {
                 self.bot_status = BotStatus::Error;
                 if mode == BotStartMode::UserInitiated {
@@ -1314,11 +1321,8 @@ impl LauncherApp {
                     "[browser] failed to forward bot on state to snapshot provider: {err:#}"
                 ));
                 if self.state.selected_mode == RuntimeMode::Zenith {
-                    let _ = self.set_passive_provider_owner(
-                        PassiveProviderOwner::ZenithDryRun,
-                        false,
-                        None,
-                    );
+                    let _ =
+                        self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false);
                 }
                 self.bot_status = BotStatus::Error;
                 if mode == BotStartMode::UserInitiated {
@@ -1465,39 +1469,6 @@ impl LauncherApp {
         self.stop_bot_with_browser_hint(self.browser_session.is_some());
     }
 
-    fn start_quick_play_diagnostic(&mut self) {
-        if self.state.selected_mode != RuntimeMode::Zenith {
-            self.push_log("[quick-play] diagnostic blocked: mode is not zenith");
-            return;
-        }
-        if self.bot_desired_enabled
-            || self.bot_session.is_some()
-            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On)
-        {
-            self.push_log("[quick-play] diagnostic blocked: bot is enabled");
-            return;
-        }
-        if self.browser_session.is_none() {
-            self.push_log("[quick-play] diagnostic blocked: browser runtime is not ready");
-            return;
-        }
-        let username_hint = {
-            let trimmed = self.quick_play_diagnostic_username.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_owned())
-            }
-        };
-        if self.set_passive_provider_owner(
-            PassiveProviderOwner::ManualDiagnostic,
-            true,
-            username_hint.as_deref(),
-        ) {
-            self.push_log("[quick-play] diagnostic capture requested");
-        }
-    }
-
     fn stop_bot_with_browser_hint(&mut self, browser_remains_open: bool) {
         self.bot_desired_enabled = false;
         self.bot_waiting_for_next_game = false;
@@ -1524,7 +1495,7 @@ impl LauncherApp {
                 ));
             }
         }
-        let _ = self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false, None);
+        let _ = self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false);
         self.bot_status = BotStatus::Off;
     }
 
@@ -1774,12 +1745,7 @@ impl LauncherApp {
         }
     }
 
-    fn set_passive_provider_owner(
-        &mut self,
-        owner: PassiveProviderOwner,
-        enabled: bool,
-        username_hint: Option<&str>,
-    ) -> bool {
+    fn set_passive_provider_owner(&mut self, owner: PassiveProviderOwner, enabled: bool) -> bool {
         let previous = self.passive_provider.clone();
         let transition = if enabled {
             self.passive_provider.request(owner)
@@ -1790,11 +1756,16 @@ impl LauncherApp {
             return true;
         };
 
+        let username_hint = if enabled {
+            self.local_tetrio_username_hint()
+        } else {
+            None
+        };
         let control_result = if let Some(session) = self.browser_session.as_mut() {
             session.snapshot_provider.set_quick_play_passive_provider(
                 owner.control_value(),
                 enabled,
-                username_hint,
+                username_hint.as_deref(),
             )
         } else {
             self.passive_provider = previous;
@@ -1835,15 +1806,10 @@ impl LauncherApp {
             .passive_provider
             .is_requested(PassiveProviderOwner::ZenithDryRun);
         if manual_requested {
-            let _ = self.set_passive_provider_owner(
-                PassiveProviderOwner::ManualDiagnostic,
-                false,
-                None,
-            );
+            let _ = self.set_passive_provider_owner(PassiveProviderOwner::ManualDiagnostic, false);
         }
         if zenith_requested {
-            let _ =
-                self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false, None);
+            let _ = self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false);
         }
     }
 
@@ -2315,15 +2281,6 @@ impl eframe::App for LauncherApp {
                 SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
             )
             && !bot_locked;
-        let can_capture_quick_play = self.state.selected_mode == RuntimeMode::Zenith
-            && self.browser_status == BrowserStatus::Ready
-            && self.input_status == InputStatus::Ready
-            && matches!(
-                self.snapshot_status,
-                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
-            )
-            && !bot_locked;
-
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Cold Clear Launcher");
@@ -2353,6 +2310,13 @@ impl eframe::App for LauncherApp {
                 ui.horizontal(|ui| {
                     ui.label("Target");
                     ui.text_edit_singleline(&mut self.state.browser.target_hint);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Local TETR.IO Username");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.state.browser.local_tetrio_username)
+                            .hint_text("exact username"),
+                    );
                 });
             });
             ui.horizontal(|ui| {
@@ -2483,30 +2447,6 @@ impl eframe::App for LauncherApp {
                 ui.small(
                     "기본값은 OFF이며, 현재 단계에서는 Bot ON마다 최대 1피스만 실제 입력합니다.",
                 );
-                ui.horizontal(|ui| {
-                    ui.label("Diagnostic local username");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.quick_play_diagnostic_username)
-                            .hint_text("optional exact username"),
-                    );
-                });
-                ui.small(
-                    "Temporary diagnostic hint only. It is not saved to launcher-state.json and is used only to correlate profile username -> userid -> gameid during capture.",
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            can_capture_quick_play,
-                            egui::Button::new("Capture Quick Play Data"),
-                        )
-                        .clicked()
-                    {
-                        self.start_quick_play_diagnostic();
-                    }
-                });
-                ui.small(
-                    "Bot OFF 상태에서 Quick Play WS/session/closure 진단 캡처만 수행합니다.",
-                );
             }
 
             ui.separator();
@@ -2553,6 +2493,11 @@ fn load_launcher_state(paths: &AppPaths) -> Result<LauncherState> {
     if raw_json.get("pps_unlimited").is_none() {
         state.pps_unlimited = state.target_pps <= 0.0;
     }
+    if state.browser.local_tetrio_username.trim().is_empty() {
+        if let Some(username) = legacy_local_tetrio_username(&raw_json) {
+            state.browser.local_tetrio_username = username;
+        }
+    }
     state.normalize_pps_state();
     Ok(state)
 }
@@ -2564,6 +2509,23 @@ fn save_launcher_state(paths: &AppPaths, state: &LauncherState) -> Result<()> {
     let raw = serde_json::to_string_pretty(state)?;
     fs::write(&paths.launcher_state_path, raw)?;
     Ok(())
+}
+
+fn legacy_local_tetrio_username(raw_json: &serde_json::Value) -> Option<String> {
+    let browser = raw_json.get("browser");
+    [
+        raw_json.get("local_tetrio_username"),
+        raw_json.get("local_player_username"),
+        raw_json.get("quick_play_diagnostic_username"),
+        browser.and_then(|value| value.get("local_player_username")),
+        browser.and_then(|value| value.get("quick_play_diagnostic_username")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str())
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_owned)
 }
 
 fn movement_mode_label(mode: MovementModeConfig) -> &'static str {
@@ -2960,9 +2922,36 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_username_hint_is_not_persisted_in_launcher_state() {
-        let serialized = serde_json::to_value(LauncherState::default()).unwrap();
+    fn local_tetrio_username_is_persisted_in_launcher_state() {
+        let mut state = LauncherState::default();
+        state.browser.local_tetrio_username = "ExactLocal".to_owned();
+        let serialized = serde_json::to_value(state).unwrap();
         assert_eq!(serialized.get("quick_play_diagnostic_username"), None);
+        assert_eq!(
+            serialized
+                .pointer("/browser/local_tetrio_username")
+                .and_then(|value| value.as_str()),
+            Some("ExactLocal")
+        );
+    }
+
+    #[test]
+    fn load_launcher_state_migrates_legacy_quick_play_username() {
+        let paths = test_paths("launcher-state-legacy-local-username");
+        fs::write(
+            &paths.launcher_state_path,
+            serde_json::to_vec(&json!({
+                "quick_play_diagnostic_username": "ExactLocal"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = load_launcher_state(&paths).unwrap();
+
+        assert_eq!(state.browser.local_tetrio_username, "ExactLocal");
+
+        cleanup_test_paths(&paths);
     }
 
     #[test]

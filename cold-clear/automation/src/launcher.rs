@@ -784,6 +784,9 @@ struct ZenithLiveController {
     executed_pieces: u32,
     max_reached_logged: bool,
     session_max_pieces: u32,
+    startup_started_at: Option<Instant>,
+    startup_first_plan_logged: bool,
+    startup_first_input_logged: bool,
     active_piece_counter: Option<u32>,
     active_snapshot_token: Option<String>,
     active_game_id: Option<String>,
@@ -830,6 +833,28 @@ impl ZenithLiveController {
 
     fn session_max_pieces(&self) -> u32 {
         normalize_zenith_live_max_pieces(self.session_max_pieces)
+    }
+
+    fn start_startup_session(&mut self) {
+        self.startup_started_at = Some(Instant::now());
+        self.startup_first_plan_logged = false;
+        self.startup_first_input_logged = false;
+    }
+
+    fn note_startup_stage(&mut self, stage: &str) -> Option<String> {
+        let elapsed_ms = self.startup_started_at?.elapsed().as_millis();
+        let should_log = match stage {
+            "first_plan" if !self.startup_first_plan_logged => {
+                self.startup_first_plan_logged = true;
+                true
+            }
+            "first_input" if !self.startup_first_input_logged => {
+                self.startup_first_input_logged = true;
+                true
+            }
+            _ => false,
+        };
+        should_log.then(|| format!("[zenith-startup] stage={stage} elapsed_ms={elapsed_ms}"))
     }
 
     fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
@@ -1498,6 +1523,9 @@ impl LauncherApp {
             self.zenith_dry_run.reset();
             self.zenith_live.reset();
             self.zenith_live.session_max_pieces = self.state.effective_zenith_live_max_pieces();
+            if self.state.selected_mode == RuntimeMode::Zenith {
+                self.zenith_live.start_startup_session();
+            }
             self.push_log(format!(
                 "[mode] bot enabled mode={} generation={}",
                 self.state.selected_mode.control_value(),
@@ -2241,6 +2269,9 @@ impl LauncherApp {
                     plan.route_kind,
                     plan.planner
                 ));
+                if let Some(line) = self.zenith_live.note_startup_stage("first_plan") {
+                    self.push_log(line);
+                }
                 let piece_counter = snapshot.snapshot.piece_counter;
                 if !self.zenith_live_input_allowed() {
                     self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
@@ -2285,6 +2316,9 @@ impl LauncherApp {
                                 "[zenith-live] input dispatched piece_counter={}",
                                 piece_counter_label(piece_counter)
                             ));
+                            if let Some(line) = self.zenith_live.note_startup_stage("first_input") {
+                                self.push_log(line);
+                            }
                             self.zenith_live.start_planned(
                                 snapshot,
                                 self.passive_provider.activation_generation,

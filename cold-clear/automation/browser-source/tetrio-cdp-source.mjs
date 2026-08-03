@@ -63,6 +63,7 @@ const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_TIMEOUT_MS = 700;
 const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_BUDGET_MS = 250;
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS = [80, 160, 280, 450, 700, 1000];
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_JITTER_MS = 30;
+const DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS = [50, 75, 100, 125, 150, 200];
 const DEFAULT_QUICK_PLAY_REPORT_PATH = path.join(
   "automation",
   "quick-play-runtime-report.json"
@@ -1414,6 +1415,15 @@ export function createQuickPlayDiagnosticState() {
       wsPlayerId: "",
       resolvedAt: 0
     },
+    zenithStartupTrace: {
+      enabled: false,
+      startedAt: 0,
+      stagesLogged: {},
+      burstReady: false,
+      burstRetryCount: 0,
+      fallbackRetryCount: 0,
+      burstExhausted: false
+    },
     logFn: null,
     closureRetryJitterMsFn: null,
     sessionScanState: {
@@ -1529,6 +1539,81 @@ export function createQuickPlayDiagnosticState() {
       }
     }
   };
+}
+
+function createZenithStartupTraceState({
+  enabled = false,
+  startedAt = 0
+} = {}) {
+  return {
+    enabled: enabled === true,
+    startedAt: Math.max(0, Number(startedAt ?? 0)),
+    stagesLogged: {},
+    burstReady: false,
+    burstRetryCount: 0,
+    fallbackRetryCount: 0,
+    burstExhausted: false
+  };
+}
+
+function quickPlayUsesZenithStartupTrace(quickPlayDiagnosticState) {
+  return Boolean(
+    quickPlayDiagnosticState?.active &&
+      quickPlayDiagnosticState?.zenithStartupTrace?.enabled === true &&
+      quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState)
+  );
+}
+
+function logZenithStartupStage(
+  quickPlayDiagnosticState,
+  stage,
+  {
+    now = Date.now(),
+    details = {},
+    log = quickPlayDiagnosticState?.logFn ?? console.log
+  } = {}
+) {
+  if (!quickPlayUsesZenithStartupTrace(quickPlayDiagnosticState)) {
+    return false;
+  }
+  const trace = quickPlayDiagnosticState.zenithStartupTrace;
+  const normalizedStage = String(stage ?? "").trim();
+  if (!normalizedStage || trace.stagesLogged[normalizedStage] === true) {
+    return false;
+  }
+  trace.stagesLogged[normalizedStage] = true;
+  const elapsedMs = Math.max(
+    0,
+    Math.round(Math.max(0, Number(now ?? Date.now())) - Math.max(0, Number(trace.startedAt ?? 0)))
+  );
+  const suffix = Object.entries(details ?? {})
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .map(([key, value]) => `${key}=${value}`)
+    .join(" ");
+  log?.(
+    `[zenith-startup] stage=${normalizedStage} elapsed_ms=${elapsedMs}` +
+      (suffix ? ` ${suffix}` : "")
+  );
+  return true;
+}
+
+function noteZenithStartupBurstTrigger(quickPlayDiagnosticState, reason = "") {
+  if (!quickPlayUsesZenithStartupTrace(quickPlayDiagnosticState)) {
+    return false;
+  }
+  if (!["first_zenith_options", "gameplay_signal", "bootstrap_ready"].includes(
+    String(reason ?? "")
+  )) {
+    return false;
+  }
+  if (
+    quickPlayDiagnosticState?.boundLocalClosureCandidate?.rootObjectId ||
+    String(quickPlayDiagnosticState?.currentTargetUrl ?? "").trim().startsWith("chrome-extension://")
+  ) {
+    return false;
+  }
+  quickPlayDiagnosticState.zenithStartupTrace.burstReady = true;
+  return true;
 }
 
 function normalizeQuickPlayPassiveOwner(owner) {
@@ -1717,7 +1802,6 @@ function scheduleQuickPlayClosureSurvey(
     log = quickPlayDiagnosticState?.logFn ?? console.log
   } = {}
 ) {
-  const artifactsEnabled = quickPlayPassiveArtifactsEnabled(quickPlayDiagnosticState);
   if (!quickPlayDiagnosticState?.active) {
     return false;
   }
@@ -1740,6 +1824,7 @@ function scheduleQuickPlayClosureSurvey(
   }
   const nextAt = Math.max(0, Number(now ?? Date.now())) + Math.max(0, Number(delayMs) || 0);
   const nextAttempt = Math.max(1, Number(closureScanState.attempts ?? 0) + 1);
+  noteZenithStartupBurstTrigger(quickPlayDiagnosticState, reason);
   if (quickPlayDiagnosticState.nextClosureSurveyAt > 0) {
     const currentReason = String(quickPlayDiagnosticState.closureScanState.pendingReason ?? "retry");
     const normalizedReason = String(reason ?? "retry");
@@ -1819,6 +1904,39 @@ function summarizeQuickPlayNoTickCallFrames(callFrames = [], attempt = 0) {
 }
 
 function nextQuickPlayTimingMissDelayMs(quickPlayDiagnosticState) {
+  if (quickPlayUsesZenithStartupTrace(quickPlayDiagnosticState)) {
+    const trace = quickPlayDiagnosticState.zenithStartupTrace;
+    if (
+      trace.burstReady === true &&
+      !quickPlayDiagnosticState?.boundLocalClosureCandidate?.rootObjectId
+    ) {
+      const burstIndex = Math.max(0, Number(trace.burstRetryCount ?? 0));
+      if (
+        trace.burstExhausted !== true &&
+        burstIndex < DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS.length
+      ) {
+        trace.burstRetryCount = burstIndex + 1;
+        trace.burstExhausted =
+          trace.burstRetryCount >= DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS.length;
+        return DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS[burstIndex];
+      }
+      trace.burstExhausted = true;
+      const fallbackIndex = Math.max(0, Number(trace.fallbackRetryCount ?? 0)) + 1;
+      trace.fallbackRetryCount = Math.max(0, Number(trace.fallbackRetryCount ?? 0)) + 1;
+      const base =
+        DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS[
+          Math.min(
+            DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS.length - 1,
+            fallbackIndex
+          )
+        ];
+      const jitterFn = quickPlayDiagnosticState?.closureRetryJitterMsFn;
+      const jitter = Number.isFinite(Number(jitterFn?.(fallbackIndex, base)))
+        ? Number(jitterFn(fallbackIndex, base))
+        : 0;
+      return Math.max(0, Math.round(base + jitter));
+    }
+  }
   const closureScanState = quickPlayDiagnosticState?.closureScanState ?? {};
   const missCount = Math.max(0, Number(closureScanState.timingMissCount ?? 0));
   const base =
@@ -1890,7 +2008,7 @@ function maybeScheduleQuickPlayClosureRetryFromZenithOptions(
   closureScanState.zenithRetryScheduled = true;
   return scheduleQuickPlayClosureSurvey(quickPlayDiagnosticState, {
     now,
-    delayMs: 150,
+    delayMs: 0,
     reason: "first_zenith_options"
   });
 }
@@ -1994,6 +2112,10 @@ function activateQuickPlayPassiveCapture(
   quickPlayDiagnosticState.lastPassiveSnapshotFailureLogReason = "";
   clearQuickPlayBoundLocalClosureCandidate(quickPlayDiagnosticState);
   clearQuickPlayPendingIdentity(quickPlayDiagnosticState);
+  quickPlayDiagnosticState.zenithStartupTrace = createZenithStartupTraceState({
+    enabled: quickPlayPassiveUsesOwnerLifecycle(quickPlayDiagnosticState),
+    startedAt: quickPlayDiagnosticState.startedAt
+  });
   quickPlayDiagnosticState.logFn = log;
   quickPlayDiagnosticState.sessionScanState = {
     pendingReason: "diagnostic_start"
@@ -2044,6 +2166,10 @@ function activateQuickPlayPassiveCapture(
         : quickPlayPassivePacketLimit(quickPlayDiagnosticState)
     }`
   );
+  logZenithStartupStage(quickPlayDiagnosticState, "bot_on", {
+    now: quickPlayDiagnosticState.startedAt,
+    log
+  });
   return { started: true };
 }
 
@@ -5001,6 +5127,12 @@ export async function reconcileQuickPlayPassiveBinding(
       );
     }
   }
+  if (result === "bound") {
+    logZenithStartupStage(quickPlayDiagnosticState, "bound", {
+      now,
+      log
+    });
+  }
   return { result, deferredReason, shouldStartPolling };
 }
 
@@ -5721,6 +5853,10 @@ async function readQuickPlayPassiveSnapshot(
       );
     }
   }
+  logZenithStartupStage(quickPlayDiagnosticState, "first_snapshot", {
+    now,
+    log
+  });
   return { status: "ready", snapshot: payload };
 }
 
@@ -7619,6 +7755,10 @@ export async function maybeRunQuickPlayDiagnosticCapture({
       const reason = String(
         quickPlayDiagnosticState.closureScanState.pendingReason ?? "retry"
       );
+      logZenithStartupStage(quickPlayDiagnosticState, "first_scan", {
+        now,
+        log
+      });
       log?.(
         `[quick-play] closure scan started attempt=${attempt} target_generation=${Math.max(
           0,
@@ -7712,6 +7852,24 @@ export async function maybeRunQuickPlayDiagnosticCapture({
                   }
                 );
             if (retainResult?.ok === true) {
+              logZenithStartupStage(quickPlayDiagnosticState, "candidate_retained", {
+                now,
+                log,
+                details: {
+                  scan_attempt: attempt,
+                  burst_used:
+                    quickPlayDiagnosticState?.zenithStartupTrace?.burstRetryCount > 0
+                      ? "true"
+                      : "false",
+                  matching_frame_missing_count: Math.max(
+                    0,
+                    Number(
+                      quickPlayDiagnosticState?.diagnostics?.closure_scan?.timing_miss_reasons
+                        ?.matching_frame_missing ?? 0
+                    )
+                  )
+                }
+              });
               const reconcile = await reconcileQuickPlayPassiveBinding(quickPlayDiagnosticState, {
                 reason: "accepted_candidate",
                 browserControlState,
@@ -9279,6 +9437,7 @@ export async function maybeRunZenithBootstrapCheck({
   zenithBootstrapCheckState,
   browserControlState,
   bootstrapState,
+  quickPlayDiagnosticState = null,
   transientState = null,
   now = Date.now(),
   nowFn = () => Date.now(),
@@ -9335,6 +9494,15 @@ export async function maybeRunZenithBootstrapCheck({
     evaluatedAt
   );
   if (bootstrapStatus.ready) {
+    if (quickPlayDiagnosticState?.active) {
+      scheduleQuickPlayClosureSurvey(quickPlayDiagnosticState, {
+        now,
+        delayMs: 0,
+        reason: "bootstrap_ready",
+        generation,
+        log
+      });
+    }
     if (zenithBootstrapCheckState.lastReadyGeneration !== generation) {
       zenithBootstrapCheckState.lastReadyGeneration = generation;
       log?.(`[zenith] bootstrap ready generation=${generation}`);
@@ -9982,6 +10150,7 @@ async function main() {
           zenithBootstrapCheckState,
           browserControlState,
           bootstrapState,
+          quickPlayDiagnosticState,
           transientState,
           now: loopNow,
           onBootstrapReady: notifyObserverBootstrapReady,

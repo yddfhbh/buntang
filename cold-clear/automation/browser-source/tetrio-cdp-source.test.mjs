@@ -1416,9 +1416,19 @@ test("first Zenith options rearms closure acquisition", () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const controlState = createBrowserControlState();
   controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
   const diagnosticState = makeQuickPlayState(paths);
   try {
-    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
       now: 1_000,
       log: () => {}
     });
@@ -1438,7 +1448,7 @@ test("first Zenith options rearms closure acquisition", () => {
 
     assert.equal(diagnosticState.closureScanState.zenithRetryScheduled, true);
     assert.equal(diagnosticState.closureScanState.pendingReason, "first_zenith_options");
-    assert.equal(diagnosticState.nextClosureSurveyAt, 1_350);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 1_200);
     assert.equal(diagnosticState.diagnostics.closure_scan.scheduled, 1);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
@@ -1511,9 +1521,19 @@ test("duplicate retry and first-options schedules coalesce", () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const controlState = createBrowserControlState();
   controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
   const diagnosticState = makeQuickPlayState(paths);
   try {
-    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
       now: 1_000,
       log: () => {}
     });
@@ -1533,7 +1553,7 @@ test("duplicate retry and first-options schedules coalesce", () => {
       ]
     });
 
-    assert.equal(diagnosticState.nextClosureSurveyAt, 1_650);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 1_500);
     assert.equal(diagnosticState.closureScanState.pendingReason, "first_zenith_options");
     assert.equal(diagnosticState.diagnostics.closure_scan.scheduled, 1);
   } finally {
@@ -4122,6 +4142,96 @@ test("matching_frame_missing schedules bounded timing-miss retry", async () => {
   }
 });
 
+test("Zenith startup burst uses short retries before falling back to long backoff", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 126;
+  const diagnosticState = makeQuickPlayState(paths);
+  diagnosticState.closureRetryJitterMsFn = () => 0;
+  try {
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 9_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.pendingIdentity = {
+      generation: 126,
+      userid: "user-burst",
+      gameid: 9126,
+      wsPlayerId: "user-burst|9126|Burst",
+      resolvedAt: 9_000
+    };
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 9_000,
+      direction: "inbound",
+      root_keys: ["state", "players"],
+      payload_keys: ["countdown", "playing"],
+      players: [{ userid: "user-burst", gameid: 9126, username: "Burst" }]
+    });
+
+    const runAt = async (now) => maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send() {
+          return {};
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: false,
+        resultType: "matching_frame_missing",
+        callframesSeen: 6,
+        noTickAttempt: {
+          callframes_seen: 6,
+          top_functions: ["render"]
+        },
+        rawCandidates: [],
+        acceptedCandidates: []
+      }),
+      log: () => {}
+    });
+
+    await runAt(9_000);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_050);
+    await runAt(9_050);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_125);
+    await runAt(9_125);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_225);
+    await runAt(9_225);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_350);
+    await runAt(9_350);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_500);
+    await runAt(9_500);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_700);
+    await runAt(9_700);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 9_860);
+    assert.equal(diagnosticState.zenithStartupTrace.burstRetryCount, 6);
+    assert.equal(diagnosticState.zenithStartupTrace.fallbackRetryCount, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
 test("gameplay packet for local gameid rearms scan and unrelated packet does not", () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const controlState = createBrowserControlState();
@@ -4160,6 +4270,115 @@ test("gameplay packet for local gameid rearms scan and unrelated packet does not
     });
     assert.equal(diagnosticState.nextClosureSurveyAt, 10_020);
     assert.equal(diagnosticState.closureScanState.pendingReason, "gameplay_signal");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("gameplay signal coalesces a pending long retry into an immediate scan", () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 127;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 10_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.pendingIdentity = {
+      generation: 127,
+      userid: "user-coalesce",
+      gameid: 10127,
+      wsPlayerId: "user-coalesce|10127|Coalesce",
+      resolvedAt: 10_000
+    };
+    diagnosticState.nextClosureSurveyAt = 10_700;
+    diagnosticState.closureScanState.pendingReason = "timing_miss";
+
+    recordQuickPlayDiagnosticEnvelope(diagnosticState, {
+      timestamp: 10_020,
+      direction: "inbound",
+      root_keys: ["state", "players"],
+      payload_keys: ["countdown", "playing"],
+      players: [{ userid: "user-coalesce", gameid: 10127, username: "Coalesce" }]
+    });
+
+    assert.equal(diagnosticState.nextClosureSurveyAt, 10_020);
+    assert.equal(diagnosticState.closureScanState.pendingReason, "gameplay_signal");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("bootstrap ready coalesces a pending long retry into an immediate scan", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.botEnabled = true;
+  controlState.modeGeneration = 128;
+  const diagnosticState = makeQuickPlayState(paths);
+  const zenithBootstrapCheckState = createZenithBootstrapCheckState();
+  const bootstrapState = createBootstrapState(0);
+  try {
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 11_000,
+      log: () => {}
+    });
+    diagnosticState.roundObserved = true;
+    diagnosticState.pendingIdentity = {
+      generation: 128,
+      userid: "user-bootstrap",
+      gameid: 11128,
+      wsPlayerId: "user-bootstrap|11128|Bootstrap",
+      resolvedAt: 11_000
+    };
+    diagnosticState.nextClosureSurveyAt = 11_700;
+    diagnosticState.closureScanState.pendingReason = "timing_miss";
+    zenithBootstrapCheckState.generation = 128;
+    zenithBootstrapCheckState.scheduled = true;
+    zenithBootstrapCheckState.nextCheckAt = 11_050;
+
+    const result = await maybeRunZenithBootstrapCheck({
+      cdp: {
+        async send() {
+          return {};
+        }
+      },
+      zenithBootstrapCheckState,
+      browserControlState: controlState,
+      bootstrapState,
+      quickPlayDiagnosticState: diagnosticState,
+      now: 11_050,
+      nowFn: () => 11_050,
+      readBootstrapPageStateFn: async () => ({ readyState: "complete", href: "https://tetr.io/" }),
+      getBootstrapReadinessStatusFn: () => ({ ready: true, reason: "ready" }),
+      log: () => {}
+    });
+
+    assert.equal(result.ready, true);
+    assert.equal(diagnosticState.nextClosureSurveyAt, 11_050);
+    assert.equal(diagnosticState.closureScanState.pendingReason, "bootstrap_ready");
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }

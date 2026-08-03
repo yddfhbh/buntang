@@ -2070,16 +2070,24 @@ function requestQuickPlayPassiveProviderOwner(
     normalizedOwner
   );
   const previousHadOwners = hasAnyQuickPlayPassiveOwner(quickPlayDiagnosticState);
+  const previousDiagnosticUsernameHint =
+    quickPlayDiagnosticState.diagnosticUsernameHint ?? null;
+  const normalizedUsernameHint = normalizedScalar(usernameHint) ?? null;
+  const usernameHintChanged =
+    Boolean(enabled) &&
+    quickPlayDiagnosticState.diagnosticUsernameHint !== normalizedUsernameHint;
   if (
     quickPlayDiagnosticState.ownerRequests &&
-    quickPlayDiagnosticState.ownerRequests[normalizedOwner] === Boolean(enabled)
+    quickPlayDiagnosticState.ownerRequests[normalizedOwner] === Boolean(enabled) &&
+    !usernameHintChanged
   ) {
     return { started: false, changed: false, active: quickPlayDiagnosticState.active === true };
   }
   quickPlayDiagnosticState.ownerRequests[normalizedOwner] = Boolean(enabled);
+  if (enabled) {
+    quickPlayDiagnosticState.diagnosticUsernameHint = normalizedUsernameHint;
+  }
   if (normalizedOwner === QUICK_PLAY_OWNER_MANUAL_DIAGNOSTIC && enabled) {
-    quickPlayDiagnosticState.diagnosticUsernameHint =
-      normalizedScalar(usernameHint) ?? quickPlayDiagnosticState.diagnosticUsernameHint;
     if (Number(quickPlayDiagnosticState.manualOwnerStopAt ?? 0) <= 0) {
       quickPlayDiagnosticState.manualOwnerStopAt =
         Math.max(0, Number(now ?? Date.now())) +
@@ -2116,6 +2124,7 @@ function requestQuickPlayPassiveProviderOwner(
     );
     if (!result.started) {
       quickPlayDiagnosticState.ownerRequests[normalizedOwner] = previousRequested;
+      quickPlayDiagnosticState.diagnosticUsernameHint = previousDiagnosticUsernameHint;
       return result;
     }
     return { ...result, changed: true };
@@ -2127,7 +2136,10 @@ function requestQuickPlayPassiveProviderOwner(
   }
   return {
     started: false,
-    changed: !previousHadOwners || previousRequested !== Boolean(enabled),
+    changed:
+      usernameHintChanged ||
+      !previousHadOwners ||
+      previousRequested !== Boolean(enabled),
     active: true
   };
 }

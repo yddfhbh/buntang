@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use eframe::egui;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::browser_source::{ChromiumHostProcess, ProviderProcess, SharedLogger};
 use crate::config::{
@@ -39,6 +39,7 @@ const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Bot ON",
     "Bot OFF",
 ];
+const ZENITH_LIVE_MAX_PIECE_OPTIONS: &[u32] = &[1, 5, 20];
 const BOT_UI_HIDDEN_LABELS: &[&str] = &[
     "Dry run",
     "Use hold",
@@ -193,6 +194,10 @@ struct LauncherState {
     browser: BrowserCdpConfig,
     always_on_top: bool,
     zenith_live_input_enabled: bool,
+    #[serde(
+        default = "default_zenith_live_max_pieces",
+        deserialize_with = "deserialize_zenith_live_max_pieces"
+    )]
     zenith_live_max_pieces: u32,
     dry_run: bool,
     play_style: PlayStyleConfig,
@@ -461,9 +466,7 @@ impl LauncherState {
             self.target_pps = 3.0;
         }
         self.target_pps = self.target_pps.clamp(0.25, 20.0);
-        if self.zenith_live_max_pieces == 0 {
-            self.zenith_live_max_pieces = 1;
-        }
+        self.zenith_live_max_pieces = normalize_zenith_live_max_pieces(self.zenith_live_max_pieces);
     }
 
     fn effective_target_pps(&self) -> f32 {
@@ -475,8 +478,35 @@ impl LauncherState {
     }
 
     fn effective_zenith_live_max_pieces(&self) -> u32 {
-        self.zenith_live_max_pieces.max(1).min(1)
+        normalize_zenith_live_max_pieces(self.zenith_live_max_pieces)
     }
+}
+
+fn default_zenith_live_max_pieces() -> u32 {
+    1
+}
+
+fn normalize_zenith_live_max_pieces(value: u32) -> u32 {
+    if ZENITH_LIVE_MAX_PIECE_OPTIONS.contains(&value) {
+        value
+    } else {
+        default_zenith_live_max_pieces()
+    }
+}
+
+fn deserialize_zenith_live_max_pieces<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let parsed = match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_else(default_zenith_live_max_pieces),
+        _ => default_zenith_live_max_pieces(),
+    };
+    Ok(normalize_zenith_live_max_pieces(parsed))
 }
 
 enum LauncherEvent {
@@ -752,6 +782,8 @@ impl Default for ZenithLiveStage {
 struct ZenithLiveController {
     stage: ZenithLiveStage,
     executed_pieces: u32,
+    max_reached_logged: bool,
+    session_max_pieces: u32,
     active_piece_counter: Option<u32>,
     active_snapshot_token: Option<String>,
     active_game_id: Option<String>,
@@ -761,8 +793,17 @@ struct ZenithLiveController {
     started_at: Option<Instant>,
     last_skip_key: Option<String>,
     last_abort_key: Option<String>,
-    last_completed_piece_counter: Option<u32>,
-    last_aborted_piece_counter: Option<u32>,
+    last_completed_execution: Option<ZenithLiveExecutionIdentity>,
+    last_aborted_execution: Option<ZenithLiveExecutionIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ZenithLiveExecutionIdentity {
+    snapshot_token: String,
+    game_id: String,
+    candidate_id: String,
+    capture_generation: u64,
+    piece_counter: Option<u32>,
 }
 
 impl ZenithLiveController {
@@ -776,6 +817,19 @@ impl ZenithLiveController {
 
     fn clear_abort_reason(&mut self) {
         self.last_abort_key = None;
+    }
+
+    fn note_max_reached(&mut self) -> bool {
+        if self.max_reached_logged {
+            false
+        } else {
+            self.max_reached_logged = true;
+            true
+        }
+    }
+
+    fn session_max_pieces(&self) -> u32 {
+        normalize_zenith_live_max_pieces(self.session_max_pieces)
     }
 
     fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
@@ -812,10 +866,45 @@ impl ZenithLiveController {
         self.clear_abort_reason();
     }
 
-    fn mark_completed(&mut self, after_piece_counter: Option<u32>) {
+    fn active_execution_identity(&self) -> Option<ZenithLiveExecutionIdentity> {
+        Some(ZenithLiveExecutionIdentity {
+            snapshot_token: self.active_snapshot_token.clone()?,
+            game_id: self.active_game_id.clone()?,
+            candidate_id: self.active_candidate_id.clone()?,
+            capture_generation: self.active_capture_generation?,
+            piece_counter: self.active_piece_counter,
+        })
+    }
+
+    fn execution_matches_snapshot(
+        execution: &Option<ZenithLiveExecutionIdentity>,
+        snapshot: &ZenithPassivePlannerSnapshot,
+    ) -> bool {
+        let Some(execution) = execution else {
+            return false;
+        };
+        execution.snapshot_token == snapshot.snapshot.token
+            || (execution.game_id == snapshot.gameid
+                && execution.candidate_id == snapshot.candidate_id
+                && execution.capture_generation == snapshot.capture_generation
+                && execution.piece_counter == snapshot.snapshot.piece_counter)
+    }
+
+    fn completed_execution_matches_snapshot(
+        &self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+    ) -> bool {
+        Self::execution_matches_snapshot(&self.last_completed_execution, snapshot)
+    }
+
+    fn aborted_execution_matches_snapshot(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
+        Self::execution_matches_snapshot(&self.last_aborted_execution, snapshot)
+    }
+
+    fn mark_completed(&mut self) {
         self.stage = ZenithLiveStage::Completed;
         self.executed_pieces = self.executed_pieces.saturating_add(1);
-        self.last_completed_piece_counter = after_piece_counter;
+        self.last_completed_execution = self.active_execution_identity();
         self.clear_skip_reason();
         self.clear_abort_reason();
         self.active_piece_counter = None;
@@ -827,9 +916,9 @@ impl ZenithLiveController {
         self.started_at = None;
     }
 
-    fn mark_aborted(&mut self, piece_counter: Option<u32>) {
+    fn mark_aborted(&mut self) {
         self.stage = ZenithLiveStage::Aborted;
-        self.last_aborted_piece_counter = piece_counter;
+        self.last_aborted_execution = self.active_execution_identity();
         self.active_piece_counter = None;
         self.active_snapshot_token = None;
         self.active_game_id = None;
@@ -991,6 +1080,16 @@ impl LauncherApp {
         }
     }
 
+    fn browser_connection_settings_locked(&self) -> bool {
+        self.browser_session.is_some()
+    }
+
+    fn local_tetrio_username_locked(&self) -> bool {
+        self.bot_desired_enabled
+            || self.bot_session.is_some()
+            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On)
+    }
+
     fn update_live_target_pps(&mut self) {
         let effective_target_pps = self.state.effective_target_pps();
         if let Some(bot_session) = self.bot_session.as_ref() {
@@ -1013,8 +1112,55 @@ impl LauncherApp {
         }
     }
 
+    fn sync_passive_provider_username_hint_for_owner(
+        &mut self,
+        owner: PassiveProviderOwner,
+    ) -> bool {
+        if !self.passive_provider.is_requested(owner) {
+            return true;
+        }
+        let username_hint = self.local_tetrio_username_hint();
+        let Some(session) = self.browser_session.as_mut() else {
+            return true;
+        };
+        match session.snapshot_provider.set_quick_play_passive_provider(
+            owner.control_value(),
+            true,
+            username_hint.as_deref(),
+        ) {
+            Ok(()) => true,
+            Err(err) => {
+                self.push_log(format!(
+                    "{} passive provider username sync failed owner={} error={err:#}",
+                    owner.log_prefix(),
+                    owner.control_value()
+                ));
+                false
+            }
+        }
+    }
+
+    fn sync_requested_passive_provider_username_hint(&mut self) -> bool {
+        let mut synced = true;
+        for owner in [
+            PassiveProviderOwner::ManualDiagnostic,
+            PassiveProviderOwner::ZenithDryRun,
+        ] {
+            synced &= self.sync_passive_provider_username_hint_for_owner(owner);
+        }
+        synced
+    }
+
     fn zenith_live_max_pieces(&self) -> u32 {
-        self.state.effective_zenith_live_max_pieces()
+        if self.state.selected_mode == RuntimeMode::Zenith
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.zenith_live.session_max_pieces()
+        } else {
+            self.state.effective_zenith_live_max_pieces()
+        }
     }
 
     fn zenith_live_input_allowed(&self) -> bool {
@@ -1095,7 +1241,14 @@ impl LauncherApp {
     }
 
     fn suppress_zenith_live_input(&mut self, reason: &str, piece_counter: Option<u32>) {
-        let skip_key = format!("{reason}:{}", piece_counter_label(piece_counter));
+        if reason == "max_pieces_reached" {
+            return;
+        }
+        let skip_key = if reason == "max_pieces_reached" {
+            reason.to_owned()
+        } else {
+            format!("{reason}:{}", piece_counter_label(piece_counter))
+        };
         if let Some(line) = self.zenith_live.note_skip(
             &skip_key,
             format!(
@@ -1128,7 +1281,7 @@ impl LauncherApp {
         if let Err(err) = self.release_live_input_now() {
             self.push_log(format!("[input] failed to release all keys: {err:#}"));
         }
-        self.zenith_live.mark_aborted(piece_counter);
+        self.zenith_live.mark_aborted();
     }
 
     fn update_zenith_live_lock_state(&mut self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
@@ -1158,7 +1311,7 @@ impl LauncherApp {
         {
             if after > before {
                 let max_pieces = self.zenith_live_max_pieces();
-                self.zenith_live.mark_completed(Some(after));
+                self.zenith_live.mark_completed();
                 self.push_log(format!(
                     "[zenith-live] piece completed piece_counter_before={} piece_counter_after={} executed={} max={}",
                     before,
@@ -1167,7 +1320,13 @@ impl LauncherApp {
                     max_pieces
                 ));
                 if self.zenith_live.executed_pieces >= max_pieces {
-                    self.push_log("[zenith-live] execution suspended reason=max_pieces_reached");
+                    if self.zenith_live.note_max_reached() {
+                        self.push_log(format!(
+                            "[zenith-live] execution suspended reason=max_pieces_reached executed={} max={}",
+                            self.zenith_live.executed_pieces,
+                            max_pieces
+                        ));
+                    }
                 }
                 return false;
             }
@@ -1302,6 +1461,9 @@ impl LauncherApp {
                 self.save_state();
                 self.push_log("[launcher] bot on");
             }
+            if self.state.selected_mode == RuntimeMode::Zenith {
+                self.sync_requested_passive_provider_username_hint();
+            }
             if self.state.selected_mode == RuntimeMode::Zenith
                 && !self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, true)
             {
@@ -1335,6 +1497,7 @@ impl LauncherApp {
             self.bot_restart_pending = false;
             self.zenith_dry_run.reset();
             self.zenith_live.reset();
+            self.zenith_live.session_max_pieces = self.state.effective_zenith_live_max_pieces();
             self.push_log(format!(
                 "[mode] bot enabled mode={} generation={}",
                 self.state.selected_mode.control_value(),
@@ -2083,9 +2246,15 @@ impl LauncherApp {
                     self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
                 } else if self.zenith_live.executed_pieces >= self.zenith_live_max_pieces() {
                     self.suppress_zenith_live_input("max_pieces_reached", piece_counter);
-                } else if self.zenith_live.last_aborted_piece_counter == piece_counter {
+                } else if self
+                    .zenith_live
+                    .aborted_execution_matches_snapshot(snapshot)
+                {
                     self.suppress_zenith_live_input("aborted_piece", piece_counter);
-                } else if self.zenith_live.last_completed_piece_counter == piece_counter {
+                } else if self
+                    .zenith_live
+                    .completed_execution_matches_snapshot(snapshot)
+                {
                     self.suppress_zenith_live_input("completed_piece", piece_counter);
                 } else if self.zenith_live.is_executing_piece(piece_counter) {
                     self.suppress_zenith_live_input("already_executing", piece_counter);
@@ -2104,8 +2273,9 @@ impl LauncherApp {
                         ZenithLiveStage::Planned,
                     );
                     self.push_log(format!(
-                        "[zenith-live] execution started piece_counter={} max_pieces={}",
+                        "[zenith-live] execution started piece_counter={} executed={} max_pieces={}",
                         piece_counter_label(piece_counter),
+                        self.zenith_live.executed_pieces,
                         self.zenith_live_max_pieces()
                     ));
                     self.zenith_live.stage = ZenithLiveStage::Executing;
@@ -2270,10 +2440,8 @@ impl eframe::App for LauncherApp {
             self.state.always_on_top,
         )));
 
-        let browser_locked = self.browser_session.is_some();
-        let bot_locked = self.bot_desired_enabled
-            || self.bot_session.is_some()
-            || matches!(self.bot_status, BotStatus::Starting | BotStatus::On);
+        let browser_locked = self.browser_connection_settings_locked();
+        let bot_locked = self.local_tetrio_username_locked();
         let can_turn_bot_on = self.browser_status == BrowserStatus::Ready
             && self.input_status == InputStatus::Ready
             && matches!(
@@ -2294,7 +2462,7 @@ impl eframe::App for LauncherApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("Open Chromium now prewarms the snapshot and input CDP helpers. Bot ON only starts the planner/runner.");
             if browser_locked {
-                ui.small("Browser settings are locked while Chromium is open.");
+                ui.small("Browser connection settings are locked while Chromium is open.");
             }
             ui.add_enabled_ui(!browser_locked, |ui| {
                 ui.horizontal(|ui| {
@@ -2311,13 +2479,17 @@ impl eframe::App for LauncherApp {
                     ui.label("Target");
                     ui.text_edit_singleline(&mut self.state.browser.target_hint);
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Local TETR.IO Username");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.state.browser.local_tetrio_username)
-                            .hint_text("exact username"),
-                    );
-                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Local TETR.IO Username");
+                let response = ui.add_enabled(
+                    !bot_locked,
+                    egui::TextEdit::singleline(&mut self.state.browser.local_tetrio_username)
+                        .hint_text("exact username"),
+                );
+                if response.changed() && self.browser_session.is_some() {
+                    self.sync_requested_passive_provider_username_hint();
+                }
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.state.always_on_top, "Always on top");
@@ -2443,6 +2615,21 @@ impl eframe::App for LauncherApp {
                         "최대 자동 배치: {}",
                         self.state.effective_zenith_live_max_pieces()
                     ));
+                    ui.add_enabled_ui(!bot_locked, |ui| {
+                        egui::ComboBox::from_id_salt("zenith_live_max_pieces")
+                            .selected_text(
+                                self.state.effective_zenith_live_max_pieces().to_string(),
+                            )
+                            .show_ui(ui, |ui| {
+                                for option in ZENITH_LIVE_MAX_PIECE_OPTIONS {
+                                    ui.selectable_value(
+                                        &mut self.state.zenith_live_max_pieces,
+                                        *option,
+                                        option.to_string(),
+                                    );
+                                }
+                            });
+                    });
                 });
                 ui.small(
                     "기본값은 OFF이며, 현재 단계에서는 Bot ON마다 최대 1피스만 실제 입력합니다.",
@@ -2453,6 +2640,9 @@ impl eframe::App for LauncherApp {
             ui.heading("Settings");
             if ui.button("Save Settings").clicked() {
                 self.save_state();
+                if self.browser_session.is_some() && !bot_locked {
+                    self.sync_requested_passive_provider_username_hint();
+                }
             }
 
             ui.separator();
@@ -2650,6 +2840,7 @@ mod tests {
         app.state.selected_mode = RuntimeMode::Zenith;
         app.bot_desired_enabled = true;
         app.bot_status = BotStatus::On;
+        app.zenith_live.session_max_pieces = app.state.effective_zenith_live_max_pieces();
         app.browser_status = BrowserStatus::Ready;
         app.input_status = InputStatus::Ready;
         app.snapshot_status = SnapshotStatus::Ready;
@@ -2774,6 +2965,43 @@ mod tests {
         );
     }
 
+    fn drive_zenith_live_piece_counters(app: &mut LauncherApp, paths: &AppPaths, counters: &[u32]) {
+        for piece_counter in counters {
+            std::thread::sleep(Duration::from_millis(20));
+            write_zenith_passive_snapshot(paths, "ready", "running", *piece_counter, json!(false));
+            app.poll_zenith_dry_run();
+        }
+    }
+
+    fn drive_zenith_live_piece_counters_for_game(
+        app: &mut LauncherApp,
+        paths: &AppPaths,
+        gameid: &str,
+        counters: &[u32],
+    ) {
+        let (x, y) = zenith_spawn_coordinates(Piece::J);
+        for piece_counter in counters {
+            std::thread::sleep(Duration::from_millis(20));
+            write_zenith_passive_snapshot_with_metadata(
+                paths,
+                "ready",
+                "running",
+                5,
+                "user-zenith",
+                gameid,
+                "candidate-1",
+                *piece_counter,
+                json!(false),
+                "J",
+                json!(x),
+                json!(y),
+                json!(null),
+                &["O", "T", "L", "S", "Z"],
+            );
+            app.poll_zenith_dry_run();
+        }
+    }
+
     fn write_zenith_invalid_passive_snapshot_missing_current_type(paths: &AppPaths) {
         let path = zenith_passive_snapshot_path(paths);
         if let Some(parent) = path.parent() {
@@ -2808,6 +3036,16 @@ mod tests {
             }
         });
         fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    }
+
+    fn read_test_zenith_passive_snapshot(paths: &AppPaths) -> ZenithPassivePlannerSnapshot {
+        let path = zenith_passive_snapshot_path(paths);
+        let (envelope, _) = read_zenith_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .expect("test Zenith passive snapshot to exist");
+        envelope
+            .snapshot
+            .expect("test Zenith passive snapshot payload")
     }
 
     #[test]
@@ -2936,6 +3174,15 @@ mod tests {
     }
 
     #[test]
+    fn local_tetrio_username_hint_is_fail_closed_when_blank() {
+        let paths = test_paths("launcher-state-empty-local-username");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.browser.local_tetrio_username = "   ".to_owned();
+        assert_eq!(app.local_tetrio_username_hint(), None);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn load_launcher_state_migrates_legacy_quick_play_username() {
         let paths = test_paths("launcher-state-legacy-local-username");
         fs::write(
@@ -2952,6 +3199,79 @@ mod tests {
         assert_eq!(state.browser.local_tetrio_username, "ExactLocal");
 
         cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn browser_connection_settings_lock_only_depends_on_browser_session() {
+        let paths = test_paths("browser-connection-lock");
+        let mut app = LauncherApp::new(paths.clone());
+        assert!(!app.browser_connection_settings_locked());
+
+        app.browser_status = BrowserStatus::Ready;
+        assert!(!app.browser_connection_settings_locked());
+
+        configure_zenith_runtime_ready(&mut app);
+        assert!(!app.browser_connection_settings_locked());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn local_tetrio_username_editability_tracks_bot_state_independently() {
+        let paths = test_paths("local-username-lock");
+        let mut app = LauncherApp::new(paths.clone());
+
+        app.browser_status = BrowserStatus::Closed;
+        app.bot_status = BotStatus::Off;
+        app.bot_desired_enabled = false;
+        assert!(!app.local_tetrio_username_locked());
+
+        app.browser_status = BrowserStatus::Ready;
+        assert!(!app.local_tetrio_username_locked());
+        assert!(!app.browser_connection_settings_locked());
+
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        assert!(app.local_tetrio_username_locked());
+        assert!(!app.browser_connection_settings_locked());
+
+        app.stop_bot_with_browser_hint(false);
+        assert_eq!(app.bot_status, BotStatus::Off);
+        assert!(!app.local_tetrio_username_locked());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_defaults_to_one() {
+        assert_eq!(
+            LauncherState::default().effective_zenith_live_max_pieces(),
+            1
+        );
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_accepts_supported_values() {
+        for value in ZENITH_LIVE_MAX_PIECE_OPTIONS {
+            let state: LauncherState =
+                serde_json::from_value(json!({ "zenith_live_max_pieces": value })).unwrap();
+            assert_eq!(state.effective_zenith_live_max_pieces(), *value);
+        }
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_invalid_values_fall_back_to_one() {
+        for raw in [
+            json!({ "zenith_live_max_pieces": 0 }),
+            json!({ "zenith_live_max_pieces": -1 }),
+            json!({ "zenith_live_max_pieces": 3 }),
+            json!({ "zenith_live_max_pieces": 100 }),
+            json!({ "zenith_live_max_pieces": "5" }),
+            json!({ "zenith_live_max_pieces": null }),
+        ] {
+            let state: LauncherState = serde_json::from_value(raw).unwrap();
+            assert_eq!(state.effective_zenith_live_max_pieces(), 1);
+        }
     }
 
     #[test]
@@ -3145,6 +3465,8 @@ mod tests {
         app.state.mode_generation = 4;
         app.bot_desired_enabled = true;
         app.bot_status = BotStatus::On;
+        app.zenith_live.executed_pieces = 3;
+        app.zenith_live.session_max_pieces = 5;
 
         app.select_mode(RuntimeMode::Zenith);
 
@@ -3152,6 +3474,8 @@ mod tests {
         assert_eq!(app.state.mode_generation, 5);
         assert!(!app.bot_desired_enabled);
         assert_eq!(app.bot_status, BotStatus::Off);
+        assert_eq!(app.zenith_live.executed_pieces, 0);
+        assert_eq!(app.zenith_live.session_max_pieces(), 1);
         assert!(app
             .logs
             .iter()
@@ -3245,11 +3569,8 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("[zenith-live] plan accepted piece_counter=6 generation=5")));
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line
-                .contains("[zenith-live] execution started piece_counter=6 max_pieces=1")));
+        assert!(app.logs.iter().any(|line| line
+            .contains("[zenith-live] execution started piece_counter=6 executed=0 max_pieces=1")));
         assert!(app
             .logs
             .iter()
@@ -3337,10 +3658,9 @@ mod tests {
                 "[zenith-live] piece completed piece_counter_before=20 piece_counter_after=21 executed=1 max=1"
             )
         }));
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line == "[zenith-live] execution suspended reason=max_pieces_reached"));
+        assert!(app.logs.iter().any(|line| {
+            line == "[zenith-live] execution suspended reason=max_pieces_reached executed=1 max=1"
+        }));
 
         std::thread::sleep(Duration::from_millis(20));
         write_zenith_passive_snapshot(&paths, "ready", "running", 22, json!(false));
@@ -3352,9 +3672,373 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        assert!(app.logs.iter().any(|line| line.contains(
-            "[zenith-live] input suppressed reason=max_pieces_reached piece_counter=22"
-        )));
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_completed_execution_identity_tracks_executed_piece_not_ack_piece() {
+        let paths = test_paths("zenith-live-completed-identity");
+        let mut controller = ZenithLiveController::default();
+
+        write_zenith_passive_snapshot_with_metadata(
+            &paths,
+            "ready",
+            "running",
+            5,
+            "user-zenith",
+            "game-a",
+            "candidate-1",
+            0,
+            json!(false),
+            "J",
+            json!(4),
+            json!(19),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        let executed_snapshot = read_test_zenith_passive_snapshot(&paths);
+        controller.start_planned(&executed_snapshot, 9, ZenithLiveStage::AwaitingLock);
+        controller.mark_completed();
+
+        let completed = controller
+            .last_completed_execution
+            .as_ref()
+            .expect("completed execution identity");
+        assert_eq!(completed.piece_counter, Some(0));
+        assert_eq!(completed.game_id, "game-a");
+        assert_eq!(completed.capture_generation, 5);
+        assert_eq!(completed.snapshot_token, "zenith-game-a-5-0-candidate-1");
+
+        write_zenith_passive_snapshot_with_metadata(
+            &paths,
+            "ready",
+            "running",
+            5,
+            "user-zenith",
+            "game-a",
+            "candidate-1",
+            1,
+            json!(false),
+            "J",
+            json!(4),
+            json!(19),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        let next_piece_snapshot = read_test_zenith_passive_snapshot(&paths);
+        assert!(!controller.completed_execution_matches_snapshot(&next_piece_snapshot));
+
+        write_zenith_passive_snapshot_with_metadata(
+            &paths,
+            "ready",
+            "running",
+            6,
+            "user-zenith",
+            "game-a",
+            "candidate-1",
+            0,
+            json!(false),
+            "J",
+            json!(4),
+            json!(19),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        let next_generation_snapshot = read_test_zenith_passive_snapshot(&paths);
+        assert!(!controller.completed_execution_matches_snapshot(&next_generation_snapshot));
+
+        write_zenith_passive_snapshot_with_metadata(
+            &paths,
+            "ready",
+            "running",
+            5,
+            "user-zenith",
+            "game-b",
+            "candidate-1",
+            0,
+            json!(false),
+            "J",
+            json!(4),
+            json!(19),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        let next_game_snapshot = read_test_zenith_passive_snapshot(&paths);
+        assert!(!controller.completed_execution_matches_snapshot(&next_game_snapshot));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_completion_allows_next_piece_after_lock_acknowledgement() {
+        let paths = test_paths("zenith-live-next-piece-after-complete");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = 5;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.executed_pieces, 1);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-live] execution started"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=completed_piece"))
+                .count(),
+            0
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains(
+                "[zenith-live] piece completed piece_counter_before=0 piece_counter_after=1 executed=1 max=5",
+            )
+        }));
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution started piece_counter=1 executed=1 max_pieces=5")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_session_max_is_fixed_while_bot_is_on() {
+        let paths = test_paths("zenith-live-session-max-fixed");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.selected_mode = RuntimeMode::Zenith;
+        app.state.zenith_live_max_pieces = 1;
+        configure_zenith_runtime_ready(&mut app);
+
+        assert_eq!(app.zenith_live_max_pieces(), 1);
+
+        app.state.zenith_live_max_pieces = 20;
+
+        assert_eq!(app.zenith_live_max_pieces(), 1);
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert_eq!(app.zenith_live_max_pieces(), 20);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_executes_exactly_five_pieces() {
+        let paths = test_paths("zenith-live-five-pieces");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = 5;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        drive_zenith_live_piece_counters(
+            &mut app,
+            &paths,
+            &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+        );
+
+        assert_eq!(app.zenith_live.executed_pieces, 5);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-live] execution started"))
+                .count(),
+            5
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-live] piece completed"))
+                .count(),
+            5
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution suspended reason=max_pieces_reached"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=completed_piece"))
+                .count(),
+            0
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_executes_exactly_twenty_pieces() {
+        let paths = test_paths("zenith-live-twenty-pieces");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = 20;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let counters: Vec<u32> = (40..=80).collect();
+        drive_zenith_live_piece_counters(&mut app, &paths, &counters);
+
+        assert_eq!(app.zenith_live.executed_pieces, 20);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            20
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution suspended reason=max_pieces_reached"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution aborted"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=completed_piece"))
+                .count(),
+            0
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_game_change_keeps_session_execution_count() {
+        let paths = test_paths("zenith-live-count-persists-across-games");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = 5;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        drive_zenith_live_piece_counters_for_game(&mut app, &paths, "game-a", &[20, 21, 22, 23]);
+        assert_eq!(app.zenith_live.executed_pieces, 3);
+
+        drive_zenith_live_piece_counters_for_game(&mut app, &paths, "game-b", &[6, 7, 8, 9]);
+
+        assert_eq!(app.zenith_live.executed_pieces, 5);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            6
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution suspended reason=max_pieces_reached"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_max_reached_log_resets_for_new_bot_on_session() {
+        let paths = test_paths("zenith-live-max-log-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 10, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 11, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.stop_bot_with_browser_hint(false);
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 20, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 21, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution suspended reason=max_pieces_reached"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -3422,6 +4106,58 @@ mod tests {
         assert!(app.logs.iter().any(|line| {
             line.contains("[zenith-live] execution aborted reason=lock_timeout piece_counter=40")
         }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_aborted_piece_does_not_block_next_piece() {
+        let paths = test_paths("zenith-live-abort-next-piece");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = 5;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+        app.zenith_live.started_at =
+            Some(Instant::now() - Duration::from_millis(ZENITH_LIVE_LOCK_TIMEOUT_MS + 50));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        let aborted = app
+            .zenith_live
+            .last_aborted_execution
+            .as_ref()
+            .expect("aborted execution identity");
+        assert_eq!(aborted.piece_counter, Some(0));
+        let aborted_snapshot = read_test_zenith_passive_snapshot(&paths);
+        assert!(app
+            .zenith_live
+            .aborted_execution_matches_snapshot(&aborted_snapshot));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-live] execution started piece_counter=1"))
+                .count(),
+            1
+        );
 
         cleanup_test_paths(&paths);
     }

@@ -700,6 +700,52 @@ test("zenith passive owner stores shared local username hint", () => {
   }
 });
 
+test("active zenith passive owner refreshes shared local username hint", () => {
+  const controlState = createBrowserControlState();
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    controlState.selectedMode = "zenith";
+    controlState.botEnabled = true;
+
+    applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true,
+        username_hint: "FirstLocal"
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_050,
+      log: () => {}
+    });
+
+    const applied = applyBrowserControlMessage({
+      message: {
+        type: "quick_play_passive_provider",
+        owner: "zenith_dry_run",
+        enabled: true,
+        username_hint: "UpdatedLocal"
+      },
+      controlState,
+      quickPlayDiagnosticState: diagnosticState,
+      closureCaptureState: createClosureCaptureState(),
+      nextGameReacquireState: createNextGameReacquireState(),
+      now: 2_075,
+      log: () => {}
+    });
+
+    assert.equal(applied, true);
+    assert.equal(diagnosticState.active, true);
+    assert.equal(diagnosticState.diagnosticUsernameHint, "UpdatedLocal");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
 test("wrong mode still rejects zenith passive owner with actual mode in logs", () => {
   const controlState = createBrowserControlState();
   const paths = makeQuickPlayDiagnosticTempPaths();

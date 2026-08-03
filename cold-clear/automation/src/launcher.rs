@@ -69,6 +69,91 @@ const BOT_UI_HIDDEN_LABELS: &[&str] = &[
 const ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH: &str = "automation/quick-play-passive-snapshot.json";
 const ZENITH_LIVE_LOCK_TIMEOUT_MS: u64 = 1_500;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ZenithLivePieceLimit {
+    Bounded(u32),
+    Unlimited,
+}
+
+impl Default for ZenithLivePieceLimit {
+    fn default() -> Self {
+        Self::Bounded(default_zenith_live_max_pieces())
+    }
+}
+
+impl ZenithLivePieceLimit {
+    fn normalized(self) -> Self {
+        match self {
+            Self::Bounded(value) if ZENITH_LIVE_MAX_PIECE_OPTIONS.contains(&value) => {
+                Self::Bounded(value)
+            }
+            Self::Unlimited => Self::Unlimited,
+            Self::Bounded(_) => Self::default(),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Bounded(value) => value.to_string(),
+            Self::Unlimited => "무제한".to_owned(),
+        }
+    }
+
+    fn log_label(self) -> String {
+        match self {
+            Self::Bounded(value) => value.to_string(),
+            Self::Unlimited => "unlimited".to_owned(),
+        }
+    }
+
+    fn is_reached(self, executed_pieces: u32) -> bool {
+        match self {
+            Self::Bounded(value) => executed_pieces >= value,
+            Self::Unlimited => false,
+        }
+    }
+
+    fn bounded_value(self) -> Option<u32> {
+        match self {
+            Self::Bounded(value) => Some(value),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+impl Serialize for ZenithLivePieceLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Bounded(value) => serializer.serialize_u32(*value),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ZenithLivePieceLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let parsed = match value {
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .map(Self::Bounded)
+                .unwrap_or_default(),
+            serde_json::Value::String(value) if value.eq_ignore_ascii_case("unlimited") => {
+                Self::Unlimited
+            }
+            _ => Self::default(),
+        };
+        Ok(parsed.normalized())
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ModePreset {
     VsLeft1080p,
@@ -194,11 +279,7 @@ struct LauncherState {
     browser: BrowserCdpConfig,
     always_on_top: bool,
     zenith_live_input_enabled: bool,
-    #[serde(
-        default = "default_zenith_live_max_pieces",
-        deserialize_with = "deserialize_zenith_live_max_pieces"
-    )]
-    zenith_live_max_pieces: u32,
+    zenith_live_max_pieces: ZenithLivePieceLimit,
     dry_run: bool,
     play_style: PlayStyleConfig,
     poll_interval_ms: u64,
@@ -235,7 +316,7 @@ impl Default for LauncherState {
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             zenith_live_input_enabled: false,
-            zenith_live_max_pieces: 1,
+            zenith_live_max_pieces: ZenithLivePieceLimit::default(),
             dry_run: true,
             play_style: PlayStyleConfig::Normal,
             poll_interval_ms: 4,
@@ -466,7 +547,7 @@ impl LauncherState {
             self.target_pps = 3.0;
         }
         self.target_pps = self.target_pps.clamp(0.25, 20.0);
-        self.zenith_live_max_pieces = normalize_zenith_live_max_pieces(self.zenith_live_max_pieces);
+        self.zenith_live_max_pieces = self.zenith_live_max_pieces.normalized();
     }
 
     fn effective_target_pps(&self) -> f32 {
@@ -477,36 +558,13 @@ impl LauncherState {
         }
     }
 
-    fn effective_zenith_live_max_pieces(&self) -> u32 {
-        normalize_zenith_live_max_pieces(self.zenith_live_max_pieces)
+    fn effective_zenith_live_max_pieces(&self) -> ZenithLivePieceLimit {
+        self.zenith_live_max_pieces.normalized()
     }
 }
 
 fn default_zenith_live_max_pieces() -> u32 {
     1
-}
-
-fn normalize_zenith_live_max_pieces(value: u32) -> u32 {
-    if ZENITH_LIVE_MAX_PIECE_OPTIONS.contains(&value) {
-        value
-    } else {
-        default_zenith_live_max_pieces()
-    }
-}
-
-fn deserialize_zenith_live_max_pieces<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    let parsed = match value {
-        serde_json::Value::Number(number) => number
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or_else(default_zenith_live_max_pieces),
-        _ => default_zenith_live_max_pieces(),
-    };
-    Ok(normalize_zenith_live_max_pieces(parsed))
 }
 
 enum LauncherEvent {
@@ -783,7 +841,7 @@ struct ZenithLiveController {
     stage: ZenithLiveStage,
     executed_pieces: u32,
     max_reached_logged: bool,
-    session_max_pieces: u32,
+    session_max_pieces: ZenithLivePieceLimit,
     startup_started_at: Option<Instant>,
     startup_first_plan_logged: bool,
     startup_first_input_logged: bool,
@@ -831,8 +889,8 @@ impl ZenithLiveController {
         }
     }
 
-    fn session_max_pieces(&self) -> u32 {
-        normalize_zenith_live_max_pieces(self.session_max_pieces)
+    fn session_max_pieces(&self) -> ZenithLivePieceLimit {
+        self.session_max_pieces.normalized()
     }
 
     fn start_startup_session(&mut self) {
@@ -1176,7 +1234,7 @@ impl LauncherApp {
         synced
     }
 
-    fn zenith_live_max_pieces(&self) -> u32 {
+    fn zenith_live_piece_limit(&self) -> ZenithLivePieceLimit {
         if self.state.selected_mode == RuntimeMode::Zenith
             && (self.bot_desired_enabled
                 || self.bot_session.is_some()
@@ -1190,6 +1248,51 @@ impl LauncherApp {
 
     fn zenith_live_input_allowed(&self) -> bool {
         self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
+    }
+
+    fn zenith_live_limit_reached(&self) -> bool {
+        self.zenith_live_piece_limit()
+            .is_reached(self.zenith_live.executed_pieces)
+    }
+
+    fn zenith_live_session_armed_log(&self) -> String {
+        format!(
+            "[zenith-live] session armed limit={}",
+            self.zenith_live_piece_limit().log_label()
+        )
+    }
+
+    fn zenith_live_execution_started_log(&self, piece_counter: Option<u32>) -> String {
+        match self.zenith_live_piece_limit() {
+            ZenithLivePieceLimit::Bounded(max_pieces) => format!(
+                "[zenith-live] execution started piece_counter={} executed={} max_pieces={}",
+                piece_counter_label(piece_counter),
+                self.zenith_live.executed_pieces,
+                max_pieces
+            ),
+            ZenithLivePieceLimit::Unlimited => format!(
+                "[zenith-live] execution started piece_counter={} executed={} limit=unlimited",
+                piece_counter_label(piece_counter),
+                self.zenith_live.executed_pieces
+            ),
+        }
+    }
+
+    fn zenith_live_piece_completed_log(
+        &self,
+        before_piece_counter: u32,
+        after_piece_counter: u32,
+    ) -> String {
+        match self.zenith_live_piece_limit() {
+            ZenithLivePieceLimit::Bounded(max_pieces) => format!(
+                "[zenith-live] piece completed piece_counter_before={} piece_counter_after={} executed={} max={}",
+                before_piece_counter, after_piece_counter, self.zenith_live.executed_pieces, max_pieces
+            ),
+            ZenithLivePieceLimit::Unlimited => format!(
+                "[zenith-live] piece completed piece_counter_before={} piece_counter_after={} executed={} limit=unlimited",
+                before_piece_counter, after_piece_counter, self.zenith_live.executed_pieces
+            ),
+        }
     }
 
     fn zenith_execution_timings(config: &AutomationConfig) -> ExecutionTimings {
@@ -1335,21 +1438,17 @@ impl LauncherApp {
         if let (Some(before), Some(after)) = (before_piece_counter, snapshot.snapshot.piece_counter)
         {
             if after > before {
-                let max_pieces = self.zenith_live_max_pieces();
+                let piece_limit = self.zenith_live_piece_limit();
                 self.zenith_live.mark_completed();
-                self.push_log(format!(
-                    "[zenith-live] piece completed piece_counter_before={} piece_counter_after={} executed={} max={}",
-                    before,
-                    after,
-                    self.zenith_live.executed_pieces,
-                    max_pieces
-                ));
-                if self.zenith_live.executed_pieces >= max_pieces {
+                self.push_log(self.zenith_live_piece_completed_log(before, after));
+                if piece_limit.is_reached(self.zenith_live.executed_pieces) {
                     if self.zenith_live.note_max_reached() {
                         self.push_log(format!(
                             "[zenith-live] execution suspended reason=max_pieces_reached executed={} max={}",
                             self.zenith_live.executed_pieces,
-                            max_pieces
+                            piece_limit
+                                .bounded_value()
+                                .expect("bounded limit required for max reached log")
                         ));
                     }
                 }
@@ -1525,6 +1624,7 @@ impl LauncherApp {
             self.zenith_live.session_max_pieces = self.state.effective_zenith_live_max_pieces();
             if self.state.selected_mode == RuntimeMode::Zenith {
                 self.zenith_live.start_startup_session();
+                self.push_log(self.zenith_live_session_armed_log());
             }
             self.push_log(format!(
                 "[mode] bot enabled mode={} generation={}",
@@ -2203,11 +2303,16 @@ impl LauncherApp {
             self.zenith_dry_run.reset_processed_state();
             return;
         }
-        if snapshot.destroyed || snapshot.gameoverreason.is_some() {
-            self.cancel_zenith_live_execution("destroyed");
+        if snapshot.destroyed || snapshot.successful || snapshot.gameoverreason.is_some() {
+            let end_reason = if snapshot.successful {
+                "successful"
+            } else {
+                "destroyed"
+            };
+            self.cancel_zenith_live_execution(end_reason);
             if let Some(line) = self.zenith_dry_run.note_skip(
-                "destroyed",
-                "[zenith-dry-run] snapshot skipped reason=destroyed".to_owned(),
+                end_reason,
+                format!("[zenith-dry-run] snapshot skipped reason={end_reason}"),
             ) {
                 self.push_log(line);
             }
@@ -2275,7 +2380,7 @@ impl LauncherApp {
                 let piece_counter = snapshot.snapshot.piece_counter;
                 if !self.zenith_live_input_allowed() {
                     self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
-                } else if self.zenith_live.executed_pieces >= self.zenith_live_max_pieces() {
+                } else if self.zenith_live_limit_reached() {
                     self.suppress_zenith_live_input("max_pieces_reached", piece_counter);
                 } else if self
                     .zenith_live
@@ -2303,12 +2408,7 @@ impl LauncherApp {
                         self.passive_provider.activation_generation,
                         ZenithLiveStage::Planned,
                     );
-                    self.push_log(format!(
-                        "[zenith-live] execution started piece_counter={} executed={} max_pieces={}",
-                        piece_counter_label(piece_counter),
-                        self.zenith_live.executed_pieces,
-                        self.zenith_live_max_pieces()
-                    ));
+                    self.push_log(self.zenith_live_execution_started_log(piece_counter));
                     self.zenith_live.stage = ZenithLiveStage::Executing;
                     match self.execute_zenith_live_plan(&config, &prepared) {
                         Ok(()) => {
@@ -2647,21 +2747,24 @@ impl eframe::App for LauncherApp {
                     });
                     ui.label(format!(
                         "최대 자동 배치: {}",
-                        self.state.effective_zenith_live_max_pieces()
+                        self.state.effective_zenith_live_max_pieces().label()
                     ));
                     ui.add_enabled_ui(!bot_locked, |ui| {
                         egui::ComboBox::from_id_salt("zenith_live_max_pieces")
-                            .selected_text(
-                                self.state.effective_zenith_live_max_pieces().to_string(),
-                            )
+                            .selected_text(self.state.effective_zenith_live_max_pieces().label())
                             .show_ui(ui, |ui| {
                                 for option in ZENITH_LIVE_MAX_PIECE_OPTIONS {
                                     ui.selectable_value(
                                         &mut self.state.zenith_live_max_pieces,
-                                        *option,
+                                        ZenithLivePieceLimit::Bounded(*option),
                                         option.to_string(),
                                     );
                                 }
+                                ui.selectable_value(
+                                    &mut self.state.zenith_live_max_pieces,
+                                    ZenithLivePieceLimit::Unlimited,
+                                    "무제한",
+                                );
                             });
                     });
                 });
@@ -2941,6 +3044,48 @@ mod tests {
         hold_piece: serde_json::Value,
         queue: &[&str],
     ) {
+        write_zenith_passive_snapshot_with_metadata_and_flags(
+            paths,
+            status,
+            capture_status,
+            capture_generation,
+            userid,
+            gameid,
+            candidate_id,
+            piece_counter,
+            true,
+            paused,
+            false,
+            false,
+            None,
+            current_piece,
+            current_x,
+            current_y,
+            hold_piece,
+            queue,
+        );
+    }
+
+    fn write_zenith_passive_snapshot_with_metadata_and_flags(
+        paths: &AppPaths,
+        status: &str,
+        capture_status: &str,
+        capture_generation: u64,
+        userid: &str,
+        gameid: &str,
+        candidate_id: &str,
+        piece_counter: u32,
+        playing: bool,
+        paused: serde_json::Value,
+        destroyed: bool,
+        successful: bool,
+        gameoverreason: Option<&str>,
+        current_piece: &str,
+        current_x: serde_json::Value,
+        current_y: serde_json::Value,
+        hold_piece: serde_json::Value,
+        queue: &[&str],
+    ) {
         let path = zenith_passive_snapshot_path(paths);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -2956,12 +3101,13 @@ mod tests {
                 "userid": userid,
                 "gameid": gameid,
                 "candidate_id": candidate_id,
-                "playing": true,
+                "playing": playing,
                 "started": true,
                 "countdown_started": false,
                 "paused": paused,
-                "destroyed": false,
-                "gameoverreason": null,
+                "destroyed": destroyed,
+                "successful": successful,
+                "gameoverreason": gameoverreason,
                 "board": board,
                 "current": {
                     "type": current_piece,
@@ -2991,6 +3137,39 @@ mod tests {
             capture_status,
             piece_counter,
             paused,
+            "J",
+            json!(x),
+            json!(y),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+    }
+
+    fn write_zenith_passive_snapshot_with_state_flags(
+        paths: &AppPaths,
+        status: &str,
+        capture_status: &str,
+        piece_counter: u32,
+        playing: bool,
+        destroyed: bool,
+        successful: bool,
+        gameoverreason: Option<&str>,
+    ) {
+        let (x, y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_metadata_and_flags(
+            paths,
+            status,
+            capture_status,
+            5,
+            "user-zenith",
+            "game-zenith",
+            "candidate-1",
+            piece_counter,
+            playing,
+            json!(false),
+            destroyed,
+            successful,
+            gameoverreason,
             "J",
             json!(x),
             json!(y),
@@ -3280,7 +3459,7 @@ mod tests {
     fn zenith_live_max_pieces_defaults_to_one() {
         assert_eq!(
             LauncherState::default().effective_zenith_live_max_pieces(),
-            1
+            ZenithLivePieceLimit::Bounded(1)
         );
     }
 
@@ -3289,8 +3468,43 @@ mod tests {
         for value in ZENITH_LIVE_MAX_PIECE_OPTIONS {
             let state: LauncherState =
                 serde_json::from_value(json!({ "zenith_live_max_pieces": value })).unwrap();
-            assert_eq!(state.effective_zenith_live_max_pieces(), *value);
+            assert_eq!(
+                state.effective_zenith_live_max_pieces(),
+                ZenithLivePieceLimit::Bounded(*value)
+            );
         }
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_accepts_unlimited_value() {
+        let state: LauncherState =
+            serde_json::from_value(json!({ "zenith_live_max_pieces": "unlimited" })).unwrap();
+        assert_eq!(
+            state.effective_zenith_live_max_pieces(),
+            ZenithLivePieceLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_serializes_unlimited_explicitly() {
+        let mut state = LauncherState::default();
+        state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        let serialized = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            serialized.get("zenith_live_max_pieces"),
+            Some(&serde_json::Value::String("unlimited".to_owned()))
+        );
+    }
+
+    #[test]
+    fn zenith_live_max_pieces_serializes_bounded_values_as_numbers() {
+        let mut state = LauncherState::default();
+        state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(20);
+        let serialized = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            serialized.get("zenith_live_max_pieces"),
+            Some(&serde_json::Value::Number(20u32.into()))
+        );
     }
 
     #[test]
@@ -3304,7 +3518,10 @@ mod tests {
             json!({ "zenith_live_max_pieces": null }),
         ] {
             let state: LauncherState = serde_json::from_value(raw).unwrap();
-            assert_eq!(state.effective_zenith_live_max_pieces(), 1);
+            assert_eq!(
+                state.effective_zenith_live_max_pieces(),
+                ZenithLivePieceLimit::Bounded(1)
+            );
         }
     }
 
@@ -3500,7 +3717,7 @@ mod tests {
         app.bot_desired_enabled = true;
         app.bot_status = BotStatus::On;
         app.zenith_live.executed_pieces = 3;
-        app.zenith_live.session_max_pieces = 5;
+        app.zenith_live.session_max_pieces = ZenithLivePieceLimit::Bounded(5);
 
         app.select_mode(RuntimeMode::Zenith);
 
@@ -3509,7 +3726,10 @@ mod tests {
         assert!(!app.bot_desired_enabled);
         assert_eq!(app.bot_status, BotStatus::Off);
         assert_eq!(app.zenith_live.executed_pieces, 0);
-        assert_eq!(app.zenith_live.session_max_pieces(), 1);
+        assert_eq!(
+            app.zenith_live.session_max_pieces(),
+            ZenithLivePieceLimit::Bounded(1)
+        );
         assert!(app
             .logs
             .iter()
@@ -3815,7 +4035,7 @@ mod tests {
     fn zenith_live_completion_allows_next_piece_after_lock_acknowledgement() {
         let paths = test_paths("zenith-live-next-piece-after-complete");
         let mut app = LauncherApp::new(paths.clone());
-        app.state.zenith_live_max_pieces = 5;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(5);
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
@@ -3865,18 +4085,57 @@ mod tests {
         let paths = test_paths("zenith-live-session-max-fixed");
         let mut app = LauncherApp::new(paths.clone());
         app.state.selected_mode = RuntimeMode::Zenith;
-        app.state.zenith_live_max_pieces = 1;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(1);
         configure_zenith_runtime_ready(&mut app);
 
-        assert_eq!(app.zenith_live_max_pieces(), 1);
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Bounded(1)
+        );
 
-        app.state.zenith_live_max_pieces = 20;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(20);
 
-        assert_eq!(app.zenith_live_max_pieces(), 1);
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Bounded(1)
+        );
 
         app.stop_bot_with_browser_hint(false);
 
-        assert_eq!(app.zenith_live_max_pieces(), 20);
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Bounded(20)
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_unlimited_session_limit_is_fixed_while_bot_is_on() {
+        let paths = test_paths("zenith-live-session-unlimited-fixed");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.selected_mode = RuntimeMode::Zenith;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Unlimited
+        );
+
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(1);
+
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Unlimited
+        );
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert_eq!(
+            app.zenith_live_piece_limit(),
+            ZenithLivePieceLimit::Bounded(1)
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -3885,7 +4144,7 @@ mod tests {
     fn zenith_live_executes_exactly_five_pieces() {
         let paths = test_paths("zenith-live-five-pieces");
         let mut app = LauncherApp::new(paths.clone());
-        app.state.zenith_live_max_pieces = 5;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(5);
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
@@ -3946,7 +4205,7 @@ mod tests {
     fn zenith_live_executes_exactly_twenty_pieces() {
         let paths = test_paths("zenith-live-twenty-pieces");
         let mut app = LauncherApp::new(paths.clone());
-        app.state.zenith_live_max_pieces = 20;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(20);
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
@@ -3994,10 +4253,63 @@ mod tests {
     }
 
     #[test]
+    fn zenith_live_unlimited_dispatches_one_hundred_sequential_pieces_without_max_gate() {
+        let paths = test_paths("zenith-live-unlimited-hundred");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let counters: Vec<u32> = (0..100).collect();
+        drive_zenith_live_piece_counters(&mut app, &paths, &counters);
+
+        let dispatch_count = app
+            .zenith_live_test_hook
+            .dispatch_count
+            .load(Ordering::Relaxed);
+        assert_eq!(dispatch_count, 100);
+        assert_eq!(app.zenith_live.executed_pieces, 99);
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::AwaitingLock);
+        assert_eq!(app.zenith_live.active_piece_counter, Some(99));
+        assert!(!app.zenith_live.max_reached_logged);
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("execution suspended reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=max_pieces_reached"))
+                .count(),
+            0
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input suppressed reason=completed_piece"))
+                .count(),
+            0
+        );
+        assert!(dispatch_count > app.zenith_live.executed_pieces);
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution started") && line.contains("limit=unlimited")
+        }));
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] piece completed") && line.contains("limit=unlimited")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn zenith_live_game_change_keeps_session_execution_count() {
         let paths = test_paths("zenith-live-count-persists-across-games");
         let mut app = LauncherApp::new(paths.clone());
-        app.state.zenith_live_max_pieces = 5;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(5);
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
@@ -4148,7 +4460,7 @@ mod tests {
     fn zenith_live_aborted_piece_does_not_block_next_piece() {
         let paths = test_paths("zenith-live-abort-next-piece");
         let mut app = LauncherApp::new(paths.clone());
-        app.state.zenith_live_max_pieces = 5;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Bounded(5);
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
@@ -4239,6 +4551,164 @@ mod tests {
                 "[zenith-live] execution aborted reason=generation_mismatch piece_counter=50",
             )
         }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_bot_off_while_awaiting_lock_releases_input_and_stops_dispatch() {
+        let paths = test_paths("zenith-live-bot-off-awaiting-lock");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::AwaitingLock);
+        let release_count_before_stop = app
+            .zenith_live_test_hook
+            .release_count
+            .load(Ordering::Relaxed);
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert_eq!(app.bot_status, BotStatus::Off);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .release_count
+                .load(Ordering::Relaxed)
+                .saturating_sub(release_count_before_stop),
+            1
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_successful_snapshot_aborts_active_execution_without_replanning() {
+        let paths = test_paths("zenith-live-successful-stops");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_state_flags(
+            &paths, "ready", "running", 1, true, false, true, None,
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-live] execution started"))
+                .count(),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution aborted reason=successful piece_counter=0")
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=successful"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_not_playing_snapshot_aborts_active_execution_without_replanning() {
+        let paths = test_paths("zenith-live-playing-false-stops");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_state_flags(
+            &paths, "ready", "running", 1, false, false, false, None,
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution aborted reason=playing_false piece_counter=0")
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=not_playing"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_destroyed_snapshot_aborts_active_execution_without_replanning() {
+        let paths = test_paths("zenith-live-destroyed-stops");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_state_flags(
+            &paths, "ready", "running", 1, true, true, false, None,
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Aborted);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] execution aborted reason=destroyed piece_counter=0")
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=destroyed"));
 
         cleanup_test_paths(&paths);
     }

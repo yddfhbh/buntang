@@ -57,6 +57,7 @@ pub struct ZenithPassivePlannerSnapshot {
     pub countdown_started: bool,
     pub paused: Option<bool>,
     pub destroyed: bool,
+    pub successful: bool,
     pub gameoverreason: Option<String>,
 }
 
@@ -305,6 +306,8 @@ struct ZenithPassiveSnapshotWire {
     countdown_started: bool,
     paused: Option<bool>,
     destroyed: bool,
+    #[serde(default)]
+    successful: bool,
     gameoverreason: Option<String>,
     board: Vec<Vec<Value>>,
     current: ZenithPassiveCurrentWire,
@@ -631,6 +634,7 @@ impl Default for ZenithPassiveSnapshotWire {
             countdown_started: false,
             paused: None,
             destroyed: false,
+            successful: false,
             gameoverreason: None,
             board: Vec::new(),
             current: ZenithPassiveCurrentWire::default(),
@@ -716,6 +720,7 @@ impl ZenithPassiveSnapshotWire {
             countdown_started: self.countdown_started,
             paused: self.paused,
             destroyed: self.destroyed,
+            successful: self.successful,
             gameoverreason: self.gameoverreason.and_then(|reason| {
                 let trimmed = reason.trim().to_owned();
                 if trimmed.is_empty() {

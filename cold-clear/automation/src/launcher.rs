@@ -543,10 +543,7 @@ impl LauncherState {
     }
 
     fn normalize_pps_state(&mut self) {
-        if !self.target_pps.is_finite() || self.target_pps < 0.25 {
-            self.target_pps = 3.0;
-        }
-        self.target_pps = self.target_pps.clamp(0.25, 20.0);
+        self.target_pps = normalize_target_pps_value(self.target_pps);
         self.zenith_live_max_pieces = self.zenith_live_max_pieces.normalized();
     }
 
@@ -565,6 +562,21 @@ impl LauncherState {
 
 fn default_zenith_live_max_pieces() -> u32 {
     1
+}
+
+fn normalize_target_pps_value(target_pps: f32) -> f32 {
+    if !target_pps.is_finite() || target_pps < 0.25 {
+        3.0
+    } else {
+        target_pps.clamp(0.25, 20.0)
+    }
+}
+
+fn pacing_interval_for_target_pps(target_pps: f32) -> Option<Duration> {
+    if !target_pps.is_finite() || target_pps <= 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(1.0 / f64::from(target_pps)))
 }
 
 enum LauncherEvent {
@@ -842,6 +854,8 @@ struct ZenithLiveController {
     executed_pieces: u32,
     max_reached_logged: bool,
     session_max_pieces: ZenithLivePieceLimit,
+    session_pps_unlimited: bool,
+    session_target_pps: f32,
     startup_started_at: Option<Instant>,
     startup_first_plan_logged: bool,
     startup_first_input_logged: bool,
@@ -852,6 +866,10 @@ struct ZenithLiveController {
     active_capture_generation: Option<u64>,
     active_provider_generation: Option<u64>,
     started_at: Option<Instant>,
+    last_execution_started_at: Option<Instant>,
+    next_execution_earliest_at: Option<Instant>,
+    last_execution_game_id: Option<String>,
+    deferred_snapshot_token: Option<String>,
     last_skip_key: Option<String>,
     last_abort_key: Option<String>,
     last_completed_execution: Option<ZenithLiveExecutionIdentity>,
@@ -891,6 +909,31 @@ impl ZenithLiveController {
 
     fn session_max_pieces(&self) -> ZenithLivePieceLimit {
         self.session_max_pieces.normalized()
+    }
+
+    fn set_session_pacing(&mut self, pps_unlimited: bool, target_pps: f32) {
+        self.session_pps_unlimited = pps_unlimited;
+        self.session_target_pps = normalize_target_pps_value(target_pps);
+        self.clear_pacing_state();
+    }
+
+    fn session_target_pps(&self) -> f32 {
+        normalize_target_pps_value(self.session_target_pps)
+    }
+
+    fn session_target_pps_interval(&self) -> Option<Duration> {
+        if self.session_pps_unlimited {
+            None
+        } else {
+            pacing_interval_for_target_pps(self.session_target_pps())
+        }
+    }
+
+    fn clear_pacing_state(&mut self) {
+        self.last_execution_started_at = None;
+        self.next_execution_earliest_at = None;
+        self.last_execution_game_id = None;
+        self.deferred_snapshot_token = None;
     }
 
     fn start_startup_session(&mut self) {
@@ -938,6 +981,7 @@ impl ZenithLiveController {
         stage: ZenithLiveStage,
     ) {
         self.stage = stage;
+        self.deferred_snapshot_token = None;
         self.active_piece_counter = snapshot.snapshot.piece_counter;
         self.active_snapshot_token = Some(snapshot.snapshot.token.clone());
         self.active_game_id = Some(snapshot.gameid.clone());
@@ -947,6 +991,49 @@ impl ZenithLiveController {
         self.started_at = Some(Instant::now());
         self.clear_skip_reason();
         self.clear_abort_reason();
+    }
+
+    fn note_execution_started_for_pacing(
+        &mut self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+        now: Instant,
+    ) {
+        self.last_execution_started_at = Some(now);
+        self.last_execution_game_id = Some(snapshot.gameid.clone());
+        self.next_execution_earliest_at = self
+            .session_target_pps_interval()
+            .map(|interval| now + interval);
+        self.deferred_snapshot_token = None;
+    }
+
+    fn pacing_remaining_for_snapshot(
+        &mut self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+        now: Instant,
+    ) -> Option<Duration> {
+        if self
+            .last_execution_game_id
+            .as_deref()
+            .is_some_and(|game_id| game_id != snapshot.gameid.as_str())
+        {
+            self.clear_pacing_state();
+            return None;
+        }
+        let earliest = self.next_execution_earliest_at?;
+        let remaining = earliest.saturating_duration_since(now);
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn set_deferred_snapshot(&mut self, snapshot: &ZenithPassivePlannerSnapshot) {
+        self.deferred_snapshot_token = Some(snapshot.snapshot.token.clone());
+    }
+
+    fn is_deferred_snapshot(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
+        self.deferred_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
     }
 
     fn active_execution_identity(&self) -> Option<ZenithLiveExecutionIdentity> {
@@ -1032,6 +1119,7 @@ impl ZenithLiveController {
 struct ZenithLiveTestHook {
     dispatch_count: Arc<AtomicU32>,
     release_count: Arc<AtomicU32>,
+    started_at: Arc<Mutex<Vec<Instant>>>,
 }
 
 #[cfg(test)]
@@ -1074,6 +1162,8 @@ pub struct LauncherApp {
     zenith_live: ZenithLiveController,
     #[cfg(test)]
     zenith_live_test_hook: ZenithLiveTestHook,
+    #[cfg(test)]
+    test_now: Option<Instant>,
 }
 
 impl LauncherApp {
@@ -1106,7 +1196,17 @@ impl LauncherApp {
             zenith_live: ZenithLiveController::default(),
             #[cfg(test)]
             zenith_live_test_hook: ZenithLiveTestHook::default(),
+            #[cfg(test)]
+            test_now: None,
         }
+    }
+
+    fn monotonic_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_now {
+            return now;
+        }
+        Instant::now()
     }
 
     fn browser_logger(&self) -> SharedLogger {
@@ -1246,6 +1346,46 @@ impl LauncherApp {
         }
     }
 
+    fn zenith_live_pps_unlimited(&self) -> bool {
+        if self.state.selected_mode == RuntimeMode::Zenith
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.zenith_live.session_pps_unlimited
+        } else {
+            self.state.pps_unlimited
+        }
+    }
+
+    fn zenith_live_target_pps(&self) -> f32 {
+        if self.state.selected_mode == RuntimeMode::Zenith
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.zenith_live.session_target_pps()
+        } else {
+            normalize_target_pps_value(self.state.target_pps)
+        }
+    }
+
+    fn zenith_live_pps_interval(&self) -> Option<Duration> {
+        if self.zenith_live_pps_unlimited() {
+            None
+        } else {
+            pacing_interval_for_target_pps(self.zenith_live_target_pps())
+        }
+    }
+
+    fn zenith_live_pps_label(&self) -> String {
+        if self.zenith_live_pps_unlimited() {
+            "unlimited".to_owned()
+        } else {
+            format_target_pps_log_label(self.zenith_live_target_pps())
+        }
+    }
+
     fn zenith_live_input_allowed(&self) -> bool {
         self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
     }
@@ -1257,23 +1397,29 @@ impl LauncherApp {
 
     fn zenith_live_session_armed_log(&self) -> String {
         format!(
-            "[zenith-live] session armed limit={}",
-            self.zenith_live_piece_limit().log_label()
+            "[zenith-live] session armed limit={} pps={} interval_ms={}",
+            self.zenith_live_piece_limit().log_label(),
+            self.zenith_live_pps_label(),
+            self.zenith_live_pps_interval()
+                .map(|interval| interval.as_millis())
+                .unwrap_or(0)
         )
     }
 
     fn zenith_live_execution_started_log(&self, piece_counter: Option<u32>) -> String {
         match self.zenith_live_piece_limit() {
             ZenithLivePieceLimit::Bounded(max_pieces) => format!(
-                "[zenith-live] execution started piece_counter={} executed={} max_pieces={}",
+                "[zenith-live] execution started piece_counter={} executed={} max_pieces={} pps={}",
                 piece_counter_label(piece_counter),
                 self.zenith_live.executed_pieces,
-                max_pieces
+                max_pieces,
+                self.zenith_live_pps_label()
             ),
             ZenithLivePieceLimit::Unlimited => format!(
-                "[zenith-live] execution started piece_counter={} executed={} limit=unlimited",
+                "[zenith-live] execution started piece_counter={} executed={} limit=unlimited pps={}",
                 piece_counter_label(piece_counter),
-                self.zenith_live.executed_pieces
+                self.zenith_live.executed_pieces,
+                self.zenith_live_pps_label()
             ),
         }
     }
@@ -1388,6 +1534,31 @@ impl LauncherApp {
         }
     }
 
+    fn defer_zenith_live_input_for_pacing(
+        &mut self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+        remaining: Duration,
+    ) {
+        self.zenith_live.set_deferred_snapshot(snapshot);
+        let skip_key = format!(
+            "pps_pacing:{}:{}:{}:{}",
+            snapshot.gameid,
+            snapshot.capture_generation,
+            snapshot.candidate_id,
+            piece_counter_label(snapshot.snapshot.piece_counter)
+        );
+        if let Some(line) = self.zenith_live.note_skip(
+            &skip_key,
+            format!(
+                "[zenith-live] input deferred reason=pps_pacing remaining_ms={} piece_counter={}",
+                remaining.as_millis(),
+                piece_counter_label(snapshot.snapshot.piece_counter)
+            ),
+        ) {
+            self.push_log(line);
+        }
+    }
+
     fn cancel_zenith_live_execution(&mut self, reason: &str) {
         if !matches!(
             self.zenith_live.stage,
@@ -1410,6 +1581,20 @@ impl LauncherApp {
             self.push_log(format!("[input] failed to release all keys: {err:#}"));
         }
         self.zenith_live.mark_aborted();
+        if matches!(
+            reason,
+            "bot_off"
+                | "launcher_shutdown"
+                | "provider_owner_missing"
+                | "provider_child_exited"
+                | "capture_stopped"
+                | "playing_false"
+                | "destroyed"
+                | "successful"
+                | "gameid_changed"
+        ) {
+            self.zenith_live.clear_pacing_state();
+        }
     }
 
     fn update_zenith_live_lock_state(&mut self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
@@ -1622,6 +1807,8 @@ impl LauncherApp {
             self.zenith_dry_run.reset();
             self.zenith_live.reset();
             self.zenith_live.session_max_pieces = self.state.effective_zenith_live_max_pieces();
+            self.zenith_live
+                .set_session_pacing(self.state.pps_unlimited, self.state.target_pps);
             if self.state.selected_mode == RuntimeMode::Zenith {
                 self.zenith_live.start_startup_session();
                 self.push_log(self.zenith_live_session_armed_log());
@@ -2158,6 +2345,9 @@ impl LauncherApp {
                 "capture_stopped"
             };
             self.cancel_zenith_live_execution(reason);
+            if matches!(reason, "provider_child_exited" | "capture_stopped") {
+                self.zenith_live.clear_pacing_state();
+            }
             return;
         }
         let path = self.zenith_passive_snapshot_path();
@@ -2248,6 +2438,7 @@ impl LauncherApp {
         }
         if envelope.capture_status.as_deref() != Some("running") {
             self.cancel_zenith_live_execution("capture_stopped");
+            self.zenith_live.clear_pacing_state();
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "capture_stopped",
                 "[zenith-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
@@ -2272,6 +2463,7 @@ impl LauncherApp {
         }
         if !snapshot.playing || !snapshot.started {
             self.cancel_zenith_live_execution("playing_false");
+            self.zenith_live.clear_pacing_state();
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "not_playing",
                 "[zenith-dry-run] snapshot skipped reason=not_playing".to_owned(),
@@ -2283,6 +2475,7 @@ impl LauncherApp {
         }
         if snapshot.countdown_started {
             self.cancel_zenith_live_execution("countdown");
+            self.zenith_live.clear_pacing_state();
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "countdown",
                 "[zenith-dry-run] snapshot skipped reason=countdown".to_owned(),
@@ -2294,6 +2487,7 @@ impl LauncherApp {
         }
         if snapshot.paused == Some(true) {
             self.cancel_zenith_live_execution("paused");
+            self.zenith_live.clear_pacing_state();
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "paused",
                 "[zenith-dry-run] snapshot skipped reason=paused".to_owned(),
@@ -2310,6 +2504,7 @@ impl LauncherApp {
                 "destroyed"
             };
             self.cancel_zenith_live_execution(end_reason);
+            self.zenith_live.clear_pacing_state();
             if let Some(line) = self.zenith_dry_run.note_skip(
                 end_reason,
                 format!("[zenith-dry-run] snapshot skipped reason={end_reason}"),
@@ -2322,7 +2517,15 @@ impl LauncherApp {
         if self.update_zenith_live_lock_state(snapshot) {
             return;
         }
-        if self.zenith_dry_run.last_snapshot_token.as_deref()
+        if self.zenith_live.is_deferred_snapshot(snapshot) {
+            if let Some(remaining) = self
+                .zenith_live
+                .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
+            {
+                self.defer_zenith_live_input_for_pacing(snapshot, remaining);
+                return;
+            }
+        } else if self.zenith_dry_run.last_snapshot_token.as_deref()
             == Some(snapshot.snapshot.token.as_str())
         {
             if let Some(line) = self.zenith_dry_run.note_skip(
@@ -2396,7 +2599,13 @@ impl LauncherApp {
                     self.suppress_zenith_live_input("already_executing", piece_counter);
                 } else if snapshot.userid.trim().is_empty() {
                     self.suppress_zenith_live_input("identity_mismatch", piece_counter);
+                } else if let Some(remaining) = self
+                    .zenith_live
+                    .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
+                {
+                    self.defer_zenith_live_input_for_pacing(snapshot, remaining);
                 } else {
+                    let execution_started_at = self.monotonic_now();
                     self.zenith_live.clear_skip_reason();
                     self.push_log(format!(
                         "[zenith-live] plan accepted piece_counter={} generation={}",
@@ -2408,6 +2617,12 @@ impl LauncherApp {
                         self.passive_provider.activation_generation,
                         ZenithLiveStage::Planned,
                     );
+                    self.zenith_live
+                        .note_execution_started_for_pacing(snapshot, execution_started_at);
+                    #[cfg(test)]
+                    if let Ok(mut started_at) = self.zenith_live_test_hook.started_at.lock() {
+                        started_at.push(execution_started_at);
+                    }
                     self.push_log(self.zenith_live_execution_started_log(piece_counter));
                     self.zenith_live.stage = ZenithLiveStage::Executing;
                     match self.execute_zenith_live_plan(&config, &prepared) {
@@ -2706,15 +2921,17 @@ impl eframe::App for LauncherApp {
                 ui.label(BOT_UI_VISIBLE_LABELS[1]).on_hover_text(
                     "PPS는 초당 배치할 미노 수의 최대값입니다.\n실제 속도는 계산 및 입력 경로에 따라 더 낮을 수 있습니다.",
                 );
-                ui.add_enabled_ui(!self.state.pps_unlimited, |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.state.target_pps)
-                            .speed(0.1)
-                            .range(0.25..=20.0)
-                            .fixed_decimals(2),
-                    );
+                ui.add_enabled_ui(!bot_locked, |ui| {
+                    ui.add_enabled_ui(!self.state.pps_unlimited, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut self.state.target_pps)
+                                .speed(0.1)
+                                .range(0.25..=20.0)
+                                .fixed_decimals(2),
+                        );
+                    });
+                    ui.checkbox(&mut self.state.pps_unlimited, BOT_UI_VISIBLE_LABELS[2]);
                 });
-                ui.checkbox(&mut self.state.pps_unlimited, BOT_UI_VISIBLE_LABELS[2]);
             });
             self.state.normalize_pps_state();
             if previous_target_pps != self.state.target_pps
@@ -2887,6 +3104,20 @@ fn format_target_pps_label(target_pps: f32) -> String {
     }
 }
 
+fn format_target_pps_log_label(target_pps: f32) -> String {
+    if !target_pps.is_finite() || target_pps <= 0.0 {
+        return "unlimited".to_owned();
+    }
+    let mut label = format!("{target_pps:.2}");
+    while label.contains('.') && label.ends_with('0') {
+        label.pop();
+    }
+    if label.ends_with('.') {
+        label.pop();
+    }
+    label
+}
+
 fn piece_counter_label(piece_counter: Option<u32>) -> String {
     piece_counter
         .map(|value| value.to_string())
@@ -2978,12 +3209,24 @@ mod tests {
         app.bot_desired_enabled = true;
         app.bot_status = BotStatus::On;
         app.zenith_live.session_max_pieces = app.state.effective_zenith_live_max_pieces();
+        app.zenith_live
+            .set_session_pacing(app.state.pps_unlimited, app.state.target_pps);
         app.browser_status = BrowserStatus::Ready;
         app.input_status = InputStatus::Ready;
         app.snapshot_status = SnapshotStatus::Ready;
         let _ = app
             .passive_provider
             .request(PassiveProviderOwner::ZenithDryRun);
+    }
+
+    fn zenith_live_started_offsets_ms(app: &LauncherApp, baseline: Instant) -> Vec<u128> {
+        app.zenith_live_test_hook
+            .started_at
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|started_at| started_at.duration_since(baseline).as_millis())
+            .collect()
     }
 
     fn zenith_passive_snapshot_path(paths: &AppPaths) -> std::path::PathBuf {
@@ -4136,6 +4379,361 @@ mod tests {
             app.zenith_live_piece_limit(),
             ZenithLivePieceLimit::Bounded(1)
         );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_session_pps_is_fixed_while_bot_is_on() {
+        let paths = test_paths("zenith-live-session-pps-fixed");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.selected_mode = RuntimeMode::Zenith;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+
+        assert!(!app.zenith_live_pps_unlimited());
+        assert_eq!(app.zenith_live_target_pps(), 1.0);
+        assert_eq!(
+            app.zenith_live_pps_interval(),
+            Some(Duration::from_millis(1000))
+        );
+
+        app.state.pps_unlimited = true;
+        app.state.target_pps = 2.0;
+        app.state.normalize_pps_state();
+
+        assert!(!app.zenith_live_pps_unlimited());
+        assert_eq!(app.zenith_live_target_pps(), 1.0);
+        assert_eq!(
+            app.zenith_live_pps_interval(),
+            Some(Duration::from_millis(1000))
+        );
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert!(app.zenith_live_pps_unlimited());
+        assert_eq!(app.zenith_live_pps_interval(), None);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_one_defers_until_interval_elapses() {
+        let paths = test_paths("zenith-live-pps-one");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(999));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            zenith_live_started_offsets_ms(&app, baseline),
+            vec![0, 1000]
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input deferred reason=pps_pacing"))
+                .count(),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_two_enforces_half_second_start_interval() {
+        let paths = test_paths("zenith-live-pps-two");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 2.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(500));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(700));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 2, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            zenith_live_started_offsets_ms(&app, baseline),
+            vec![0, 500, 1000]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_quarter_enforces_four_second_start_interval() {
+        let paths = test_paths("zenith-live-pps-quarter");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 0.25;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(3999));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(4000));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            zenith_live_started_offsets_ms(&app, baseline),
+            vec![0, 4000]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_unlimited_keeps_immediate_post_lock_execution() {
+        let paths = test_paths("zenith-live-pps-unlimited");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = true;
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(100));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(zenith_live_started_offsets_ms(&app, baseline), vec![0, 100]);
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input deferred reason=pps_pacing"))
+                .count(),
+            0
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_wait_uses_latest_snapshot_when_piece_counter_advances() {
+        let paths = test_paths("zenith-live-pps-latest-snapshot");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(500));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 2, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            zenith_live_started_offsets_ms(&app, baseline),
+            vec![0, 1000]
+        );
+        assert_eq!(app.zenith_live.active_piece_counter, Some(2));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line.contains("[zenith-live] execution started piece_counter=2") }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_does_not_add_wait_after_long_piece_cycle() {
+        let paths = test_paths("zenith-live-pps-long-cycle");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(1500));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            zenith_live_started_offsets_ms(&app, baseline),
+            vec![0, 1500]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_bot_off_cancels_deferred_pacing() {
+        let paths = test_paths("zenith-live-pps-bot-off-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.stop_bot_with_browser_hint(false);
+        assert!(app.zenith_live.next_execution_earliest_at.is_none());
+        assert!(app.zenith_live.deferred_snapshot_token.is_none());
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_mode_change_cancels_deferred_pacing() {
+        let paths = test_paths("zenith-live-pps-mode-change-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.select_mode(RuntimeMode::Solo);
+        assert!(app.zenith_live.next_execution_earliest_at.is_none());
+        assert!(app.zenith_live.deferred_snapshot_token.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pps_game_end_cancels_deferred_pacing() {
+        let paths = test_paths("zenith-live-pps-game-end-reset");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 0, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 1, json!(false));
+        app.poll_zenith_dry_run();
+
+        write_zenith_passive_snapshot_with_state_flags(
+            &paths, "ready", "running", 1, true, false, true, None,
+        );
+        app.poll_zenith_dry_run();
+
+        assert!(app.zenith_live.next_execution_earliest_at.is_none());
+        assert!(app.zenith_live.deferred_snapshot_token.is_none());
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[zenith-dry-run] snapshot skipped reason=successful"));
 
         cleanup_test_paths(&paths);
     }

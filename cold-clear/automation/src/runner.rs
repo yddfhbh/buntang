@@ -152,6 +152,66 @@ where
         };
         match snapshot_option {
             Some(observed_snapshot) => {
+                let piece_cycle_started_at = Instant::now();
+                let mut observed_snapshot = observed_snapshot;
+                if let (Some(current), Some(previous)) =
+                    (observed_snapshot.snapshot.piece_counter, last_piece_counter)
+                {
+                    if current < previous {
+                        last_piece_counter = None;
+                    }
+                }
+                if let Some(reason) = skip_snapshot_reason(
+                    &observed_snapshot.snapshot,
+                    last_piece_counter,
+                    observed_snapshot.age,
+                ) {
+                    log_skip_snapshot_reason(&observed_snapshot.snapshot, reason, &mut log);
+                    thread::sleep(poll_delay);
+                    continue;
+                }
+                let target_pps = current_target_pps(config, live_target_pps);
+                if should_apply_solo_pps_wait(&observed_snapshot.snapshot) {
+                    if let Some(wait) = target_pps_wait(last_hard_drop_started_at, target_pps) {
+                        log_solo_pps_wait(wait, &mut log);
+                        log(format!(
+                            "[automation] pps_limit target_pps={:.2} cycle_ms={} elapsed_ms={} wait_ms={} before_planning",
+                            wait.target_pps,
+                            wait.target_piece_time.as_millis(),
+                            wait.elapsed.as_millis(),
+                            wait.wait.as_millis()
+                        ));
+                        if !sleep_with_stop(stop, wait.wait) {
+                            log("[automation] idle runner exit reason=stop_flag".to_owned());
+                            return Ok(());
+                        }
+                        let Some(refreshed_snapshot) = refresh_solo_snapshot_after_pps_wait(
+                            config, stop, poll_delay, &mut log,
+                        )?
+                        else {
+                            log("[bot] waiting for fresh snapshot".to_owned());
+                            thread::sleep(poll_delay);
+                            continue;
+                        };
+                        observed_snapshot = refreshed_snapshot;
+                        if let (Some(current), Some(previous)) =
+                            (observed_snapshot.snapshot.piece_counter, last_piece_counter)
+                        {
+                            if current < previous {
+                                last_piece_counter = None;
+                            }
+                        }
+                        if let Some(reason) = skip_snapshot_reason(
+                            &observed_snapshot.snapshot,
+                            last_piece_counter,
+                            observed_snapshot.age,
+                        ) {
+                            log_skip_snapshot_reason(&observed_snapshot.snapshot, reason, &mut log);
+                            thread::sleep(poll_delay);
+                            continue;
+                        }
+                    }
+                }
                 let ObservedSnapshot { snapshot, age } = observed_snapshot;
                 if snapshot.source != "browser_ws_sim" {
                     vs_sim_controller.observe_browser_snapshot(&snapshot, &mut log);
@@ -159,21 +219,11 @@ where
                 if config.play_style == crate::config::PlayStyleConfig::Speed {
                     update_state_for_snapshot(&mut sprint_state, &snapshot);
                 }
-                if let (Some(current), Some(previous)) =
-                    (snapshot.piece_counter, last_piece_counter)
-                {
-                    if current < previous {
-                        last_piece_counter = None;
-                    }
-                }
-                if let Some(reason) = skip_snapshot_reason(&snapshot, last_piece_counter, age) {
-                    log_skip_snapshot_reason(&snapshot, reason, &mut log);
-                    thread::sleep(poll_delay);
-                    continue;
-                }
-                let piece_cycle_started_at = Instant::now();
+                log_solo_snapshot_accepted(&snapshot, age, &mut log);
+                let snapshot_accepted_at = Instant::now();
                 match prepare_execution(config, &snapshot, &sprint_state, &mut log)? {
                     Some(prepared) => {
+                        log_solo_plan_ready(&snapshot, snapshot_accepted_at.elapsed(), &mut log);
                         emit_move_logs(config, &snapshot, &prepared, &mut log);
                         if snapshot.source == "browser_ws_sim"
                             && !vs_sim_controller.validate_route_preflight(&snapshot, &mut log)?
@@ -182,6 +232,13 @@ where
                             thread::sleep(poll_delay);
                             continue;
                         }
+                        let plan_ready_at = Instant::now();
+                        log_solo_execution_started(
+                            &snapshot,
+                            plan_ready_at.elapsed(),
+                            last_hard_drop_started_at.map(|started_at| started_at.elapsed()),
+                            &mut log,
+                        );
                         let input_started_at = Instant::now();
                         let executed_hold = prepared.execution_plan.hold;
                         if let Err(error) = execute_plan_until_hard_drop_with_vs_post_hold_delay(
@@ -242,16 +299,6 @@ where
                             };
                             match hard_drop_decision {
                                 HardDropDecision::Proceed => {
-                                    if !wait_for_target_pps(
-                                        last_hard_drop_started_at,
-                                        current_target_pps(config, live_target_pps),
-                                        stop,
-                                        &mut log,
-                                    ) {
-                                        log("[automation] idle runner exit reason=stop_flag"
-                                            .to_owned());
-                                        return Ok(());
-                                    }
                                     let hard_drop_started_at = Instant::now();
                                     if let Err(error) = execute_hard_drop_action(
                                         driver,
@@ -701,6 +748,14 @@ fn current_target_pps(config: &AutomationConfig, live_target_pps: Option<&Atomic
         .unwrap_or(config.target_pps)
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct TargetPpsWait {
+    target_pps: f32,
+    target_piece_time: Duration,
+    elapsed: Duration,
+    wait: Duration,
+}
+
 fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> Option<Duration> {
     let target_piece_time = target_piece_time?;
     let wait = target_piece_time.checked_sub(elapsed)?;
@@ -711,35 +766,164 @@ fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> 
     }
 }
 
-fn wait_for_target_pps<F>(
+fn target_pps_wait(
     last_hard_drop_started_at: Option<Instant>,
     target_pps: f32,
-    stop: &AtomicBool,
-    log: &mut F,
-) -> bool
+) -> Option<TargetPpsWait> {
+    let Some(target_piece_time) = target_pps_interval(target_pps) else {
+        return None;
+    };
+    let Some(last_hard_drop_started_at) = last_hard_drop_started_at else {
+        return None;
+    };
+    let elapsed = last_hard_drop_started_at.elapsed();
+    let wait = pps_wait_duration(Some(target_piece_time), elapsed)?;
+    Some(TargetPpsWait {
+        target_pps,
+        target_piece_time,
+        elapsed,
+        wait,
+    })
+}
+
+fn should_apply_solo_pps_wait(snapshot: &GameSnapshot) -> bool {
+    snapshot.source != "browser_ws_sim"
+}
+
+fn log_solo_snapshot_accepted<F>(snapshot: &GameSnapshot, age: Option<Duration>, log: &mut F)
 where
     F: FnMut(String),
 {
-    let Some(target_piece_time) = target_pps_interval(target_pps) else {
-        return true;
-    };
-    let Some(last_hard_drop_started_at) = last_hard_drop_started_at else {
-        return true;
-    };
-
-    let elapsed = last_hard_drop_started_at.elapsed();
-    let Some(wait) = pps_wait_duration(Some(target_piece_time), elapsed) else {
-        return true;
-    };
-
+    if !should_apply_solo_pps_wait(snapshot) {
+        return;
+    }
+    let current_piece = snapshot
+        .queue
+        .first()
+        .map(|piece| format!("{piece:?}"))
+        .unwrap_or_else(|| "None".to_owned());
+    let x = snapshot
+        .active
+        .as_ref()
+        .map(|active| active.x.to_string())
+        .unwrap_or_else(|| "na".to_owned());
+    let y = snapshot
+        .active
+        .as_ref()
+        .map(|active| active.y.to_string())
+        .unwrap_or_else(|| "na".to_owned());
+    let rotation = snapshot
+        .active
+        .as_ref()
+        .map(|active| format!("{:?}", active.rotation))
+        .unwrap_or_else(|| "na".to_owned());
+    let age_ms = age
+        .map(|value| value.as_millis().to_string())
+        .unwrap_or_else(|| "na".to_owned());
     log(format!(
-        "[automation] pps_limit target_pps={:.2} cycle_ms={} elapsed_ms={} wait_ms={} before_hard_drop",
-        target_pps,
-        target_piece_time.as_millis(),
-        elapsed.as_millis(),
-        wait.as_millis()
+        "[solo-timing] snapshot accepted piece_counter={} token={} current_piece={} x={} y={} rotation={} age_ms={}",
+        snapshot
+            .piece_counter
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "na".to_owned()),
+        snapshot.token,
+        current_piece,
+        x,
+        y,
+        rotation,
+        age_ms
     ));
-    sleep_with_stop(stop, wait)
+}
+
+fn log_solo_pps_wait<F>(wait: TargetPpsWait, log: &mut F)
+where
+    F: FnMut(String),
+{
+    log(format!(
+        "[solo-timing] pps wait target_pps={:.2} requested_wait_ms={} plan_already_ready=false",
+        wait.target_pps,
+        wait.wait.as_millis()
+    ));
+}
+
+fn log_solo_plan_ready<F>(snapshot: &GameSnapshot, elapsed_from_snapshot: Duration, log: &mut F)
+where
+    F: FnMut(String),
+{
+    if !should_apply_solo_pps_wait(snapshot) {
+        return;
+    }
+    log(format!(
+        "[solo-timing] plan ready piece_counter={} token={} elapsed_from_snapshot_ms={}",
+        snapshot
+            .piece_counter
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "na".to_owned()),
+        snapshot.token,
+        elapsed_from_snapshot.as_millis()
+    ));
+}
+
+fn log_solo_execution_started<F>(
+    snapshot: &GameSnapshot,
+    plan_age: Duration,
+    elapsed_since_previous_execution: Option<Duration>,
+    log: &mut F,
+) where
+    F: FnMut(String),
+{
+    if !should_apply_solo_pps_wait(snapshot) {
+        return;
+    }
+    let elapsed_since_previous_execution_ms = elapsed_since_previous_execution
+        .map(|value| value.as_millis().to_string())
+        .unwrap_or_else(|| "na".to_owned());
+    log(format!(
+        "[solo-timing] execution started piece_counter={} token={} plan_age_ms={} elapsed_since_previous_execution_ms={}",
+        snapshot
+            .piece_counter
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "na".to_owned()),
+        snapshot.token,
+        plan_age.as_millis(),
+        elapsed_since_previous_execution_ms
+    ));
+}
+
+fn refresh_solo_snapshot_after_pps_wait<F>(
+    config: &AutomationConfig,
+    stop: &AtomicBool,
+    poll_delay: Duration,
+    log: &mut F,
+) -> Result<Option<ObservedSnapshot>>
+where
+    F: FnMut(String),
+{
+    for attempt in 1..=3 {
+        if stop.load(AtomicOrdering::Relaxed) {
+            return Ok(None);
+        }
+        match read_snapshot_file_with_age(&config.snapshot_path) {
+            Ok((snapshot, age)) => {
+                return Ok(Some(ObservedSnapshot { snapshot, age }));
+            }
+            Err(error) if attempt < 3 => {
+                log(format!(
+                    "[solo-timing] snapshot refresh retry attempt={} error={:#}",
+                    attempt, error
+                ));
+                thread::sleep(poll_delay);
+            }
+            Err(error) => {
+                log(format!(
+                    "[solo-timing] snapshot refresh failed attempts={} error={:#}",
+                    attempt, error
+                ));
+                return Ok(None);
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn sleep_with_stop(stop: &AtomicBool, duration: Duration) -> bool {
@@ -2164,7 +2348,7 @@ mod tests {
         RouteProfileConfig,
     };
     use crate::driver::TimedGameAction;
-    use crate::scanner::PieceToken;
+    use crate::scanner::{ActivePieceState, PieceToken};
     use libtetris::{PieceState, RotationState, Statistics, TspinStatus};
     use std::collections::VecDeque;
     use std::fs::write;
@@ -2293,6 +2477,50 @@ mod tests {
         }
     }
 
+    struct StopAfterHardDropBackend {
+        stop: Arc<AtomicBool>,
+        hard_drop_sequences: Arc<AtomicU32>,
+        route_sequences: Arc<AtomicU32>,
+    }
+
+    impl InputBackend for StopAfterHardDropBackend {
+        fn tap(&mut self, action: GameAction, _: Duration) -> Result<()> {
+            if action == GameAction::HardDrop {
+                let count = self
+                    .hard_drop_sequences
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    + 1;
+                if count >= 2 {
+                    self.stop.store(true, AtomicOrdering::Relaxed);
+                }
+            }
+            Ok(())
+        }
+
+        fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+            if actions.len() == 1 && actions[0].action == GameAction::HardDrop {
+                let count = self
+                    .hard_drop_sequences
+                    .fetch_add(1, AtomicOrdering::Relaxed)
+                    + 1;
+                if count >= 2 {
+                    self.stop.store(true, AtomicOrdering::Relaxed);
+                }
+            } else if !actions.is_empty() {
+                self.route_sequences.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn release_all_keys(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn supports_batched_sequences(&self) -> bool {
+            true
+        }
+    }
+
     fn temp_bridge_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2351,6 +2579,36 @@ mod tests {
             countdown: false,
             active: None,
         }
+    }
+
+    fn write_runner_snapshot_file(path: &Path, snapshot: &GameSnapshot) {
+        let current = snapshot
+            .queue
+            .first()
+            .copied()
+            .expect("runner test snapshots should always include the current piece");
+        let queue = snapshot.queue.iter().copied().skip(1).collect::<Vec<_>>();
+        let raw = serde_json::json!({
+            "ok": true,
+            "source": snapshot.source,
+            "field": snapshot.field,
+            "current": current,
+            "hold": snapshot.hold,
+            "queue": queue,
+            "b2b": snapshot.b2b,
+            "combo": snapshot.combo,
+            "incoming": snapshot.incoming,
+            "pieceCounter": snapshot.piece_counter.unwrap_or_default(),
+            "linesCleared": snapshot.lines_cleared,
+            "token": snapshot.token,
+            "playing": snapshot.playing,
+            "countdown": snapshot.countdown,
+            "activeX": snapshot.active.as_ref().map(|active| active.x),
+            "activeY": snapshot.active.as_ref().map(|active| active.y),
+            "activeRotation": snapshot.active.as_ref().map(|active| active.rotation),
+        });
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write(path, serde_json::to_string(&raw).unwrap()).unwrap();
     }
 
     #[test]
@@ -3480,7 +3738,12 @@ mod tests {
 
     #[test]
     fn target_pps_interval_matches_expected_piece_times() {
+        assert_eq!(target_pps_interval(1.0), Some(Duration::from_millis(1000)));
         assert_eq!(target_pps_interval(2.0), Some(Duration::from_millis(500)));
+        assert_eq!(
+            target_pps_interval(3.0).map(|duration| duration.as_millis()),
+            Some(333)
+        );
         assert_eq!(target_pps_interval(5.0), Some(Duration::from_millis(200)));
     }
 
@@ -3517,16 +3780,113 @@ mod tests {
 
     #[test]
     fn unlimited_target_pps_has_no_intentional_wait() {
-        let stop = AtomicBool::new(false);
-        let mut logs = Vec::new();
+        assert_eq!(target_pps_wait(Some(Instant::now()), 0.0), None);
+    }
 
-        assert!(wait_for_target_pps(
-            Some(Instant::now()),
-            0.0,
-            &stop,
-            &mut |line| logs.push(line),
-        ));
-        assert!(logs.is_empty());
+    #[test]
+    fn target_pps_wait_returns_remaining_cycle_time() {
+        let wait = target_pps_wait(Some(Instant::now() - Duration::from_millis(120)), 2.0)
+            .expect("remaining PPS wait should exist");
+
+        assert_eq!(wait.target_piece_time, Duration::from_millis(500));
+        assert!(wait.elapsed >= Duration::from_millis(120));
+        assert!(wait.wait <= Duration::from_millis(380));
+        assert!(wait.wait > Duration::from_millis(0));
+    }
+
+    #[test]
+    fn solo_pps_wait_refreshes_latest_snapshot_before_planning() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let hard_drop_sequences = Arc::new(AtomicU32::new(0));
+        let route_sequences = Arc::new(AtomicU32::new(0));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_dir = temp_bridge_dir("solo-pps-refresh");
+        let snapshot_path = snapshot_dir.join("live-snapshot.json");
+
+        let first_snapshot = runner_test_snapshot("browser-1-0", 0);
+        let mut second_snapshot = runner_test_snapshot("browser-1-1", 1);
+        second_snapshot.active = Some(ActivePieceState {
+            x: 4,
+            y: 18,
+            rotation: RotationToken::North,
+        });
+        let mut refreshed_second_snapshot = second_snapshot.clone();
+        refreshed_second_snapshot.active = Some(ActivePieceState {
+            x: 4,
+            y: 15,
+            rotation: RotationToken::North,
+        });
+        write_runner_snapshot_file(&snapshot_path, &second_snapshot);
+
+        let mut config = AutomationConfig {
+            snapshot_path: snapshot_path.clone(),
+            target_pps: 10.0,
+            ..AutomationConfig::default()
+        };
+        config.tap_duration_ms = 0;
+        config.movement_tap_duration_ms = 0;
+        config.rotate_tap_duration_ms = 0;
+        config.hold_tap_duration_ms = 0;
+        config.hard_drop_tap_duration_ms = 0;
+        config.soft_drop_tap_duration_ms = 0;
+        config.movement_interval_ms = 0;
+        config.rotation_interval_ms = 0;
+        config.piece_interval_ms = 0;
+        config.hard_drop_interval_ms = 0;
+
+        let updater_path = snapshot_path.clone();
+        let updater_snapshot = refreshed_second_snapshot.clone();
+        let updater = thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(20));
+            write_runner_snapshot_file(&updater_path, &updater_snapshot);
+        });
+
+        let mut scanner = ScriptedScanner {
+            snapshots: VecDeque::from([
+                (first_snapshot, Some(Duration::ZERO)),
+                (second_snapshot, Some(Duration::ZERO)),
+            ]),
+            latest_age: None,
+        };
+        let mut backend = StopAfterHardDropBackend {
+            stop: stop.clone(),
+            hard_drop_sequences: hard_drop_sequences.clone(),
+            route_sequences: route_sequences.clone(),
+        };
+
+        run_loop_until(&config, &mut scanner, &mut backend, stop.as_ref(), {
+            let logs = logs.clone();
+            move |line| logs.lock().unwrap().push(line)
+        })
+        .unwrap();
+
+        updater.join().unwrap();
+
+        let logs = logs.lock().unwrap();
+        let pps_wait_index = logs
+            .iter()
+            .position(|line| {
+                line.contains("[solo-timing] pps wait") && line.contains("requested_wait_ms=")
+            })
+            .expect("Solo PPS wait log should be present");
+        let refreshed_snapshot_index = logs
+            .iter()
+            .position(|line| {
+                line.contains("[solo-timing] snapshot accepted piece_counter=1 token=browser-1-1")
+                    && line.contains("y=15")
+            })
+            .expect("refreshed Solo snapshot should be accepted after PPS wait");
+        let plan_ready_index = logs
+            .iter()
+            .position(|line| {
+                line.contains("[solo-timing] plan ready piece_counter=1 token=browser-1-1")
+            })
+            .expect("Solo plan should be built for the refreshed snapshot");
+
+        assert!(pps_wait_index < refreshed_snapshot_index);
+        assert!(refreshed_snapshot_index < plan_ready_index);
+        assert_eq!(route_sequences.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(hard_drop_sequences.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]

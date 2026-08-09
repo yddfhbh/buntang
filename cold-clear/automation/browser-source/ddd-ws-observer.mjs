@@ -10,6 +10,7 @@ import {
   isVsWsSimEnabled,
   markVsBridgeInactive,
   resetVsBridgeZenithAccumulator,
+  setVsBridgeConfiguredLocalUsername,
 } from "./vs-ws-bridge.mjs";
 
 const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -518,11 +519,20 @@ function normalizeModeValue(value) {
   return MODE_SOLO;
 }
 
+function normalizeModeControlScalar(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const normalized = String(value).trim();
+  return normalized ? normalized : null;
+}
+
 function createModeControllerState() {
   return {
     selectedMode: MODE_SOLO,
     botEnabled: false,
     modeGeneration: 0,
+    localTetrioUsername: null,
     zenithPrebuffer: [],
     friendlyVsPrebuffer: [],
     lastPassiveMode: "",
@@ -677,22 +687,38 @@ function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) 
   const nextMode = normalizeModeValue(control?.selectedMode);
   const nextBotEnabled = control?.botEnabled === true;
   const nextGeneration = Math.max(0, Number(control?.modeGeneration ?? 0));
+  const nextLocalTetrioUsername =
+    normalizeModeControlScalar(
+      control?.localTetrioUsername ?? control?.local_tetrio_username
+    );
   const previousMode = normalizeModeValue(modeController.selectedMode);
   const previousBotEnabled = modeController.botEnabled === true;
   const previousGeneration = Math.max(0, Number(modeController.modeGeneration ?? 0));
+  const previousLocalTetrioUsername =
+    normalizeModeControlScalar(modeController.localTetrioUsername);
   const modeChanged = previousMode !== nextMode;
   const activationChanged =
     previousBotEnabled !== nextBotEnabled || previousGeneration !== nextGeneration;
+  const localUsernameChanged =
+    previousLocalTetrioUsername !== nextLocalTetrioUsername;
+  modeController.localTetrioUsername = nextLocalTetrioUsername;
+  setVsBridgeConfiguredLocalUsername(
+    observerState?.vsBridge,
+    nextLocalTetrioUsername
+  );
   if (modeController.lastPassiveMode !== nextMode) {
     modeController.lastPassiveMode = nextMode;
     safeLog(log, `[mode] passive websocket listener active mode=${nextMode}`);
   }
-  if (!modeChanged && !activationChanged) {
+  if (!modeChanged && !activationChanged && !localUsernameChanged) {
     return false;
   }
   modeController.selectedMode = nextMode;
   modeController.botEnabled = nextBotEnabled;
   modeController.modeGeneration = nextGeneration;
+  if (!modeChanged && !activationChanged && localUsernameChanged) {
+    return true;
+  }
   if (modeChanged) {
     modeController.lastLoggedActivationKey = "";
     clearVsRuntimeState(observerState, log, onVsRoundStatus);

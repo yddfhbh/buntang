@@ -139,6 +139,22 @@ impl ProviderProcess {
         self.send_control_payload(&serialized, "quick_play_passive_provider")
     }
 
+    pub fn set_local_tetrio_username(&mut self, username: Option<&str>) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "type": "local_tetrio_username",
+            "username": Value::Null
+        });
+        if let Some(username) = username {
+            let trimmed = username.trim();
+            if !trimmed.is_empty() {
+                payload["username"] = Value::String(trimmed.to_owned());
+            }
+        }
+        let serialized = serde_json::to_vec(&payload)
+            .context("failed to encode browser provider local_tetrio_username control message")?;
+        self.send_control_payload(&serialized, "local_tetrio_username")
+    }
+
     pub fn start_prewarmed(
         paths: &AppPaths,
         config: &AutomationConfig,

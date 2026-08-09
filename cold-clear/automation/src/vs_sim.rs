@@ -32,6 +32,23 @@ pub struct VsSimulationController {
     post_lock_delay_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VsBridgeObservation {
+    pub active: bool,
+    pub sequence: u64,
+    pub captured_at_ms: u64,
+    pub round_id: String,
+    pub ready_at_ms: u64,
+    pub local_userid: Option<String>,
+    pub local_username: Option<String>,
+    pub local_game_id: String,
+    pub seed: String,
+    pub bagtype: Option<String>,
+    pub next_count: Option<usize>,
+    pub opponent_count: usize,
+    pub incoming_garbage_count: usize,
+}
+
 #[derive(Clone, Debug)]
 struct VsSimulationSession {
     round_id: String,
@@ -105,12 +122,30 @@ struct VsBridgeGarbageWire {
     owner_game_id: Option<Value>,
 }
 
+impl VsBridgeObservation {
+    fn from_bridge(bridge: &VsBridgeWire) -> Result<Self> {
+        Ok(Self {
+            active: bridge.active,
+            sequence: bridge.sequence,
+            captured_at_ms: bridge.captured_at,
+            round_id: bridge.round_id.clone(),
+            ready_at_ms: bridge.ready_at,
+            local_userid: bridge.local.userid.clone(),
+            local_username: bridge.local.username.clone(),
+            local_game_id: value_to_string(&bridge.local.gameid)
+                .context("bridge local gameid was not a scalar")?,
+            seed: value_to_string(&bridge.options.seed).context("bridge seed was not a scalar")?,
+            bagtype: bridge.options.bagtype.clone(),
+            next_count: bridge.options.nextcount.as_ref().and_then(value_to_usize),
+            opponent_count: bridge.opponents.len(),
+            incoming_garbage_count: bridge.incoming_garbage.len(),
+        })
+    }
+}
+
 impl VsSimulationController {
     pub fn new(snapshot_path: &Path) -> Self {
-        let bridge_path = snapshot_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("vs-ws-bridge.json");
+        let bridge_path = vs_bridge_path_for_snapshot(snapshot_path);
         Self::with_settings(
             std::env::var(VS_WS_SIM_ENV).ok().as_deref() == Some("1"),
             bridge_path,
@@ -571,6 +606,20 @@ impl VsSimulationController {
 
         Ok(())
     }
+}
+
+pub(crate) fn vs_bridge_path_for_snapshot(snapshot_path: &Path) -> PathBuf {
+    snapshot_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("vs-ws-bridge.json")
+}
+
+pub(crate) fn read_vs_bridge_observation(path: &Path) -> Result<Option<VsBridgeObservation>> {
+    let Some(bridge) = read_bridge_wire(path)? else {
+        return Ok(None);
+    };
+    Ok(Some(VsBridgeObservation::from_bridge(&bridge)?))
 }
 
 impl VsSimulationSession {

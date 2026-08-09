@@ -103,11 +103,18 @@ async function flushObserverWork() {
   await Promise.resolve();
 }
 
-function setObserverMode(cleanup, mode, generation = 1, botEnabled = true) {
+function setObserverMode(
+  cleanup,
+  mode,
+  generation = 1,
+  botEnabled = true,
+  localTetrioUsername = null
+) {
   cleanup.setModeControl?.({
     selectedMode: mode,
     modeGeneration: generation,
-    botEnabled
+    botEnabled,
+    localTetrioUsername
   });
 }
 
@@ -1008,7 +1015,7 @@ test("observer callback fires only when active state or roundId changes", async 
     vsSimEnabled: true,
     onVsRoundStatus: (status) => statuses.push(status)
   });
-  setObserverMode(cleanup, "friendly_vs");
+  setObserverMode(cleanup, "friendly_vs", 1, true, "hebi_");
 
   cdp.emit("Network.webSocketCreated", {
     requestId: "req-vs-1",
@@ -1079,7 +1086,7 @@ test("observer callback errors do not stop frame handling", async () => {
       throw new Error("status callback failure");
     }
   });
-  setObserverMode(cleanup, "friendly_vs");
+  setObserverMode(cleanup, "friendly_vs", 1, true, "hebi_");
 
   assert.doesNotThrow(() => {
     cdp.emit("Network.webSocketFrameReceived", {

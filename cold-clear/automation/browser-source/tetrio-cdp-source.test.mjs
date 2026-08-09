@@ -627,6 +627,45 @@ test("diagnostic capture works only in Zenith mode and does not change bot state
   }
 });
 
+test("local_tetrio_username control stores the configured username", () => {
+  const controlState = createBrowserControlState();
+
+  const applied = applyBrowserControlMessage({
+    message: {
+      type: "local_tetrio_username",
+      username: "GUEST-2E94IOLA_"
+    },
+    controlState,
+    closureCaptureState: createClosureCaptureState(),
+    nextGameReacquireState: createNextGameReacquireState(),
+    now: 1_000,
+    log: () => {}
+  });
+
+  assert.equal(applied, true);
+  assert.equal(controlState.localTetrioUsername, "GUEST-2E94IOLA_");
+});
+
+test("local_tetrio_username control clears the configured username on blank input", () => {
+  const controlState = createBrowserControlState();
+  controlState.localTetrioUsername = "GUEST-2E94IOLA_";
+
+  const applied = applyBrowserControlMessage({
+    message: {
+      type: "local_tetrio_username",
+      username: "   "
+    },
+    controlState,
+    closureCaptureState: createClosureCaptureState(),
+    nextGameReacquireState: createNextGameReacquireState(),
+    now: 1_000,
+    log: () => {}
+  });
+
+  assert.equal(applied, true);
+  assert.equal(controlState.localTetrioUsername, null);
+});
+
 test("zenith passive owner starts while bot is enabled and avoids manual artifacts", () => {
   const controlState = createBrowserControlState();
   const paths = makeQuickPlayDiagnosticTempPaths();

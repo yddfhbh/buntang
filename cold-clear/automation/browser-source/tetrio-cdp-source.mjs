@@ -1323,7 +1323,8 @@ export function createBrowserControlState() {
   return {
     botEnabled: false,
     selectedMode: RUNTIME_MODE_SOLO,
-    modeGeneration: 0
+    modeGeneration: 0,
+    localTetrioUsername: null
   };
 }
 
@@ -9658,6 +9659,14 @@ export function applyBrowserControlMessage({
       bootstrapReady
     });
   }
+  if (message.type === "local_tetrio_username") {
+    const nextUsername = normalizedScalar(message.username) ?? null;
+    if ((controlState.localTetrioUsername ?? null) === nextUsername) {
+      return false;
+    }
+    controlState.localTetrioUsername = nextUsername;
+    return true;
+  }
   if (message.type === "selected_mode") {
     const nextMode = normalizeRuntimeMode(message.mode);
     const nextGeneration = Math.max(0, Number(message.generation ?? 0));
@@ -10222,7 +10231,8 @@ async function main() {
       dddWsObserverCleanup?.setModeControl?.({
         selectedMode: normalizeRuntimeMode(browserControlState.selectedMode),
         botEnabled: Boolean(browserControlState.botEnabled),
-        modeGeneration: Math.max(0, Number(browserControlState.modeGeneration ?? 0))
+        modeGeneration: Math.max(0, Number(browserControlState.modeGeneration ?? 0)),
+        localTetrioUsername: browserControlState.localTetrioUsername ?? null
       });
     } catch {}
   };
@@ -10485,6 +10495,9 @@ async function main() {
       bootstrapReady: isBootstrapReadyForClosureCapture(bootstrapState),
       log: (entry) => console.log(entry)
     });
+    if (message?.type === "local_tetrio_username") {
+      notifyObserverModeControl();
+    }
     if (message?.type === "bot_enabled" && message.enabled === false) {
       void releaseQuickPlayPassiveState(cdp, quickPlayDiagnosticState, {
         reason: "bot_off",

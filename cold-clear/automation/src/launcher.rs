@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use eframe::egui;
@@ -30,6 +30,7 @@ use crate::scanner::{
     read_snapshot_file, read_zenith_passive_snapshot_file_with_age, JsonFileScanner,
     ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
 };
+use crate::vs_sim::{read_vs_bridge_observation, vs_bridge_path_for_snapshot};
 
 const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Play Style",
@@ -736,6 +737,214 @@ impl BotSession {
 }
 
 #[derive(Clone, Debug, Default)]
+struct FriendlyVsObserver {
+    armed: bool,
+    awaiting_first_fresh_bridge: bool,
+    armed_at_ms: Option<u64>,
+    baseline_sequence: Option<u64>,
+    baseline_captured_at_ms: Option<u64>,
+    baseline_signature: Option<String>,
+    last_fresh_sequence: Option<u64>,
+    last_fresh_captured_at_ms: Option<u64>,
+    last_fresh_signature: Option<String>,
+    last_waiting_reason: Option<String>,
+    last_bridge_error: Option<String>,
+    last_round_id: Option<String>,
+    last_identity_signature: Option<String>,
+    last_options_signature: Option<String>,
+    last_active_signature: Option<String>,
+    active_round_id: Option<String>,
+}
+
+impl FriendlyVsObserver {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn note_armed(
+        &mut self,
+        armed_at_ms: u64,
+        baseline: Option<&crate::vs_sim::VsBridgeObservation>,
+    ) -> Option<String> {
+        if self.armed {
+            return None;
+        }
+        self.armed = true;
+        self.awaiting_first_fresh_bridge = true;
+        self.armed_at_ms = Some(armed_at_ms);
+        self.baseline_sequence = baseline.map(|value| value.sequence);
+        self.baseline_captured_at_ms = baseline.map(|value| value.captured_at_ms);
+        self.baseline_signature = baseline.map(Self::observation_signature);
+        self.last_fresh_sequence = None;
+        self.last_fresh_captured_at_ms = None;
+        self.last_fresh_signature = None;
+        Some("[friendly-vs] observer armed".to_owned())
+    }
+
+    fn note_stopped(&mut self) -> Option<String> {
+        if !self.armed {
+            self.reset();
+            return None;
+        }
+        self.reset();
+        Some("[friendly-vs] observer stopped".to_owned())
+    }
+
+    fn note_waiting(&mut self, reason: &str) -> Option<String> {
+        self.clear_ready_state();
+        if self.last_waiting_reason.as_deref() == Some(reason) {
+            return None;
+        }
+        self.last_waiting_reason = Some(reason.to_owned());
+        Some(format!("[friendly-vs] waiting reason={reason}"))
+    }
+
+    fn note_bridge_error(&mut self, error: &str) -> Option<String> {
+        if self.last_bridge_error.as_deref() == Some(error) {
+            return None;
+        }
+        self.last_bridge_error = Some(error.to_owned());
+        Some(format!(
+            "[friendly-vs] waiting reason=bridge_unavailable error={error}"
+        ))
+    }
+
+    fn observe_round(&mut self, round_id: &str) -> Option<String> {
+        if self.last_round_id.as_deref() == Some(round_id) {
+            return None;
+        }
+        let ended = self
+            .active_round_id
+            .take()
+            .filter(|previous| previous != round_id)
+            .map(|previous| format!("[friendly-vs] round ended round_id={previous}"));
+        self.last_round_id = Some(round_id.to_owned());
+        self.last_identity_signature = None;
+        self.last_options_signature = None;
+        self.last_active_signature = None;
+        self.last_bridge_error = None;
+        ended
+    }
+
+    fn observe_fresh_bridge(&mut self, observation: &crate::vs_sim::VsBridgeObservation) {
+        self.awaiting_first_fresh_bridge = false;
+        self.last_fresh_sequence = Some(observation.sequence);
+        self.last_fresh_captured_at_ms = Some(observation.captured_at_ms);
+        self.last_fresh_signature = Some(Self::observation_signature(observation));
+        self.last_bridge_error = None;
+    }
+
+    fn is_fresh_bridge(&self, observation: &crate::vs_sim::VsBridgeObservation) -> bool {
+        if !self.awaiting_first_fresh_bridge {
+            return true;
+        }
+        let observation_signature = Self::observation_signature(observation);
+        let reference_signature = self
+            .last_fresh_signature
+            .as_deref()
+            .or(self.baseline_signature.as_deref());
+        if reference_signature == Some(observation_signature.as_str()) {
+            return false;
+        }
+
+        let armed_at_ms = self.armed_at_ms.unwrap_or(0);
+        let reference_sequence = self.last_fresh_sequence.or(self.baseline_sequence);
+        let reference_captured_at_ms = self
+            .last_fresh_captured_at_ms
+            .or(self.baseline_captured_at_ms)
+            .unwrap_or(0);
+        let sequence_advanced = reference_sequence
+            .map(|value| observation.sequence > value)
+            .unwrap_or(false);
+        if sequence_advanced {
+            return observation.captured_at_ms >= armed_at_ms.max(reference_captured_at_ms);
+        }
+        observation.captured_at_ms > reference_captured_at_ms
+            && observation.captured_at_ms >= armed_at_ms
+    }
+
+    fn clear_ready_state(&mut self) {
+        self.last_identity_signature = None;
+        self.last_options_signature = None;
+        self.last_active_signature = None;
+        self.active_round_id = None;
+    }
+
+    fn observation_signature(observation: &crate::vs_sim::VsBridgeObservation) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            observation.sequence,
+            observation.captured_at_ms,
+            observation.round_id,
+            observation.local_userid.as_deref().unwrap_or(""),
+            observation.local_username.as_deref().unwrap_or(""),
+            observation.local_game_id,
+            observation.seed,
+            observation.opponent_count
+        )
+    }
+
+    fn note_identity_ready(
+        &mut self,
+        userid: &str,
+        gameid: &str,
+        round_id: &str,
+    ) -> Option<String> {
+        let signature = format!("{userid}|{gameid}|{round_id}");
+        if self.last_identity_signature.as_deref() == Some(signature.as_str()) {
+            return None;
+        }
+        self.last_identity_signature = Some(signature);
+        self.last_waiting_reason = None;
+        Some(format!(
+            "[friendly-vs] identity ready userid={userid} gameid={gameid} round_id={round_id}"
+        ))
+    }
+
+    fn note_options_ready(
+        &mut self,
+        seed: &str,
+        bagtype: &str,
+        nextcount: usize,
+    ) -> Option<String> {
+        let signature = format!("{seed}|{bagtype}|{nextcount}");
+        if self.last_options_signature.as_deref() == Some(signature.as_str()) {
+            return None;
+        }
+        self.last_options_signature = Some(signature);
+        Some(format!(
+            "[friendly-vs] options ready seed={seed} bagtype={bagtype} nextcount={nextcount}"
+        ))
+    }
+
+    fn note_round_active(
+        &mut self,
+        round_id: &str,
+        opponents: usize,
+        incoming_garbage: usize,
+    ) -> Option<String> {
+        let signature = format!("{round_id}|{opponents}|{incoming_garbage}");
+        if self.last_active_signature.as_deref() == Some(signature.as_str()) {
+            return None;
+        }
+        self.last_active_signature = Some(signature);
+        self.active_round_id = Some(round_id.to_owned());
+        Some(format!(
+            "[friendly-vs] round active opponents={opponents} incoming_garbage={incoming_garbage}"
+        ))
+    }
+
+    fn note_round_ended(&mut self, round_id: &str) -> Option<String> {
+        if self.active_round_id.as_deref() != Some(round_id) {
+            return None;
+        }
+        self.active_round_id = None;
+        self.last_active_signature = None;
+        Some(format!("[friendly-vs] round ended round_id={round_id}"))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct ZenithDryRunController {
     last_game_id: Option<String>,
     last_capture_generation: Option<u64>,
@@ -1172,6 +1381,7 @@ pub struct LauncherApp {
     bot_desired_enabled: bool,
     bot_waiting_for_next_game: bool,
     bot_restart_pending: bool,
+    friendly_vs: FriendlyVsObserver,
     passive_provider: PassiveProviderController,
     zenith_dry_run: ZenithDryRunController,
     zenith_live: ZenithLiveController,
@@ -1206,6 +1416,7 @@ impl LauncherApp {
             bot_desired_enabled: false,
             bot_waiting_for_next_game: false,
             bot_restart_pending: false,
+            friendly_vs: FriendlyVsObserver::default(),
             passive_provider: PassiveProviderController::default(),
             zenith_dry_run: ZenithDryRunController::default(),
             zenith_live: ZenithLiveController::default(),
@@ -1347,6 +1558,25 @@ impl LauncherApp {
             synced &= self.sync_passive_provider_username_hint_for_owner(owner);
         }
         synced
+    }
+
+    fn sync_browser_local_tetrio_username(&mut self) -> bool {
+        let username_hint = self.local_tetrio_username_hint();
+        let Some(session) = self.browser_session.as_mut() else {
+            return true;
+        };
+        match session
+            .snapshot_provider
+            .set_local_tetrio_username(username_hint.as_deref())
+        {
+            Ok(()) => true,
+            Err(err) => {
+                self.push_log(format!(
+                    "[browser] failed to forward local_tetrio_username to snapshot provider: {err:#}"
+                ));
+                false
+            }
+        }
     }
 
     fn zenith_live_piece_limit(&self) -> ZenithLivePieceLimit {
@@ -1723,6 +1953,13 @@ impl LauncherApp {
                 "[browser] failed to forward selected mode to snapshot provider: {err:#}"
             ));
         }
+        if let Err(err) =
+            snapshot_provider.set_local_tetrio_username(self.local_tetrio_username_hint().as_deref())
+        {
+            self.push_log(format!(
+                "[browser] failed to forward local_tetrio_username to snapshot provider: {err:#}"
+            ));
+        }
 
         self.push_log("[input] connecting");
         let input_backend = match BrowserCdpInputBackend::shared(&self.paths, &config) {
@@ -1785,6 +2022,7 @@ impl LauncherApp {
                 self.save_state();
                 self.push_log("[launcher] bot on");
             }
+            self.sync_browser_local_tetrio_username();
             if self.state.selected_mode == RuntimeMode::Zenith {
                 self.sync_requested_passive_provider_username_hint();
             }
@@ -2311,6 +2549,30 @@ impl LauncherApp {
             .resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
     }
 
+    fn friendly_vs_bridge_path(&self) -> std::path::PathBuf {
+        let snapshot_path = self.paths.resolve_workspace_path(&self.state.snapshot_path);
+        vs_bridge_path_for_snapshot(&snapshot_path)
+    }
+
+    fn friendly_vs_runtime_ready(&self) -> bool {
+        self.state.selected_mode == RuntimeMode::FriendlyVs
+            && self.bot_desired_enabled
+            && self.bot_status == BotStatus::On
+            && self.browser_status == BrowserStatus::Ready
+            && self.input_status == InputStatus::Ready
+            && matches!(
+                self.snapshot_status,
+                SnapshotStatus::WaitingForGame | SnapshotStatus::Ready
+            )
+    }
+
+    fn current_wall_clock_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0)
+    }
+
     fn zenith_passive_snapshot_file_signature(&self, path: &std::path::Path) -> String {
         match fs::metadata(path) {
             Ok(metadata) => {
@@ -2323,6 +2585,102 @@ impl LauncherApp {
                 format!("len={} modified_ms={modified_ms}", metadata.len())
             }
             Err(err) => format!("metadata_error={:?}", err.kind()),
+        }
+    }
+
+    fn poll_friendly_vs_observer(&mut self) {
+        if self.state.selected_mode != RuntimeMode::FriendlyVs || !self.bot_desired_enabled {
+            if let Some(line) = self.friendly_vs.note_stopped() {
+                self.push_log(line);
+            }
+            return;
+        }
+        if self.bot_status != BotStatus::On || !self.friendly_vs_runtime_ready() {
+            if let Some(line) = self.friendly_vs.note_stopped() {
+                self.push_log(line);
+            }
+            return;
+        }
+        let path = self.friendly_vs_bridge_path();
+        let observation = match read_vs_bridge_observation(&path) {
+            Ok(Some(observation)) => observation,
+            Ok(None) => {
+                if let Some(line) = self
+                    .friendly_vs
+                    .note_armed(self.current_wall_clock_ms(), None)
+                {
+                    self.push_log(line);
+                }
+                if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
+                    self.push_log(line);
+                }
+                return;
+            }
+            Err(err) => {
+                if let Some(line) = self
+                    .friendly_vs
+                    .note_armed(self.current_wall_clock_ms(), None)
+                {
+                    self.push_log(line);
+                }
+                let error = format!("{err:#}");
+                if let Some(line) = self.friendly_vs.note_bridge_error(&error) {
+                    self.push_log(line);
+                }
+                return;
+            }
+        };
+        if let Some(line) = self
+            .friendly_vs
+            .note_armed(self.current_wall_clock_ms(), Some(&observation))
+        {
+            self.push_log(line);
+        }
+        if !self.friendly_vs.is_fresh_bridge(&observation) {
+            if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
+                self.push_log(line);
+            }
+            return;
+        }
+        self.friendly_vs.observe_fresh_bridge(&observation);
+        if let Some(line) = self.friendly_vs.observe_round(&observation.round_id) {
+            self.push_log(line);
+        }
+        let Some(local_userid) = observation
+            .local_userid
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            self.friendly_vs.clear_ready_state();
+            return;
+        };
+        if let Some(line) = self.friendly_vs.note_identity_ready(
+            local_userid,
+            &observation.local_game_id,
+            &observation.round_id,
+        ) {
+            self.push_log(line);
+        }
+        let bagtype = observation.bagtype.as_deref().unwrap_or("missing");
+        let nextcount = observation.next_count.unwrap_or_default();
+        if let Some(line) =
+            self.friendly_vs
+                .note_options_ready(&observation.seed, bagtype, nextcount)
+        {
+            self.push_log(line);
+        }
+        let round_live =
+            observation.active && self.current_wall_clock_ms() >= observation.ready_at_ms;
+        if round_live {
+            if let Some(line) = self.friendly_vs.note_round_active(
+                &observation.round_id,
+                observation.opponent_count,
+                observation.incoming_garbage_count,
+            ) {
+                self.push_log(line);
+            }
+        } else if let Some(line) = self.friendly_vs.note_round_ended(&observation.round_id) {
+            self.push_log(line);
         }
     }
 
@@ -2738,6 +3096,22 @@ impl LauncherApp {
         self.start_bot_with_mode(BotStartMode::AutoResume);
     }
 
+    fn mirror_friendly_vs_browser_log(&mut self, line: &str) {
+        if self.state.selected_mode != RuntimeMode::FriendlyVs || !self.bot_desired_enabled {
+            return;
+        }
+        let Some(reason) = line.strip_prefix("[vs-bridge] waiting reason=") else {
+            return;
+        };
+        let reason = reason.split_whitespace().next().unwrap_or("").trim();
+        if reason.is_empty() {
+            return;
+        }
+        if let Some(line) = self.friendly_vs.note_waiting(reason) {
+            self.push_log(line);
+        }
+    }
+
     fn poll_events(&mut self) {
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
@@ -2746,7 +3120,10 @@ impl LauncherApp {
 
         for event in events {
             match event {
-                LauncherEvent::BrowserLog(line) => self.push_log(line),
+                LauncherEvent::BrowserLog(line) => {
+                    self.mirror_friendly_vs_browser_log(&line);
+                    self.push_log(line);
+                }
                 LauncherEvent::BrowserExited(result) => {
                     self.handle_browser_exited(result);
                 }
@@ -2819,6 +3196,7 @@ impl eframe::App for LauncherApp {
         self.poll_browser_runtime();
         self.poll_events();
         self.maybe_resume_bot_runner();
+        self.poll_friendly_vs_observer();
         self.poll_zenith_dry_run();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
@@ -2872,6 +3250,7 @@ impl eframe::App for LauncherApp {
                         .hint_text("exact username"),
                 );
                 if response.changed() && self.browser_session.is_some() {
+                    self.sync_browser_local_tetrio_username();
                     self.sync_requested_passive_provider_username_hint();
                 }
             });
@@ -2929,6 +3308,9 @@ impl eframe::App for LauncherApp {
                     }
                 }
             });
+            if self.state.selected_mode == RuntimeMode::FriendlyVs {
+                ui.small("Friendly VS: Passive");
+            }
             ui.horizontal(|ui| {
                 ui.label(BOT_UI_VISIBLE_LABELS[0]);
                 ui.add_enabled_ui(!bot_locked, |ui| {
@@ -3237,6 +3619,81 @@ mod tests {
 
     fn cleanup_test_paths(paths: &AppPaths) {
         let _ = fs::remove_dir_all(&paths.workspace_root);
+    }
+
+    fn friendly_vs_bridge_path(paths: &AppPaths) -> std::path::PathBuf {
+        let snapshot_path = paths.resolve_workspace_path("automation/live-snapshot.json");
+        vs_bridge_path_for_snapshot(&snapshot_path)
+    }
+
+    fn configure_friendly_vs_runtime_ready(app: &mut LauncherApp) {
+        app.state.selected_mode = RuntimeMode::FriendlyVs;
+        app.browser_status = BrowserStatus::Ready;
+        app.input_status = InputStatus::Ready;
+        app.snapshot_status = SnapshotStatus::Ready;
+    }
+
+    fn write_friendly_vs_bridge(
+        paths: &AppPaths,
+        sequence: u64,
+        round_id: &str,
+        active: bool,
+        captured_at: u64,
+        ready_at: u64,
+        local_userid: &str,
+        local_username: &str,
+        local_gameid: i64,
+        seed: i64,
+        nextcount: i64,
+        opponent_gameids: &[i64],
+        incoming_garbage_count: usize,
+    ) {
+        let path = friendly_vs_bridge_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let opponents = opponent_gameids
+            .iter()
+            .enumerate()
+            .map(|(index, gameid)| {
+                json!({
+                    "username": format!("guest-{index}"),
+                    "userid": format!("guest-id-{index}"),
+                    "gameid": gameid
+                })
+            })
+            .collect::<Vec<_>>();
+        let incoming_garbage = (0..incoming_garbage_count)
+            .map(|index| {
+                json!({
+                    "ownerGameId": opponent_gameids.first().copied().unwrap_or(9001),
+                    "eventType": "garbage",
+                    "data": { "amt": index + 1 }
+                })
+            })
+            .collect::<Vec<_>>();
+        let raw = json!({
+            "version": 1,
+            "sequence": sequence,
+            "roundId": round_id,
+            "active": active,
+            "capturedAt": captured_at,
+            "readyAt": ready_at,
+            "readyOffsetMs": 3000,
+            "local": {
+                "username": local_username,
+                "userid": local_userid,
+                "gameid": local_gameid
+            },
+            "opponents": opponents,
+            "options": {
+                "seed": seed,
+                "bagtype": "7-bag",
+                "nextcount": nextcount
+            },
+            "incomingGarbage": incoming_garbage
+        });
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
     }
 
     fn configure_zenith_runtime_ready(app: &mut LauncherApp) {
@@ -3648,6 +4105,495 @@ mod tests {
         assert_eq!(state.selected_mode, RuntimeMode::Solo);
         assert!(!state.bot_enabled);
         assert_eq!(state.mode_generation, 0);
+    }
+
+    #[test]
+    fn friendly_vs_bot_on_arms_passive_observer_without_runner() {
+        let paths = test_paths("friendly-vs-observer-only");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+
+        app.start_bot();
+        app.poll_friendly_vs_observer();
+
+        assert_eq!(app.bot_status, BotStatus::On);
+        assert!(app.bot_desired_enabled);
+        assert!(app.bot_session.is_none());
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs] observer armed"));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[bot] planner started")));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[zenith-live] input dispatched")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_bot_off_keeps_observer_inactive() {
+        let paths = test_paths("friendly-vs-bot-off");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+
+        app.poll_friendly_vs_observer();
+
+        assert!(!app.friendly_vs.armed);
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.starts_with("[friendly-vs] observer")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_waiting_reason_is_mirrored_once() {
+        let paths = test_paths("friendly-vs-waiting");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        app.poll_friendly_vs_observer();
+
+        app.event_tx
+            .send(LauncherEvent::BrowserLog(
+                "[vs-bridge] waiting reason=self_user_missing".to_owned(),
+            ))
+            .unwrap();
+        app.event_tx
+            .send(LauncherEvent::BrowserLog(
+                "[vs-bridge] waiting reason=self_user_missing".to_owned(),
+            ))
+            .unwrap();
+        app.poll_events();
+
+        let waiting_logs = app
+            .logs
+            .iter()
+            .filter(|line| line.as_str() == "[friendly-vs] waiting reason=self_user_missing")
+            .count();
+        assert_eq!(waiting_logs, 1);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_stale_bridge_is_not_promoted_until_fresh_sequence_advances() {
+        let paths = test_paths("friendly-vs-stale-baseline");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            10,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_sub(500),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            0,
+        );
+
+        app.poll_friendly_vs_observer();
+        app.poll_friendly_vs_observer();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs] observer armed"));
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.as_str() == "[friendly-vs] waiting reason=bridge_not_fresh")
+                .count(),
+            1
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs] identity ready")));
+
+        write_friendly_vs_bridge(
+            &paths,
+            11,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_add(60_000),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            0,
+        );
+
+        app.poll_friendly_vs_observer();
+
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] identity ready userid=local-id gameid=7001 round_id=7001:1744077373"
+        }));
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] options ready seed=1744077373 bagtype=7-bag nextcount=5"
+        }));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("gameid=8002 round_id=7001:1744077373")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_admitted_bridge_same_sequence_stays_ready_until_round_active() {
+        let paths = test_paths("friendly-vs-same-sequence-ready-at");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            10,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_sub(500),
+            now_ms.saturating_sub(1),
+            "stale-id",
+            "stale-user",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_bridge(
+            &paths,
+            11,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_add(250),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            2,
+        );
+        app.poll_friendly_vs_observer();
+        app.poll_friendly_vs_observer();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.as_str()
+                        == "[friendly-vs] identity ready userid=local-id gameid=7001 round_id=7001:1744077373"
+                })
+                .count(),
+            1
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"));
+
+        std::thread::sleep(Duration::from_millis(300));
+        app.poll_friendly_vs_observer();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_fresh_unresolved_bridge_does_not_promote_stale_identity() {
+        let paths = test_paths("friendly-vs-fresh-unresolved");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            10,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_sub(500),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            2,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_bridge(
+            &paths,
+            11,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_add(60_000),
+            "",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            2,
+        );
+        app.poll_friendly_vs_observer();
+        app.event_tx
+            .send(LauncherEvent::BrowserLog(
+                "[vs-bridge] waiting reason=local_player_unresolved".to_owned(),
+            ))
+            .unwrap();
+        app.poll_events();
+
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs] identity ready")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs] waiting reason=local_player_unresolved" }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_round_lifecycle_resets_on_new_round() {
+        let paths = test_paths("friendly-vs-round-lifecycle");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            10,
+            "6999:1744077000",
+            true,
+            now_ms.saturating_sub(500),
+            now_ms.saturating_sub(1),
+            "stale-id",
+            "stale-user",
+            6999,
+            1744077000,
+            5,
+            &[7998],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_bridge(
+            &paths,
+            11,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            2,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_bridge(
+            &paths,
+            12,
+            "7001:1744077373",
+            false,
+            now_ms.saturating_add(2_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            2,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_bridge(
+            &paths,
+            13,
+            "7003:1744077374",
+            true,
+            now_ms.saturating_add(3_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7003,
+            1744077374,
+            5,
+            &[8004, 8005],
+            1,
+        );
+        app.poll_friendly_vs_observer();
+
+        assert!(!app.logs.iter().any(|line| {
+            line == "[friendly-vs] identity ready userid=stale-id gameid=6999 round_id=6999:1744077000"
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs] round active opponents=1 incoming_garbage=2" }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs] round ended round_id=7001:1744077373"));
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] identity ready userid=local-id gameid=7003 round_id=7003:1744077374"
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs] round active opponents=2 incoming_garbage=1" }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_rearm_requires_fresh_sequence_before_ready() {
+        let paths = test_paths("friendly-vs-rearm-freshness");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            10,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_sub(500),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            0,
+        );
+
+        app.start_bot();
+        app.poll_friendly_vs_observer();
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs] identity ready")));
+
+        app.stop_bot_with_browser_hint(false);
+        app.poll_friendly_vs_observer();
+
+        app.start_bot();
+        app.poll_friendly_vs_observer();
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs] identity ready"))
+                .count(),
+            0
+        );
+
+        write_friendly_vs_bridge(
+            &paths,
+            11,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_add(60_000),
+            "local-id",
+            "hebi_",
+            7001,
+            1744077373,
+            5,
+            &[8002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs] identity ready"))
+                .count(),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_mode_change_stops_observer_and_clears_state() {
+        let paths = test_paths("friendly-vs-mode-change");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        app.poll_friendly_vs_observer();
+
+        app.select_mode(RuntimeMode::Solo);
+        app.poll_friendly_vs_observer();
+
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs] observer stopped"));
+        assert!(!app.friendly_vs.armed);
+
+        cleanup_test_paths(&paths);
     }
 
     #[test]

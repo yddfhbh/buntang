@@ -14,6 +14,7 @@ import {
   ingestVsBridgeRoot,
   markVsBridgeInactive,
   resetVsBridgeZenithAccumulator,
+  setVsBridgeConfiguredLocalUsername,
   updateVsBridgeState,
   writeVsBridgeFile
 } from "./vs-ws-bridge.mjs";
@@ -32,6 +33,11 @@ function cleanupTempDir(dir) {
 
 function readJson(filePath) {
   return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+function configureFriendlyVsLocalUsername(state, username) {
+  setVsBridgeConfiguredLocalUsername(state, username);
+  return state;
 }
 
 function packetA(overrides = {}) {
@@ -212,7 +218,9 @@ test("createVsBridgeState logs its enabled absolute bridge path", () => {
 });
 
 test("deriveVsRoundBridge identifies local player and ignores room seed for round seed", () => {
-  const bridge = deriveVsRoundBridge(combinedRoundRoot(), 1783780572968);
+  const bridge = deriveVsRoundBridge(combinedRoundRoot(), 1783780572968, {
+    configuredLocalUsername: "hebi_"
+  });
 
   assert.ok(bridge);
   assert.equal(bridge.bridge.local.username, "hebi_");
@@ -232,7 +240,9 @@ test("deriveVsRoundBridge identifies local player and ignores room seed for roun
 
 test("deriveVsRoundBridge computes readyAt from room countdown options", () => {
   const capturedAt = 1783780572968;
-  const result = deriveVsRoundBridge(combinedRoundRoot(), capturedAt);
+  const result = deriveVsRoundBridge(combinedRoundRoot(), capturedAt, {
+    configuredLocalUsername: "hebi_"
+  });
 
   assert.ok(result);
   assert.equal(result.bridge.readyAt, capturedAt + 3000);
@@ -745,6 +755,413 @@ test("roster root.user is treated as participant, not self", () => {
   assert.equal(state.lastWaitingReason, "self_user_missing");
 });
 
+test("username-only root.user is never promoted to self even when round players exist", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        username: "[sys]"
+      },
+      players: [
+        {
+          userid: "local-id",
+          username: "hebi_",
+          gameid: 6328,
+          options: {
+            gameid: 6328,
+            seed: 1744077373,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "guest-id",
+          username: "guest",
+          gameid: 6329,
+          options: {
+            gameid: 6329,
+            seed: 1744077373,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.sessionSelfIdentity.username, null);
+});
+
+test("username-only root.user with arbitrary name is never promoted to self", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        username: "totally-random-name"
+      },
+      players: [
+        {
+          userid: "local-id",
+          username: "hebi_",
+          gameid: 6428,
+          options: {
+            gameid: 6428,
+            seed: 1744077374,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "guest-id",
+          username: "guest",
+          gameid: 6429,
+          options: {
+            gameid: 6429,
+            seed: 1744077374,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.sessionSelfIdentity.username, null);
+});
+
+test("configured local username resolves the matching round participant", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  configureFriendlyVsLocalUsername(state, "GUEST-2E94IOLA_");
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      players: [
+        {
+          userid: "A",
+          username: "hebi_",
+          gameid: 10,
+          options: {
+            gameid: 10,
+            seed: 1744077375,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "B",
+          username: "GUEST-2E94IOLA_",
+          gameid: 11,
+          options: {
+            gameid: 11,
+            seed: 1744077375,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.current.local.userid, "B");
+  assert.equal(state.current.local.gameid, 11);
+});
+
+test("explicit local root.user marker remains authoritative", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        username: "explicit-local",
+        local: true
+      },
+      players: [
+        {
+          userid: "other-id",
+          username: "other",
+          gameid: 6628,
+          options: {
+            gameid: 6628,
+            seed: 1744077376,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "guest-id",
+          username: "guest",
+          gameid: 6629,
+          options: {
+            gameid: 6629,
+            seed: 1744077376,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.username, "explicit-local");
+  assert.equal(state.sessionSelfIdentity.source, "root.user");
+});
+
+test("participant root.user cannot promote a different roster user to self", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  configureFriendlyVsLocalUsername(state, "GUEST-2E94IOLA_");
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        _id: "A",
+        username: "hebi_"
+      },
+      players: [
+        {
+          userid: "A",
+          username: "hebi_",
+          gameid: 10,
+          options: {
+            gameid: 10,
+            seed: 1744077377,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "B",
+          username: "GUEST-2E94IOLA_",
+          gameid: 11,
+          options: {
+            gameid: 11,
+            seed: 1744077377,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.current.local.userid, "B");
+});
+
+test("configured local username waits when no round participant matches", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  configureFriendlyVsLocalUsername(state, "GUEST-2E94IOLA_");
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      players: [
+        {
+          userid: "A",
+          username: "hebi_",
+          gameid: 10,
+          options: {
+            gameid: 10,
+            seed: 1744077378,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "B",
+          username: "guest-other",
+          gameid: 11,
+          options: {
+            gameid: 11,
+            seed: 1744077378,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.current, null);
+  assert.equal(state.lastWaitingReason, "configured_username_not_found");
+});
+
+test("configured local username waits when multiple round participants match", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  configureFriendlyVsLocalUsername(state, "GUEST-2E94IOLA_");
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      players: [
+        {
+          userid: "A",
+          username: "GUEST-2E94IOLA_",
+          gameid: 10,
+          options: {
+            gameid: 10,
+            seed: 1744077379,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "B",
+          username: "guest-2e94iola_",
+          gameid: 11,
+          options: {
+            gameid: 11,
+            seed: 1744077379,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.current, null);
+  assert.equal(state.lastWaitingReason, "configured_username_ambiguous");
+});
+
+test("blank configured username still blocks generic root.user roster-match fallback", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        _id: "local-id",
+        username: "hebi_"
+      },
+      players: [
+        {
+          userid: "local-id",
+          username: "hebi_",
+          gameid: 6528,
+          options: {
+            gameid: 6528,
+            seed: 1744077380,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "guest-id",
+          username: "guest",
+          gameid: 6529,
+          options: {
+            gameid: 6529,
+            seed: 1744077380,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.sessionSelfIdentity.userid, null);
+  assert.equal(state.current, null);
+  assert.equal(state.lastWaitingReason, "self_user_missing");
+});
+
+test("configured local username conflict blocks explicit self marker", () => {
+  const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
+  configureFriendlyVsLocalUsername(state, "GUEST-2E94IOLA_");
+
+  ingestVsBridgeRoot(
+    state,
+    {
+      user: {
+        username: "hebi_",
+        local: true
+      },
+      players: [
+        {
+          userid: "A",
+          username: "hebi_",
+          gameid: 10,
+          options: {
+            gameid: 10,
+            seed: 1744077381,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        },
+        {
+          userid: "B",
+          username: "GUEST-2E94IOLA_",
+          gameid: 11,
+          options: {
+            gameid: 11,
+            seed: 1744077381,
+            bagtype: "7-bag",
+            nextcount: 5,
+            boardwidth: 10,
+            boardheight: 20
+          }
+        }
+      ]
+    },
+    { timestamp: 1000 }
+  );
+
+  assert.equal(state.current, null);
+  assert.equal(state.lastWaitingReason, "identity_conflict");
+});
+
 test("multiple root.user candidates in one request never overwrite session self", () => {
   const state = createVsBridgeState(DEFAULT_BRIDGE_PATH, () => {});
   ingestVsBridgeSessionSelfIdentity(state, {
@@ -919,7 +1336,10 @@ test("deriveVsRoundBridge falls back to precountdown when countdown metadata is 
         countdown_interval: "bad"
       }
     }),
-    capturedAt
+    capturedAt,
+    {
+      configuredLocalUsername: "hebi_"
+    }
   );
 
   assert.ok(result);
@@ -1033,6 +1453,7 @@ test("split identity packets build the same bridge in A->B->C order", () => {
 
   try {
     const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(state, packetA(), { timestamp: 1000 });
     ingestVsBridgeRoot(state, packetB(), { timestamp: 1100 });
     ingestVsBridgeRoot(state, packetC(), { timestamp: 1200 });
@@ -1061,6 +1482,7 @@ test("split identity packets build the same bridge in C->B->A order", () => {
 
   try {
     const state = createVsBridgeState(filePath, () => {});
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(state, packetC(), { timestamp: 1200 });
     ingestVsBridgeRoot(state, packetB(), { timestamp: 1100 });
     ingestVsBridgeRoot(state, packetA(), { timestamp: 1000 });
@@ -1082,6 +1504,7 @@ test("room options arriving later update readyAt without changing the round seed
 
   try {
     const state = createVsBridgeState(filePath, () => {});
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(state, packetA(), { timestamp: 1000 });
     ingestVsBridgeRoot(state, packetB(), { timestamp: 1100 });
     ingestVsBridgeRoot(state, packetC(), { timestamp: 1200 });
@@ -1102,6 +1525,7 @@ test("readyAt log prefers countdown and does not add precountdown on top", () =>
 
   try {
     const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(state, combinedRoundRoot(), { timestamp: 1000 }, (line) =>
       logs.push(line)
     );
@@ -1120,6 +1544,7 @@ test("readyAt log falls back to precountdown when countdown metadata is missing"
 
   try {
     const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(
       state,
       combinedRoundRoot({
@@ -1148,6 +1573,7 @@ test("shared player seed mismatch logs once and blocks bridge creation", () => {
 
   try {
     const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(
       state,
       packetA({
@@ -1199,6 +1625,7 @@ test("same round packets do not rewrite the bridge unnecessarily", () => {
 
   try {
     const state = createVsBridgeState(filePath, () => {});
+    configureFriendlyVsLocalUsername(state, "hebi_");
     ingestVsBridgeRoot(state, packetA(), { timestamp: 1000 });
     ingestVsBridgeRoot(state, packetB(), { timestamp: 1100 });
     ingestVsBridgeRoot(state, packetC(), { timestamp: 1200 });
@@ -1222,6 +1649,7 @@ test("updateVsBridgeState stores round start and deduped interaction garbage", (
 
   try {
     const state = createVsBridgeState(filePath, (line) => logs.push(line));
+    configureFriendlyVsLocalUsername(state, "hebi_");
     updateVsBridgeState(
       state,
       [packetA(), packetB(), packetC()],
@@ -1307,6 +1735,7 @@ test("markVsBridgeInactive writes an inactive bridge snapshot", () => {
 
   try {
     const state = createVsBridgeState(filePath, () => {});
+    configureFriendlyVsLocalUsername(state, "hebi_");
     updateVsBridgeState(state, [packetA(), packetB(), packetC()], () => {}, 1000);
     markVsBridgeInactive(state, () => {});
 

@@ -47,6 +47,7 @@ const GARBAGE_DATA_KEYS = [
   "ackiid",
   "cid"
 ];
+const ROOT_USER_PENDING_REQUEST_ID = "__root_user_pending__";
 
 export function isVsWsSimEnabled(env = process.env) {
   return env?.FUSION_VS_WS_SIM === "1";
@@ -80,6 +81,7 @@ export function createVsBridgeState(
     roundPlayers: new Map(),
     zenithPlayersByGameId: new Map(),
     zenithPlayersByUserId: new Map(),
+    configuredLocalUsername: null,
     roomOptions: {},
     zenithSession: null,
     roundObservedAt: 0,
@@ -93,6 +95,18 @@ export function createVsBridgeState(
 
   log?.(`[vs-bridge] producer enabled path=${buildLogPath(state.bridgeFilePath)}`);
   return state;
+}
+
+export function setVsBridgeConfiguredLocalUsername(state, username) {
+  if (!state) {
+    return false;
+  }
+  const nextUsername = sanitizeConfiguredLocalUsername(username);
+  if ((state.configuredLocalUsername ?? null) === nextUsername) {
+    return false;
+  }
+  state.configuredLocalUsername = nextUsername;
+  return true;
 }
 
 export function ingestVsBridgeOptionsCandidate(
@@ -307,7 +321,7 @@ export function ingestVsBridgeSessionSelfIdentity(
   return changed;
 }
 
-export function deriveVsRoundBridge(root, capturedAt = Date.now()) {
+export function deriveVsRoundBridge(root, capturedAt = Date.now(), options = {}) {
   if (!root || typeof root !== "object" || Array.isArray(root)) {
     return null;
   }
@@ -321,6 +335,11 @@ export function deriveVsRoundBridge(root, capturedAt = Date.now()) {
     roundPlayers: new Map(),
     zenithPlayersByGameId: new Map(),
     zenithPlayersByUserId: new Map(),
+    configuredLocalUsername: sanitizeConfiguredLocalUsername(
+      options?.configuredLocalUsername ??
+        options?.localTetrioUsername ??
+        options?.local_tetrio_username
+    ),
     roomOptions: {},
     zenithSession: null,
     roundObservedAt: 0,
@@ -447,12 +466,11 @@ function buildBridgeFromState(state, capturedAt) {
   const selfIdentity = state.sessionSelfIdentity ?? createEmptySessionSelfIdentity();
   const zenithPlayers = getZenithPlayers(state, capturedAt);
   const zenithMode = shouldBuildZenithBridge(state, zenithPlayers);
+  const configuredLocalUsername = sanitizeConfiguredLocalUsername(
+    state?.configuredLocalUsername
+  );
   if (zenithMode) {
     return buildZenithBridgeFromState(state, zenithPlayers, selfIdentity);
-  }
-  if (!selfIdentity.userid && !selfIdentity.username) {
-    setWaitingReason(state, "self_user_missing");
-    return null;
   }
 
   const roundPlayers = [...state.roundPlayers.values()]
@@ -463,10 +481,41 @@ function buildBridgeFromState(state, capturedAt) {
     return null;
   }
 
-  const localPlayer = resolveLocalPlayer(selfIdentity, roundPlayers);
-  if (!localPlayer) {
-    setWaitingReason(state, "local_player_unresolved");
-    return null;
+  let localPlayer = null;
+  if (configuredLocalUsername !== null) {
+    const configuredResolution = resolveConfiguredFriendlyVsLocalPlayer(
+      roundPlayers,
+      configuredLocalUsername
+    );
+    if (configuredResolution.status === "not_found") {
+      setWaitingReason(state, "configured_username_not_found");
+      return null;
+    }
+    if (configuredResolution.status === "ambiguous") {
+      setWaitingReason(state, "configured_username_ambiguous");
+      return null;
+    }
+    localPlayer = configuredResolution.player;
+    if (
+      hasFriendlyVsIdentityConflict(
+        selfIdentity,
+        localPlayer,
+        configuredLocalUsername
+      )
+    ) {
+      setWaitingReason(state, "identity_conflict");
+      return null;
+    }
+  } else {
+    if (!selfIdentity.userid && !selfIdentity.username) {
+      setWaitingReason(state, "self_user_missing");
+      return null;
+    }
+    localPlayer = resolveLocalPlayer(selfIdentity, roundPlayers);
+    if (!localPlayer) {
+      setWaitingReason(state, "local_player_unresolved");
+      return null;
+    }
   }
 
   if (roundPlayers.length < 2) {
@@ -522,7 +571,10 @@ function buildBridgeFromState(state, capturedAt) {
       readyAt,
       readyOffsetMs,
       readyOffsetSource: readyTiming.source,
-      local: summarizeBridgePlayer(localPlayer, selfIdentity),
+      local: summarizeBridgePlayer(
+        localPlayer,
+        configuredLocalUsername === null ? selfIdentity : null
+      ),
       opponents: opponents.map((player) => summarizeBridgePlayer(player, null)),
       options
     }
@@ -617,6 +669,7 @@ function updateSelfUserCache(state, root, context = {}, log = state?.log ?? null
       marker: candidate.marker
     }, log);
     if (candidate.path === "root.user") {
+      const rootUserRequestId = requestId ?? ROOT_USER_PENDING_REQUEST_ID;
       observeParticipantIdentity(
         state,
         {
@@ -626,31 +679,8 @@ function updateSelfUserCache(state, root, context = {}, log = state?.log ?? null
         },
         log
       );
-      if (requestState && identity.userid !== undefined) {
-        requestState.rootUserIds.add(String(identity.userid));
-      }
-      if (shouldTreatRootUserAsParticipantOnly(envelope, requestState)) {
-        clearPendingRootUserCandidate(state, requestId);
-        if (hasPinnedSessionSelfIdentity(state)) {
-          maybeLogIgnoredSelfCandidate(
-            state,
-            identity,
-            "participant_roster_identity",
-            log
-          );
-        }
-        continue;
-      }
-      if (requestId && !canUseRootUserAsSessionSelf(identity, envelope, requestState)) {
-        stagePendingRootUserCandidate(state, requestId, {
-          ...identity,
-          requestId,
-          session:
-            findZenithSessionValue(root) ??
-            findZenithSessionValue(context) ??
-            sanitizeScalar(state.zenithSession),
-          source: candidate.path
-        });
+      clearPendingRootUserCandidate(state, rootUserRequestId);
+      if (!isConfirmedObserverSelfContext(candidate.source)) {
         continue;
       }
     }
@@ -671,7 +701,6 @@ function updateSelfUserCache(state, root, context = {}, log = state?.log ?? null
       log
     );
   }
-  maybePromotePendingRootUserCandidate(state, requestId, log);
 }
 
 function updateRoomUsersCache(state, root) {
@@ -885,6 +914,55 @@ function resolveLocalPlayer(selfIdentity, roundPlayers) {
   return null;
 }
 
+function resolveConfiguredFriendlyVsLocalPlayer(
+  roundPlayers,
+  configuredLocalUsername
+) {
+  const normalizedConfiguredUsername =
+    normalizeIdentityName(configuredLocalUsername);
+  if (normalizedConfiguredUsername === null) {
+    return { status: "not_found", player: null };
+  }
+  const matches = roundPlayers.filter(
+    (player) =>
+      normalizeIdentityName(player?.username) === normalizedConfiguredUsername
+  );
+  if (matches.length === 0) {
+    return { status: "not_found", player: null };
+  }
+  if (matches.length > 1) {
+    return { status: "ambiguous", player: null };
+  }
+  return { status: "resolved", player: matches[0] };
+}
+
+function hasFriendlyVsIdentityConflict(
+  selfIdentity,
+  localPlayer,
+  configuredLocalUsername
+) {
+  const pinnedUserid = sanitizeScalar(selfIdentity?.userid);
+  const localUserid = sanitizeScalar(localPlayer?.userid);
+  if (
+    pinnedUserid !== undefined &&
+    pinnedUserid !== null &&
+    localUserid !== undefined &&
+    String(pinnedUserid) !== String(localUserid)
+  ) {
+    return true;
+  }
+  const pinnedUsername = normalizeIdentityName(selfIdentity?.username);
+  const configuredUsername = normalizeIdentityName(configuredLocalUsername);
+  if (
+    pinnedUsername !== null &&
+    configuredUsername !== null &&
+    pinnedUsername !== configuredUsername
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function summarizeBridgePlayer(player, selfIdentity = null) {
   const summary = {
     username:
@@ -906,8 +984,27 @@ function withBackfilledRoundUsername(state, player) {
   }
   return {
     ...player,
-    username: state.roomUsers.get(player.userid)?.username ?? null
+    username:
+      state.roomUsers.get(player.userid)?.username ??
+      findParticipantUsernameByUserid(state, player.userid) ??
+      null
   };
+}
+
+function findParticipantUsernameByUserid(state, userid) {
+  const normalizedUserid = sanitizeScalar(userid);
+  if (normalizedUserid === undefined) {
+    return null;
+  }
+  for (const participant of state?.participantIdentities?.values?.() ?? []) {
+    if (
+      sanitizeScalar(participant?.userid) === normalizedUserid &&
+      sanitizeScalar(participant?.username) !== undefined
+    ) {
+      return sanitizeScalar(participant.username);
+    }
+  }
+  return null;
 }
 
 function pickBridgeOptions(roomOptions, localOptions, roundSeed) {
@@ -1314,14 +1411,30 @@ function summarizeIdentityEnvelope(root) {
   };
 }
 
-function canUseRootUserAsSessionSelf(identity, envelope, requestState) {
+function hasAuthoritativeRoundPlayerUserid(state, userid) {
+  const identityKey = sanitizeScalar(userid);
+  if (identityKey === undefined || !state?.roundPlayers) {
+    return false;
+  }
+  return state.roundPlayers.has(String(identityKey));
+}
+
+function hasAuthoritativeRoundObservation(state) {
+  return (state?.roundPlayers?.size ?? 0) > 0;
+}
+
+function canUseRootUserAsSessionSelf(state, identity, envelope, requestState) {
   if (!identity || !envelope) {
     return false;
   }
   if (envelope.zenithSeen || requestState?.zenithSeen) {
     return false;
   }
-  if (!envelope.roundLikeSeen && !requestState?.roundLikeSeen) {
+  if (
+    !envelope.roundLikeSeen &&
+    !requestState?.roundLikeSeen &&
+    !hasAuthoritativeRoundObservation(state)
+  ) {
     return false;
   }
   if (identity.userid === undefined || identity.userid === null) {
@@ -1330,8 +1443,22 @@ function canUseRootUserAsSessionSelf(identity, envelope, requestState) {
   const identityKey = String(identity.userid);
   return (
     envelope.playerUserIds.has(identityKey) ||
-    requestState?.playerUserIds?.has(identityKey) === true
+    requestState?.playerUserIds?.has(identityKey) === true ||
+    hasAuthoritativeRoundPlayerUserid(state, identityKey)
   );
+}
+
+function canPromoteRootUserAsSessionSelf(
+  state,
+  identity,
+  source,
+  envelope,
+  requestState
+) {
+  if (isConfirmedObserverSelfContext(source)) {
+    return true;
+  }
+  return canUseRootUserAsSessionSelf(state, identity, envelope, requestState);
 }
 
 function shouldTreatRootUserAsParticipantOnly(envelope, requestState) {
@@ -1350,6 +1477,9 @@ function shouldTreatRequestAsParticipantOnly(requestState) {
 
 function stagePendingRootUserCandidate(state, requestId, identity) {
   if (!state || !requestId || !identity) {
+    return false;
+  }
+  if (sanitizeScalar(identity.userid) === undefined) {
     return false;
   }
   const existing = state.pendingRequestSelfCandidates.get(requestId);
@@ -1387,6 +1517,10 @@ function maybePromotePendingRootUserCandidate(state, requestId, log) {
     return false;
   }
   if (!requestState.roundLikeSeen) {
+    return false;
+  }
+  if (sanitizeScalar(pending.userid) === undefined) {
+    state.pendingRequestSelfCandidates.delete(requestId);
     return false;
   }
   if (
@@ -1464,6 +1598,15 @@ function normalizeIdentityName(value) {
   }
   const normalized = String(scalar).trim().toLowerCase();
   return normalized ? normalized : null;
+}
+
+function sanitizeConfiguredLocalUsername(value) {
+  const scalar = sanitizeScalar(value);
+  if (scalar === undefined || scalar === null) {
+    return null;
+  }
+  const trimmed = String(scalar).trim();
+  return trimmed ? trimmed : null;
 }
 
 function findZenithSessionValue(value) {

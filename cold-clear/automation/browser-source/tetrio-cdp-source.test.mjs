@@ -325,16 +325,18 @@ function makeBoundQuickPlayCandidate(overrides = {}) {
     targetId: "https://tetr.io/",
     candidateId: "cand-default",
     rootObjectId: "retained-default",
-    rootPath: ["game", "state"],
+    retainedRootKind: "state",
+    retainedRootPath: [],
+    rootPath: [],
     functionName: "_tick",
     callFrameIndex: 5,
     scopeIndex: 4,
     scopeType: "closure",
     bindingName: "Ra",
-    boardPath: ["game", "state", "board"],
-    currentPath: ["game", "state", "current"],
-    holdPath: ["game", "state", "hold"],
-    queuePath: ["game", "state", "queue"],
+    boardPath: ["board"],
+    currentPath: ["current"],
+    holdPath: ["hold"],
+    queuePath: ["queue"],
     capturedAt: 1_000,
     userid: null,
     gameid: null,
@@ -372,11 +374,7 @@ function makeQuickPlayPassiveRetainedRoot({
   if (paused !== undefined) {
     state.paused = paused;
   }
-  return {
-    game: {
-      state
-    }
-  };
+  return state;
 }
 
 function createPassiveSnapshotEvalCdp(retainedRoot) {
@@ -2951,6 +2949,399 @@ test("unique accepted _tick closure binds resolved self identity and writes pass
   }
 });
 
+function makeQuickPlayAcceptedCandidateFixture({
+  candidateId,
+  rootObjectId,
+  bindingName,
+  matchedShape,
+  retainedRootKind,
+  retainedRootPath,
+  boardPath,
+  currentPath,
+  holdPath,
+  queuePath,
+  current = "t",
+  hold = "i",
+  queue = ["o", "s", "z"],
+  playing = true,
+  ended = false
+} = {}) {
+  return {
+    candidateId,
+    rootObjectId,
+    functionName: "_tick",
+    callFrameIndex: 0,
+    scopeIndex: 4,
+    scopeType: "closure",
+    bindingName,
+    locator: bindingName,
+    fullPath: `frame[0].scope[4].${bindingName}.${boardPath.join(".")}`,
+    matchedShape,
+    retainedRootKind,
+    retainedRootPath,
+    boardPath,
+    currentPath,
+    holdPath,
+    queuePath,
+    discoveredPaths: {
+      board: boardPath,
+      current: currentPath,
+      hold: holdPath,
+      queue: queuePath
+    },
+    objectKeys:
+      retainedRootPath.length > 0 ? [retainedRootPath[retainedRootPath.length - 1]] : [],
+    typeof: "object",
+    hasBoardLike: true,
+    hasCurrentLike: true,
+    hasQueueLike: true,
+    hasHoldLike: true,
+    hasGameId: false,
+    hasSeed: false,
+    hasUserId: false,
+    rejectedReason: [],
+    current,
+    hold,
+    queue,
+    pieceCounter: 4,
+    boardWidth: 10,
+    boardHeight: 40,
+    boardHash: "abcd1234",
+    rowOccupancy: [0, 0, 0],
+    playing,
+    ended,
+    accepted: true
+  };
+}
+
+function makeQuickPlaySemanticProbeFixtureValue({
+  status = "ready",
+  reason = null,
+  retainedObjectStage = "state",
+  boardWidth = 10,
+  boardHeight = 40,
+  boardNormalized = true,
+  currentNormalized = true,
+  holdNormalized = true,
+  queueNormalized = true,
+  board = Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+  current = { type: "T", x: 4, y: 19, rotation: 1 },
+  hold = "I",
+  queue = ["O", "S", "Z"],
+  playing = true,
+  started = true,
+  countdownStarted = false,
+  destroyed = false,
+  currentPath = ["state", "current"],
+  holdPath = ["state", "hold"],
+  queuePath = ["state", "queue"],
+  boardRequestedPath = ["board"],
+  boardPathResolved = true
+} = {}) {
+  return {
+    status,
+    reason,
+    board,
+    current,
+    hold,
+    queue,
+    playing,
+    started,
+    countdown_started: countdownStarted,
+    paused: false,
+    destroyed,
+    successful: null,
+    gameoverreason: null,
+    piece_counter: 4,
+    board_width: boardWidth,
+    board_height: boardHeight,
+    current_path: currentPath,
+    hold_path: holdPath,
+    queue_path: queuePath,
+    board_normalized: boardNormalized,
+    current_normalized: currentNormalized,
+    hold_normalized: holdNormalized,
+    queue_normalized: queueNormalized,
+    field_diagnostics: {
+      root: { retained_object_stage: retainedObjectStage },
+      board: {
+        requested_path: boardRequestedPath,
+        path_resolved: boardPathResolved
+      },
+      current: {},
+      hold: {},
+      queue: {}
+    }
+  };
+}
+
+function makeQuickPlayRootProbeFixtureValue({
+  requestedPath = ["state"],
+  retainedObjectStage = "state",
+  ownKeys = ["board", "current", "hold", "queue"],
+  hasBoard = true,
+  hasState = false,
+  hasGame = false
+} = {}) {
+  return {
+    requested_path: requestedPath,
+    resolved_segments: requestedPath,
+    failed_segment: null,
+    path_resolved: true,
+    accessor_exception: false,
+    value_type: "object",
+    retained_object_stage: retainedObjectStage,
+    root_diagnostics: {
+      raw_type: "object",
+      constructor: "Object",
+      own_keys: ownKeys,
+      has_board: hasBoard,
+      has_falling: false,
+      has_hold: ownKeys.includes("hold"),
+      has_bag: false,
+      has_game: hasGame,
+      has_state: hasState
+    }
+  };
+}
+
+function createQuickPlayMultiAcceptedPausedFixture(
+  candidateSpecs,
+  {
+    pollValueByRetainedObjectId = {},
+    pollTargetByRetainedObjectId = {}
+  } = {}
+) {
+  const calls = [];
+  let pausedHandlesLive = false;
+  let resumeCount = 0;
+  let semanticProbeCalls = 0;
+  let canonicalStateHandleCalls = 0;
+  let canonicalIdentityCompareCalls = 0;
+  let retainRootProbeCalls = 0;
+  let retainCloneCalls = 0;
+  let pollCalls = 0;
+  let postResumeCandidateHandleCalls = 0;
+  let canonicalHandleSequence = 0;
+  const candidatesByRootObjectId = new Map(
+    candidateSpecs.map((spec) => [spec.candidate.rootObjectId, spec])
+  );
+  const retainedByObjectId = new Map(
+    candidateSpecs
+      .filter((spec) => String(spec.retainedObjectId ?? "").trim() !== "")
+      .map((spec) => [spec.retainedObjectId, spec])
+  );
+  const canonicalHandleTargets = new Map();
+  const cdp = {
+    async send(method, params = {}) {
+      calls.push({ method, params });
+      if (
+        method === "Debugger.enable" ||
+        method === "Debugger.pause" ||
+        method === "Debugger.disable"
+      ) {
+        return {};
+      }
+      if (method === "Debugger.resume") {
+        pausedHandlesLive = false;
+        resumeCount += 1;
+        return {};
+      }
+      if (method === "Runtime.getProperties" && params.objectId === "scope-4") {
+        return {
+          result: candidateSpecs.map((spec) => ({
+            name: spec.candidate.bindingName,
+            value: {
+              type: "object",
+              objectId: spec.candidate.rootObjectId
+            }
+          }))
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        const argumentCount = Array.isArray(params.arguments) ? params.arguments.length : 0;
+        if (canonicalHandleTargets.has(params.objectId)) {
+          if (!pausedHandlesLive) {
+            postResumeCandidateHandleCalls += 1;
+            return {
+              error: {
+                message: "Invalid remote object id"
+              }
+            };
+          }
+          if (
+            params.returnByValue === true &&
+            argumentCount === 1 &&
+            String(params.arguments?.[0]?.objectId ?? "").trim() !== ""
+          ) {
+            canonicalIdentityCompareCalls += 1;
+            return {
+              result: {
+                value: executeObjectFunction(
+                  params.functionDeclaration,
+                  canonicalHandleTargets.get(params.objectId),
+                  [canonicalHandleTargets.get(String(params.arguments[0].objectId ?? "").trim())]
+                )
+              }
+            };
+          }
+        }
+        if (candidatesByRootObjectId.has(params.objectId)) {
+          const spec = candidatesByRootObjectId.get(params.objectId);
+          if (!pausedHandlesLive) {
+            postResumeCandidateHandleCalls += 1;
+            return {
+              error: {
+                message: "Invalid remote object id"
+              }
+            };
+          }
+          if (params.returnByValue === true && argumentCount === 6) {
+            semanticProbeCalls += 1;
+            if (spec.semanticProbeError) {
+              return {
+                error: {
+                  message: spec.semanticProbeError
+                }
+              };
+            }
+            return {
+              result: {
+                value:
+                  spec.semanticProbeTarget !== undefined
+                    ? executeObjectFunction(
+                        params.functionDeclaration,
+                        spec.semanticProbeTarget,
+                        (params.arguments ?? []).map((entry) => entry?.value)
+                      )
+                    : spec.semanticProbeValue
+              }
+            };
+          }
+          if (params.returnByValue === true && argumentCount === 1) {
+            retainRootProbeCalls += 1;
+            if (spec.rootProbeError) {
+              return {
+                error: {
+                  message: spec.rootProbeError
+                }
+              };
+            }
+            return {
+              result: {
+                value: spec.rootProbeValue
+              }
+            };
+          }
+          if (params.returnByValue === false && argumentCount === 7) {
+            canonicalStateHandleCalls += 1;
+            const target =
+              spec.canonicalStateTarget !== undefined
+                ? spec.canonicalStateTarget
+                : executeObjectFunction(
+                    params.functionDeclaration,
+                    spec.semanticProbeTarget,
+                    (params.arguments ?? []).map((entry) => entry?.value)
+                  );
+            if (!target || (typeof target !== "object" && typeof target !== "function")) {
+              return {
+                result: {}
+              };
+            }
+            const handleId = `canonical-handle-${++canonicalHandleSequence}`;
+            canonicalHandleTargets.set(handleId, target);
+            return {
+              result: {
+                objectId: handleId
+              }
+            };
+          }
+          if (params.returnByValue === false) {
+            retainCloneCalls += 1;
+            if (spec.retainCloneError) {
+              return {
+                error: {
+                  message: spec.retainCloneError
+                }
+              };
+            }
+            return {
+              result: {
+                objectId: spec.retainedObjectId
+              }
+            };
+          }
+          return {
+            result: {
+              value: spec.candidate
+            }
+          };
+        }
+        if (retainedByObjectId.has(params.objectId)) {
+          const spec = retainedByObjectId.get(params.objectId);
+          if (params.returnByValue === true && argumentCount === 6) {
+            pollCalls += 1;
+            return {
+              result: {
+                value:
+                  pollTargetByRetainedObjectId[params.objectId] !== undefined
+                    ? executeObjectFunction(
+                        params.functionDeclaration,
+                        pollTargetByRetainedObjectId[params.objectId],
+                        (params.arguments ?? []).map((entry) => entry?.value)
+                      )
+                    : pollValueByRetainedObjectId[params.objectId] ??
+                      spec.semanticProbeValue
+              }
+            };
+          }
+        }
+      }
+      if (method === "Runtime.releaseObject" || method === "Runtime.releaseObjectGroup") {
+        return {};
+      }
+      throw new Error(`unexpected method ${method}`);
+    },
+    async waitForEvent(method) {
+      assert.equal(method, "Debugger.paused");
+      pausedHandlesLive = true;
+      return {
+        callFrames: [
+          {
+            callFrameId: "frame-1",
+            functionName: "_tick",
+            location: {
+              scriptId: "1",
+              lineNumber: 14,
+              columnNumber: 0
+            },
+            scopeChain: [null, null, null, null, {
+              type: "closure",
+              object: { objectId: "scope-4" }
+            }]
+          }
+        ]
+      };
+    }
+  };
+  return {
+    cdp,
+    calls,
+    counts() {
+      return {
+        resumeCount,
+        semanticProbeCalls,
+        canonicalStateHandleCalls,
+        canonicalIdentityCompareCalls,
+        retainRootProbeCalls,
+        retainCloneCalls,
+        pollCalls,
+        postResumeCandidateHandleCalls
+      };
+    }
+  };
+}
+
 test("multiple accepted candidates remain unresolved and passive snapshot stays unavailable", async () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const controlState = createBrowserControlState();
@@ -3001,12 +3392,9 @@ test("multiple accepted candidates remain unresolved and passive snapshot stays 
       scanClosureFn: async () => ({
         status: "ready",
         productive: true,
-        resultType: "accepted_candidates_found",
+        resultType: "no_authoritative_candidate",
         rawCandidates: [],
-        acceptedCandidates: [
-          { candidateId: "cand-a", rootObjectId: "obj-a", functionName: "_tick", callFrameIndex: 13, scopeIndex: 4, scopeType: "closure", bindingName: "a", matchedShape: "state.board", playing: true, ended: false },
-          { candidateId: "cand-b", rootObjectId: "obj-b", functionName: "_tick", callFrameIndex: 13, scopeIndex: 4, scopeType: "closure", bindingName: "b", matchedShape: "state.board", playing: true, ended: false }
-        ]
+        acceptedCandidates: []
       }),
       log: () => {}
     });
@@ -3016,7 +3404,654 @@ test("multiple accepted candidates remain unresolved and passive snapshot stays 
     const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
     assert.deepEqual(snapshot, {
       status: "unavailable",
-      reason: "ambiguous_accepted_candidates"
+      reason: "no_authoritative_candidate"
+    });
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multiple accepted candidates retain exactly one authoritative semantic candidate", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 28;
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_100,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.nextClosureSurveyAt = 2_100;
+    diagnosticState.closureScanState.pendingReason = "first_zenith_options";
+    diagnosticState.pendingIdentity = {
+      generation: 28,
+      userid: "user-28",
+      gameid: 8028,
+      wsPlayerId: "user-28|8028|Local",
+      resolvedAt: 2_100
+    };
+    diagnosticState.wsPlayers.set("local", {
+      userid: "user-28",
+      gameid: 8028,
+      username: "Local",
+      firstSeen: 2_100,
+      lastSeen: 2_100
+    });
+    const harness = createQuickPlayMultiAcceptedPausedFixture(
+      [
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-a",
+            rootObjectId: "obj-a",
+            bindingName: "bindingA",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          semanticProbeTarget: {
+            game: {
+              state: {
+                board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                falling: { type: "T", x: 4, y: 19, rotation: 1 },
+                hold: "I",
+                bag: ["O", "S", "Z"],
+                playing: true,
+                started: true,
+                destroyed: false,
+                stats: { piecesPlaced: 4 }
+              }
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["game", "state"],
+            retainedObjectStage: "state"
+          }),
+          retainedObjectId: "retained-a"
+        },
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-b",
+            rootObjectId: "obj-b",
+            bindingName: "bindingB",
+            matchedShape: "_presentation.primary.board",
+            retainedRootKind: "binding",
+            retainedRootPath: ["_presentation", "primary"],
+            boardPath: ["state", "board"],
+            currentPath: ["state", "falling"],
+            holdPath: ["state", "hold"],
+            queuePath: ["state", "bag"]
+          }),
+          semanticProbeTarget: {
+            _presentation: {
+              primary: {
+                state: {
+                  board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                  falling: { type: "L", x: 5, y: 18, rotation: 0 },
+                  hold: "J",
+                  bag: ["I", "O", "T"],
+                  playing: false,
+                  started: true,
+                  destroyed: true,
+                  stats: { piecesPlaced: 9 }
+                }
+              }
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["_presentation", "primary"],
+            retainedObjectStage: "game",
+            ownKeys: ["state"],
+            hasBoard: false,
+            hasState: true
+          }),
+          retainedObjectId: "retained-b"
+        }
+      ],
+      {
+        pollTargetByRetainedObjectId: {
+          "retained-a": {
+            board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+            falling: { type: "T", x: 4, y: 19, rotation: 1 },
+            hold: "I",
+            bag: ["O", "S", "Z"],
+            playing: true,
+            started: true,
+            destroyed: false,
+            stats: { piecesPlaced: 4 }
+          }
+        }
+      }
+    );
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: harness.cdp,
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 2_100,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: (line) => logs.push(line)
+    });
+
+    const counts = harness.counts();
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.canonicalStateHandleCalls, 1);
+    assert.equal(counts.canonicalIdentityCompareCalls, 0);
+    assert.equal(counts.retainRootProbeCalls, 1);
+    assert.equal(counts.retainCloneCalls, 1);
+    assert.equal(counts.pollCalls, 1);
+    assert.equal(counts.resumeCount, 1);
+    assert.equal(counts.postResumeCandidateHandleCalls, 0);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.candidateId, "cand-a");
+    assert.equal(diagnosticState.diagnostics.passive_snapshot.polling_started, true);
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.candidate_id, "cand-a");
+    assert.ok(
+      logs.some((line) =>
+        line.includes("[quick-play] accepted candidate metadata index=1/2") &&
+        line.includes("candidate=cand-a") &&
+        line.includes("root_path=game.state")
+      )
+    );
+    assert.ok(
+      logs.some((line) =>
+        line.includes("[quick-play] accepted candidate probe index=2/2") &&
+        line.includes("candidate=cand-b") &&
+        line.includes("root_path=_presentation.primary") &&
+        line.includes("resolved_root=true") &&
+        line.includes("board_path_resolved=true") &&
+        line.includes("current_path_resolved=true") &&
+        line.includes("hold_path_resolved=true") &&
+        line.includes("queue_path_resolved=true") &&
+        line.includes("status=ready") &&
+        line.includes("authoritative=false")
+      )
+    );
+    assert.ok(
+      logs.some((line) =>
+        line.includes("[quick-play] accepted authoritative candidates=1")
+      )
+    );
+    assert.ok(
+      logs.some((line) =>
+        line.includes("[quick-play] canonical semantic groups=1")
+      )
+    );
+    assert.ok(
+      logs.some((line) =>
+        line.includes("[quick-play] selected semantic group=1/1") &&
+        line.includes("retain=success")
+      )
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multiple authoritative semantic aliases collapse to one canonical gameplay state", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 281;
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  const sharedState = {
+    board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+    falling: { type: "T", x: 4, y: 19, rotation: 1 },
+    hold: "I",
+    bag: ["O", "S", "Z"],
+    playing: true,
+    started: true,
+    destroyed: false,
+    stats: { piecesPlaced: 14 }
+  };
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_101,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.nextClosureSurveyAt = 2_101;
+    diagnosticState.closureScanState.pendingReason = "first_zenith_options";
+    diagnosticState.pendingIdentity = {
+      generation: 281,
+      userid: "user-281",
+      gameid: 8281,
+      wsPlayerId: "user-281|8281|Local",
+      resolvedAt: 2_101
+    };
+    diagnosticState.wsPlayers.set("local", {
+      userid: "user-281",
+      gameid: 8281,
+      username: "Local",
+      firstSeen: 2_101,
+      lastSeen: 2_101
+    });
+    const harness = createQuickPlayMultiAcceptedPausedFixture(
+      [
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-alias-a",
+            rootObjectId: "obj-alias-a",
+            bindingName: "bindingAliasA",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          semanticProbeTarget: {
+            game: {
+              state: sharedState
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["game", "state"],
+            retainedObjectStage: "state"
+          }),
+          retainedObjectId: "retained-alias-a"
+        },
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-alias-b",
+            rootObjectId: "obj-alias-b",
+            bindingName: "bindingAliasB",
+            matchedShape: "_presentation.primary.board",
+            retainedRootKind: "binding",
+            retainedRootPath: ["_presentation", "primary"],
+            boardPath: ["state", "board"],
+            currentPath: ["state", "falling"],
+            holdPath: ["state", "hold"],
+            queuePath: ["state", "bag"]
+          }),
+          semanticProbeTarget: {
+            _presentation: {
+              primary: {
+                state: sharedState
+              }
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["_presentation", "primary"],
+            retainedObjectStage: "game",
+            ownKeys: ["state"],
+            hasBoard: false,
+            hasState: true
+          }),
+          retainedObjectId: "retained-alias-b"
+        }
+      ],
+      {
+        pollTargetByRetainedObjectId: {
+          "retained-alias-a": sharedState
+        }
+      }
+    );
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: harness.cdp,
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 2_101,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: (line) => logs.push(line)
+    });
+
+    const counts = harness.counts();
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.canonicalStateHandleCalls, 2);
+    assert.equal(counts.canonicalIdentityCompareCalls, 1);
+    assert.equal(counts.retainCloneCalls, 1);
+    assert.equal(counts.pollCalls, 1);
+    assert.equal(counts.resumeCount, 1);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.candidateId, "cand-alias-a");
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.candidate_id, "cand-alias-a");
+    assert.ok(logs.some((line) => line.includes("[quick-play] accepted authoritative candidates=2")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] canonical semantic groups=1")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] alias group size=2 group=1/1")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] selected semantic group=1/1")));
+    assert.ok(logs.some((line) => line.includes("retain=success")));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("three authoritative semantic aliases still retain exactly one canonical gameplay state", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 282;
+  const diagnosticState = makeQuickPlayState(paths);
+  const logs = [];
+  const sharedState = {
+    board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+    falling: { type: "L", x: 5, y: 18, rotation: 0 },
+    hold: "J",
+    bag: ["I", "O", "T"],
+    playing: true,
+    started: true,
+    destroyed: false,
+    stats: { piecesPlaced: 21 }
+  };
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_102,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.nextClosureSurveyAt = 2_102;
+    diagnosticState.closureScanState.pendingReason = "first_zenith_options";
+    diagnosticState.pendingIdentity = {
+      generation: 282,
+      userid: "user-282",
+      gameid: 8282,
+      wsPlayerId: "user-282|8282|Local",
+      resolvedAt: 2_102
+    };
+    diagnosticState.wsPlayers.set("local", {
+      userid: "user-282",
+      gameid: 8282,
+      username: "Local",
+      firstSeen: 2_102,
+      lastSeen: 2_102
+    });
+    const harness = createQuickPlayMultiAcceptedPausedFixture(
+      [
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-alias-1",
+            rootObjectId: "obj-alias-1",
+            bindingName: "bindingAlias1",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          semanticProbeTarget: {
+            game: {
+              state: sharedState
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["game", "state"],
+            retainedObjectStage: "state"
+          }),
+          retainedObjectId: "retained-alias-1"
+        },
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-alias-2",
+            rootObjectId: "obj-alias-2",
+            bindingName: "bindingAlias2",
+            matchedShape: "_presentation.primary.board",
+            retainedRootKind: "binding",
+            retainedRootPath: ["_presentation", "primary"],
+            boardPath: ["state", "board"],
+            currentPath: ["state", "falling"],
+            holdPath: ["state", "hold"],
+            queuePath: ["state", "bag"]
+          }),
+          semanticProbeTarget: {
+            _presentation: {
+              primary: {
+                state: sharedState
+              }
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["_presentation", "primary"],
+            retainedObjectStage: "game",
+            ownKeys: ["state"],
+            hasBoard: false,
+            hasState: true
+          }),
+          retainedObjectId: "retained-alias-2"
+        },
+        {
+          candidate: makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-alias-3",
+            rootObjectId: "obj-alias-3",
+            bindingName: "bindingAlias3",
+            matchedShape: "viewer.match.board",
+            retainedRootKind: "binding",
+            retainedRootPath: ["viewer", "match"],
+            boardPath: ["state", "board"],
+            currentPath: ["state", "falling"],
+            holdPath: ["state", "hold"],
+            queuePath: ["state", "bag"]
+          }),
+          semanticProbeTarget: {
+            viewer: {
+              match: {
+                state: sharedState
+              }
+            }
+          },
+          rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+            requestedPath: ["viewer", "match"],
+            retainedObjectStage: "game",
+            ownKeys: ["state"],
+            hasBoard: false,
+            hasState: true
+          }),
+          retainedObjectId: "retained-alias-3"
+        }
+      ],
+      {
+        pollTargetByRetainedObjectId: {
+          "retained-alias-1": sharedState
+        }
+      }
+    );
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: harness.cdp,
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 2_102,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      log: (line) => logs.push(line)
+    });
+
+    const counts = harness.counts();
+    assert.equal(counts.semanticProbeCalls, 3);
+    assert.equal(counts.canonicalStateHandleCalls, 3);
+    assert.equal(counts.canonicalIdentityCompareCalls, 2);
+    assert.equal(counts.retainCloneCalls, 1);
+    assert.equal(counts.pollCalls, 1);
+    assert.equal(counts.resumeCount, 1);
+    assert.equal(counts.postResumeCandidateHandleCalls, 0);
+    assert.equal(diagnosticState.boundLocalClosureCandidate.candidateId, "cand-alias-1");
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.candidate_id, "cand-alias-1");
+    assert.ok(logs.some((line) => line.includes("[quick-play] accepted authoritative candidates=3")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] canonical semantic groups=1")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] alias group size=3 group=1/1")));
+    assert.ok(logs.some((line) => line.includes("[quick-play] selected semantic group=1/1")));
+    assert.ok(logs.some((line) => line.includes("retain=success")));
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multiple authoritative accepted candidates fail closed before retain", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 29;
+  const diagnosticState = makeQuickPlayState(paths);
+  let retainCloneCalls = 0;
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 2_200,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    diagnosticState.nextClosureSurveyAt = 2_200;
+    diagnosticState.closureScanState.pendingReason = "first_zenith_options";
+    diagnosticState.pendingIdentity = {
+      generation: 29,
+      userid: "user-29",
+      gameid: 8029,
+      wsPlayerId: "user-29|8029|Local",
+      resolvedAt: 2_200
+    };
+    diagnosticState.wsPlayers.set("local", {
+      userid: "user-29",
+      gameid: 8029,
+      username: "Local",
+      firstSeen: 2_200,
+      lastSeen: 2_200
+    });
+
+    const acceptedA = {
+      candidateId: "cand-aa",
+      rootObjectId: "obj-aa",
+      functionName: "_tick",
+      callFrameIndex: 13,
+      scopeIndex: 4,
+      scopeType: "closure",
+      bindingName: "bindingAA",
+      matchedShape: "game.state.board",
+      retainedRootKind: "state",
+      retainedRootPath: ["state"],
+      boardPath: ["state", "board"],
+      currentPath: ["state", "current"],
+      holdPath: ["state", "hold"],
+      queuePath: ["state", "queue"],
+      discoveredPaths: {
+        board: ["state", "board"],
+        current: ["state", "current"],
+        hold: ["state", "hold"],
+        queue: ["state", "queue"]
+      },
+      current: "t",
+      hold: "i",
+      queue: ["o", "s", "z"],
+      playing: true,
+      ended: false
+    };
+    const acceptedB = {
+      ...acceptedA,
+      candidateId: "cand-bb",
+      rootObjectId: "obj-bb",
+      bindingName: "bindingBB"
+    };
+
+    await maybeRunQuickPlayDiagnosticCapture({
+      cdp: {
+        async send(method, params = {}) {
+          if (method === "Runtime.callFunctionOn" && params.returnByValue === true) {
+            return {
+              result: {
+                value: {
+                  status: "ready",
+                  reason: null,
+                  board: Array.from({ length: 40 }, () => Array.from({ length: 10 }, () => 0)),
+                  current: { type: "T", x: 4, y: 19, rotation: 1 },
+                  hold: "I",
+                  queue: ["O", "S", "Z"],
+                  playing: true,
+                  started: true,
+                  countdown_started: false,
+                  paused: false,
+                  destroyed: false,
+                  successful: null,
+                  gameoverreason: null,
+                  piece_counter: 4,
+                  board_width: 10,
+                  board_height: 40,
+                  current_path: ["state", "current"],
+                  hold_path: ["state", "hold"],
+                  queue_path: ["state", "queue"],
+                  board_normalized: true,
+                  current_normalized: true,
+                  hold_normalized: true,
+                  queue_normalized: true,
+                  field_diagnostics: {
+                    root: { retained_object_stage: "state" },
+                    board: { requested_path: ["board"], path_resolved: true },
+                    current: {},
+                    hold: {},
+                    queue: {}
+                  }
+                }
+              }
+            };
+          }
+          if (method === "Runtime.callFunctionOn" && params.returnByValue === false) {
+            retainCloneCalls += 1;
+            return {
+              result: {
+                objectId: "should-not-retain"
+              }
+            };
+          }
+          if (method === "Runtime.releaseObject" || method === "Runtime.releaseObjectGroup") {
+            return {};
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      quickPlayDiagnosticState: diagnosticState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      now: 2_200,
+      surveySessionFn: async () => ({
+        status: "ready",
+        runtimePathsChecked: [],
+        candidates: []
+      }),
+      scanClosureFn: async () => ({
+        status: "ready",
+        productive: true,
+        resultType: "ambiguous_authoritative_candidates",
+        rawCandidates: [acceptedA, acceptedB],
+        acceptedCandidates: []
+      }),
+      log: () => {}
+    });
+
+    assert.equal(retainCloneCalls, 0);
+    assert.equal(String(diagnosticState.boundLocalClosureCandidate.rootObjectId ?? ""), "");
+    const snapshot = JSON.parse(readFileSync(paths.passiveSnapshotPath, "utf8"));
+    assert.deepEqual(snapshot, {
+      status: "unavailable",
+      reason: "ambiguous_authoritative_candidates"
     });
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
@@ -3267,7 +4302,7 @@ test("accepted candidate is retained before Debugger.resume and diagnostic clean
 
     assert.equal(scan.retainResult?.ok, true);
     assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-root");
-    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), ["state"]);
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), []);
     assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.boardPath), ["board"]);
     assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.currentPath), ["current"]);
     const retainCallIndex = calls.findIndex(
@@ -3293,6 +4328,379 @@ test("accepted candidate is retained before Debugger.resume and diagnostic clean
           entry.params.objectGroup === "fusion-quick-play-passive"
       )
     );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multi-candidate semantic disambiguation with no authoritative result resumes exactly once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 30;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_100,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    const harness = createQuickPlayMultiAcceptedPausedFixture([
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-a",
+          rootObjectId: "obj-a",
+          bindingName: "bindingA",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["state"],
+          boardPath: ["state", "board"],
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue({
+          status: "semantic_failed",
+          reason: "accessor_path_unresolved",
+          retainedObjectStage: "state",
+          boardWidth: 0,
+          boardHeight: 0,
+          boardNormalized: false,
+          currentNormalized: false,
+          holdNormalized: false,
+          queueNormalized: false,
+          board: null,
+          current: null,
+          hold: null,
+          queue: [],
+          playing: null,
+          started: null,
+          currentPath: [],
+          holdPath: [],
+          queuePath: [],
+          boardPathResolved: false
+        }),
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue(),
+        retainedObjectId: "retained-a"
+      },
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-b",
+          rootObjectId: "obj-b",
+          bindingName: "bindingB",
+          matchedShape: "_presentation.primary.board",
+          retainedRootKind: "binding",
+          retainedRootPath: ["_presentation", "primary"],
+          boardPath: ["_presentation", "primary", "board"],
+          currentPath: ["_presentation", "primary", "current"],
+          holdPath: ["_presentation", "primary", "hold"],
+          queuePath: ["_presentation", "primary", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue({
+          status: "semantic_failed",
+          reason: "accessor_path_unresolved",
+          retainedObjectStage: "binding",
+          boardWidth: 0,
+          boardHeight: 0,
+          boardNormalized: false,
+          currentNormalized: false,
+          holdNormalized: false,
+          queueNormalized: false,
+          board: null,
+          current: null,
+          hold: null,
+          queue: [],
+          playing: null,
+          started: null,
+          currentPath: [],
+          holdPath: [],
+          queuePath: [],
+          boardRequestedPath: ["_presentation", "primary", "board"],
+          boardPathResolved: false
+        }),
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["_presentation", "primary"],
+          retainedObjectStage: "binding"
+        }),
+        retainedObjectId: "retained-b"
+      }
+    ]);
+
+    const scan = await scanQuickPlayClosureCandidates(
+      harness.cdp,
+      { lastRuntimeError: "" },
+      () => {},
+      diagnosticState,
+      1
+    );
+
+    const counts = harness.counts();
+    assert.equal(scan.resultType, "no_authoritative_candidate");
+    assert.deepEqual(scan.acceptedCandidates, []);
+    assert.equal(scan.retainResult, null);
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.retainCloneCalls, 0);
+    assert.equal(counts.resumeCount, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multi-candidate semantic disambiguation with ambiguous authoritative result resumes exactly once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 31;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_200,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    const canonicalStateA = { token: "state-a" };
+    const canonicalStateB = { token: "state-b" };
+    const authoritativeValue = makeQuickPlaySemanticProbeFixtureValue({
+      retainedObjectStage: "state",
+      currentPath: ["state", "current"],
+      holdPath: ["state", "hold"],
+      queuePath: ["state", "queue"]
+    });
+    const harness = createQuickPlayMultiAcceptedPausedFixture([
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-a",
+          rootObjectId: "obj-a",
+          bindingName: "bindingA",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["state"],
+          boardPath: ["state", "board"],
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        semanticProbeValue: authoritativeValue,
+        canonicalStateTarget: canonicalStateA,
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue(),
+        retainedObjectId: "retained-a"
+      },
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-b",
+          rootObjectId: "obj-b",
+          bindingName: "bindingB",
+          matchedShape: "another.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["state"],
+          boardPath: ["state", "board"],
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        semanticProbeValue: authoritativeValue,
+        canonicalStateTarget: canonicalStateB,
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue(),
+        retainedObjectId: "retained-b"
+      }
+    ]);
+
+    const scan = await scanQuickPlayClosureCandidates(
+      harness.cdp,
+      { lastRuntimeError: "" },
+      () => {},
+      diagnosticState,
+      1
+    );
+
+    const counts = harness.counts();
+    assert.equal(scan.resultType, "ambiguous_authoritative_candidates");
+    assert.deepEqual(scan.acceptedCandidates, []);
+    assert.equal(scan.retainResult, null);
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.canonicalStateHandleCalls, 2);
+    assert.equal(counts.canonicalIdentityCompareCalls, 1);
+    assert.equal(counts.retainCloneCalls, 0);
+    assert.equal(counts.resumeCount, 1);
+    assert.equal(counts.postResumeCandidateHandleCalls, 0);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multi-candidate semantic probe transport failure fails closed and resumes exactly once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 32;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_300,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    const harness = createQuickPlayMultiAcceptedPausedFixture([
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-a",
+          rootObjectId: "obj-a",
+          bindingName: "bindingA",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["state"],
+          boardPath: ["state", "board"],
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue(),
+        semanticProbeError: "Invalid remote object id",
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue(),
+        retainedObjectId: "retained-a"
+      },
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-b",
+          rootObjectId: "obj-b",
+          bindingName: "bindingB",
+          matchedShape: "_presentation.primary.board",
+          retainedRootKind: "binding",
+          retainedRootPath: ["_presentation", "primary"],
+          boardPath: ["_presentation", "primary", "board"],
+          currentPath: ["_presentation", "primary", "current"],
+          holdPath: ["_presentation", "primary", "hold"],
+          queuePath: ["_presentation", "primary", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue(),
+        semanticProbeError: "Invalid remote object id",
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["_presentation", "primary"],
+          retainedObjectStage: "binding"
+        }),
+        retainedObjectId: "retained-b"
+      }
+    ]);
+
+    const scan = await scanQuickPlayClosureCandidates(
+      harness.cdp,
+      { lastRuntimeError: "" },
+      () => {},
+      diagnosticState,
+      1
+    );
+
+    const counts = harness.counts();
+    assert.equal(scan.resultType, "no_authoritative_candidate");
+    assert.deepEqual(scan.acceptedCandidates, []);
+    assert.equal(scan.retainResult, null);
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.retainCloneCalls, 0);
+    assert.equal(counts.resumeCount, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("multi-candidate retain failure fails closed and resumes exactly once", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "zenith";
+  controlState.modeGeneration = 33;
+  const diagnosticState = makeQuickPlayState(paths);
+  try {
+    startQuickPlayDiagnosticCapture(diagnosticState, controlState, {
+      now: 4_400,
+      log: () => {}
+    });
+    diagnosticState.currentTargetUrl = "https://tetr.io/";
+    const harness = createQuickPlayMultiAcceptedPausedFixture([
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-a",
+          rootObjectId: "obj-a",
+          bindingName: "bindingA",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["state"],
+          boardPath: ["state", "board"],
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue({
+          retainedObjectStage: "state",
+          currentPath: ["state", "current"],
+          holdPath: ["state", "hold"],
+          queuePath: ["state", "queue"]
+        }),
+        canonicalStateTarget: { token: "retain-failure-state-a" },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue(),
+        retainedObjectId: "retained-a",
+        retainCloneError: "Clone failed"
+      },
+      {
+        candidate: makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-b",
+          rootObjectId: "obj-b",
+          bindingName: "bindingB",
+          matchedShape: "_presentation.primary.board",
+          retainedRootKind: "binding",
+          retainedRootPath: ["_presentation", "primary"],
+          boardPath: ["_presentation", "primary", "board"],
+          currentPath: ["_presentation", "primary", "current"],
+          holdPath: ["_presentation", "primary", "hold"],
+          queuePath: ["_presentation", "primary", "queue"]
+        }),
+        semanticProbeValue: makeQuickPlaySemanticProbeFixtureValue({
+          status: "semantic_failed",
+          reason: "accessor_path_unresolved",
+          retainedObjectStage: "binding",
+          boardWidth: 0,
+          boardHeight: 0,
+          boardNormalized: false,
+          currentNormalized: false,
+          holdNormalized: false,
+          queueNormalized: false,
+          board: null,
+          current: null,
+          hold: null,
+          queue: [],
+          playing: null,
+          started: null,
+          currentPath: [],
+          holdPath: [],
+          queuePath: [],
+          boardRequestedPath: ["_presentation", "primary", "board"],
+          boardPathResolved: false
+        }),
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["_presentation", "primary"],
+          retainedObjectStage: "binding"
+        }),
+        retainedObjectId: "retained-b"
+      }
+    ]);
+
+    const scan = await scanQuickPlayClosureCandidates(
+      harness.cdp,
+      { lastRuntimeError: "" },
+      () => {},
+      diagnosticState,
+      1
+    );
+
+    const counts = harness.counts();
+    assert.equal(scan.resultType, "handle_clone_failed");
+    assert.deepEqual(scan.acceptedCandidates, []);
+    assert.equal(scan.retainResult?.ok, false);
+    assert.equal(scan.retainResult?.reason, "handle_clone_failed");
+    assert.equal(counts.semanticProbeCalls, 2);
+    assert.equal(counts.canonicalStateHandleCalls, 1);
+    assert.equal(counts.canonicalIdentityCompareCalls, 0);
+    assert.equal(counts.retainCloneCalls, 1);
+    assert.equal(counts.resumeCount, 1);
+    assert.equal(counts.postResumeCandidateHandleCalls, 0);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }
@@ -3527,7 +4935,7 @@ test("retained passive candidate traverses root path before cloning", async () =
 
     assert.equal(retain.ok, true);
     assert.equal(diagnosticState.boundLocalClosureCandidate.rootObjectId, "retained-state");
-    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), ["state"]);
+    assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.rootPath), []);
     assert.deepEqual(Array.from(diagnosticState.boundLocalClosureCandidate.boardPath), ["board"]);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
@@ -3625,8 +5033,8 @@ test("undefined final board value is unresolved and root probe logs only once", 
       generation: 34,
       candidateId: "cand-root-probe",
       rootObjectId: "retained-state",
-      rootPath: ["state"],
-      retainedRootPath: ["state"],
+      rootPath: [],
+      retainedRootPath: [],
       retainedRootKind: "state",
       boardPath: ["board"],
       currentPath: ["current"],

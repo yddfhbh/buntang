@@ -4529,6 +4529,9 @@ function buildQuickPlayRuntimeCandidatePaths(candidate = null) {
   if (queuePath.length === 0 && Array.isArray(candidate?.queue)) {
     queuePath = ["queue"];
   }
+  // Contract:
+  // - rootPath / retainedRootPath: paused binding object -> candidate semantic root
+  // - board/current/hold/queue paths: candidate semantic root -> field accessor
   return {
     retainedRootKind: String(
       candidate?.retainedRootKind ??
@@ -4917,6 +4920,8 @@ export async function retainQuickPlayPassiveCandidateHandle(
   }
   quickPlayDiagnosticState.boundLocalClosureCandidate = {
     ...runtimeCandidate,
+    retainedRootPath: [],
+    rootPath: [],
     rootObjectId: retainedObjectId
   };
   syncQuickPlayPassiveSnapshotCurrentState(quickPlayDiagnosticState);
@@ -5136,29 +5141,8 @@ export async function reconcileQuickPlayPassiveBinding(
   return { result, deferredReason, shouldStartPolling };
 }
 
-async function readQuickPlayPassiveSnapshot(
-  cdp,
-  quickPlayDiagnosticState,
-  {
-    now = Date.now(),
-    log = console.log
-  } = {}
-) {
-  const bound = quickPlayDiagnosticState?.boundLocalClosureCandidate;
-  const diagnostics = quickPlayDiagnosticState?.diagnostics?.passive_snapshot;
-  if (!bound?.rootObjectId || !diagnostics) {
-    if (diagnostics) {
-      diagnostics.transport_reads_failed += 1;
-      diagnostics.reads_failed += 1;
-      diagnostics.last_failure_reason = "candidate_handle_invalid";
-    }
-    syncQuickPlayPassiveSnapshotCurrentState(quickPlayDiagnosticState);
-    return { status: "unavailable", reason: "candidate_handle_invalid" };
-  }
-  diagnostics.reads_attempted += 1;
-  const result = await cdp.send("Runtime.callFunctionOn", {
-    objectId: bound.rootObjectId,
-    functionDeclaration: `function(retainedRootKind, boardPath, currentPath, holdPath, queuePath) {
+function quickPlayPassiveSemanticProbeFunctionDeclaration() {
+  return `function(retainedRootKind, rootPath, boardPath, currentPath, holdPath, queuePath, returnCanonicalStateContext = false) {
       const pieceNames = ["I", "O", "T", "S", "Z", "J", "L"];
       const normalizePieceType = (value) => {
         if (value === null || value === undefined || value === false) return null;
@@ -5558,11 +5542,33 @@ async function readQuickPlayPassiveSnapshot(
         if (!this || typeof this !== "object") {
           return { status: "candidate_handle_invalid" };
         }
-        const boardLookup = Array.isArray(boardPath) ? readPath(this, boardPath) : { ok: false, value: null };
-        const currentLookup = Array.isArray(currentPath) ? readPath(this, currentPath) : { ok: false, value: null };
-        const holdLookup = Array.isArray(holdPath) ? readPath(this, holdPath) : { ok: false, value: null };
-        const queueLookup = Array.isArray(queuePath) ? readPath(this, queuePath) : { ok: false, value: null };
-        const rootDiagnostic = describeRoot(this);
+        const rootLookup = Array.isArray(rootPath)
+          ? readPath(this, rootPath)
+          : { ok: false, value: undefined, requestedPath: [], resolvedSegments: [], failedSegment: null, accessorException: false };
+        const resolvedRoot =
+          rootLookup.ok === true &&
+          rootLookup.value &&
+          (typeof rootLookup.value === "object" || typeof rootLookup.value === "function")
+            ? rootLookup.value
+            : null;
+        const boardLookup = Array.isArray(boardPath) ? readPath(resolvedRoot, boardPath) : { ok: false, value: null };
+        const currentLookup = Array.isArray(currentPath) ? readPath(resolvedRoot, currentPath) : { ok: false, value: null };
+        const holdLookup = Array.isArray(holdPath) ? readPath(resolvedRoot, holdPath) : { ok: false, value: null };
+        const queueLookup = Array.isArray(queuePath) ? readPath(resolvedRoot, queuePath) : { ok: false, value: null };
+        const rootDiagnosticBase = buildBaseFieldDiagnostic(rootPath, rootLookup);
+        const rootDiagnostic =
+          rootLookup.ok === true && resolvedRoot
+            ? {
+                ...rootDiagnosticBase,
+                ...describeRoot(resolvedRoot)
+              }
+            : {
+                ...rootDiagnosticBase,
+                retained_root_kind:
+                  typeof retainedRootKind === "string" && retainedRootKind.trim()
+                    ? retainedRootKind.trim()
+                    : "binding"
+              };
         const boardDiagnosticBase = buildBaseFieldDiagnostic(boardPath, boardLookup);
         const currentDiagnosticBase = buildBaseFieldDiagnostic(currentPath, currentLookup);
         const holdDiagnosticBase = buildBaseFieldDiagnostic(holdPath, holdLookup);
@@ -5597,21 +5603,30 @@ async function readQuickPlayPassiveSnapshot(
             ? normalizeQueue(queueLookup.value)
             : { ok: false, reason: "accessor_path_unresolved", value: [] };
         const contextLookups = [
-          readPath(this, Array.isArray(currentPath) ? currentPath.slice(0, -1) : []),
-          readPath(this, Array.isArray(boardPath) ? boardPath.slice(0, -1) : []),
-          readPath(this, Array.isArray(queuePath) ? queuePath.slice(0, -1) : []),
-          readPath(this, Array.isArray(holdPath) ? holdPath.slice(0, -1) : [])
+          readPath(resolvedRoot, Array.isArray(currentPath) ? currentPath.slice(0, -1) : []),
+          readPath(resolvedRoot, Array.isArray(boardPath) ? boardPath.slice(0, -1) : []),
+          readPath(resolvedRoot, Array.isArray(queuePath) ? queuePath.slice(0, -1) : []),
+          readPath(resolvedRoot, Array.isArray(holdPath) ? holdPath.slice(0, -1) : [])
         ];
         const stateContext =
-          contextLookups.find((entry) => entry?.ok && entry.value && typeof entry.value === "object")?.value ?? this;
+          contextLookups.find((entry) => entry?.ok && entry.value && typeof entry.value === "object")?.value ??
+          resolvedRoot ??
+          this;
+        if (returnCanonicalStateContext === true) {
+          return stateContext && (typeof stateContext === "object" || typeof stateContext === "function")
+            ? stateContext
+            : undefined;
+        }
         const rawPauseState = readRawPauseState(stateContext);
         const paused = normalizePausedState(rawPauseState);
         const playing =
+          typeof resolvedRoot?.isPlaying === "function" ? Boolean(resolvedRoot.isPlaying()) :
           typeof this.isPlaying === "function" ? Boolean(this.isPlaying()) :
           typeof stateContext?.playing === "boolean" ? stateContext.playing :
           rawPauseState !== undefined ? !paused :
           null;
         const started =
+          typeof resolvedRoot?.isStarted === "function" ? Boolean(resolvedRoot.isStarted()) :
           typeof this.isStarted === "function" ? Boolean(this.isStarted()) :
           typeof stateContext?.started === "boolean" ? stateContext.started :
           null;
@@ -5641,7 +5656,8 @@ async function readQuickPlayPassiveSnapshot(
         const fieldDiagnostics = {
           root: {
             ...rootDiagnostic,
-            retained_object_stage: classifyRootStage(this, rootDiagnostic)
+            retained_object_stage: classifyRootStage(resolvedRoot, rootDiagnostic),
+            resolved_root: rootLookup.ok === true && resolvedRoot !== null
           },
           board: boardResult.diagnostic,
           current: currentDiagnostic,
@@ -5693,24 +5709,397 @@ async function readQuickPlayPassiveSnapshot(
       } catch {
         return { status: "candidate_handle_invalid" };
       }
-    }`,
+    }`;
+}
+
+async function probeQuickPlayPassiveSemanticState(cdp, runtimeCandidate) {
+  if (!cdp?.send || !runtimeCandidate?.rootObjectId) {
+    return {
+      status: "candidate_handle_invalid",
+      reason: "candidate_handle_invalid",
+      transport_error: !cdp?.send
+    };
+  }
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId: runtimeCandidate.rootObjectId,
+    functionDeclaration: quickPlayPassiveSemanticProbeFunctionDeclaration(),
     arguments: [
-      { value: bound.retainedRootKind },
-      { value: bound.boardPath },
-      { value: bound.currentPath },
-      { value: bound.holdPath },
-      { value: bound.queuePath }
+      { value: runtimeCandidate.retainedRootKind },
+      { value: runtimeCandidate.rootPath },
+      { value: runtimeCandidate.boardPath },
+      { value: runtimeCandidate.currentPath },
+      { value: runtimeCandidate.holdPath },
+      { value: runtimeCandidate.queuePath }
     ],
     returnByValue: true,
     silent: true
   }).catch((error) => ({ error }));
   if (result?.error) {
+    return {
+      status: "candidate_handle_invalid",
+      reason: "candidate_handle_invalid",
+      transport_error: true
+    };
+  }
+  return result?.result?.value ?? { status: "candidate_handle_invalid" };
+}
+
+async function resolveQuickPlayPassiveCanonicalStateContextHandle(cdp, runtimeCandidate) {
+  if (!cdp?.send || !runtimeCandidate?.rootObjectId) {
+    return {
+      ok: false,
+      reason: "canonical_state_context_unavailable"
+    };
+  }
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId: runtimeCandidate.rootObjectId,
+    functionDeclaration: quickPlayPassiveSemanticProbeFunctionDeclaration(),
+    arguments: [
+      { value: runtimeCandidate.retainedRootKind },
+      { value: runtimeCandidate.rootPath },
+      { value: runtimeCandidate.boardPath },
+      { value: runtimeCandidate.currentPath },
+      { value: runtimeCandidate.holdPath },
+      { value: runtimeCandidate.queuePath },
+      { value: true }
+    ],
+    returnByValue: false,
+    silent: true,
+    objectGroup: "fusion-quick-play-diagnostic"
+  }).catch(() => null);
+  const objectId = String(result?.result?.objectId ?? "").trim();
+  if (!objectId) {
+    return {
+      ok: false,
+      reason: "canonical_state_context_unavailable"
+    };
+  }
+  return {
+    ok: true,
+    objectId
+  };
+}
+
+async function compareQuickPlayRuntimeObjectIdentity(cdp, leftObjectId, rightObjectId) {
+  const left = String(leftObjectId ?? "").trim();
+  const right = String(rightObjectId ?? "").trim();
+  if (!cdp?.send || !left || !right) {
+    return false;
+  }
+  const result = await cdp.send("Runtime.callFunctionOn", {
+    objectId: left,
+    functionDeclaration: `function(other) {
+      return this === other;
+    }`,
+    arguments: [{ objectId: right }],
+    returnByValue: true,
+    silent: true
+  }).catch(() => null);
+  return result?.result?.value === true;
+}
+
+function summarizeQuickPlaySemanticLifecycle(value = null) {
+  if (value?.destroyed === true) {
+    return "destroyed";
+  }
+  if (value?.playing === true) {
+    return "playing";
+  }
+  if (value?.countdown_started === true) {
+    return "countdown";
+  }
+  if (value?.started === true) {
+    return "started";
+  }
+  return "inactive";
+}
+
+function evaluateQuickPlayAuthoritativeCandidateProbe(runtimeCandidate, value = null) {
+  const rootStage = String(
+    value?.field_diagnostics?.root?.retained_object_stage ?? "unknown"
+  ).trim() || "unknown";
+  const boardWidth = Math.max(0, Number(value?.board_width ?? 0));
+  const boardHeight = Math.max(0, Number(value?.board_height ?? 0));
+  const boardContractReady =
+    value?.board_normalized === true &&
+    value?.current_normalized === true &&
+    value?.hold_normalized === true &&
+    value?.queue_normalized === true &&
+    boardWidth === 10 &&
+    boardHeight > 0;
+  const lifecycleReady =
+    value?.destroyed !== true &&
+    (value?.playing === true || value?.started === true || value?.countdown_started === true);
+  const rootStageReady = rootStage === "state" || rootStage === "game";
+  const pathInvariantReady =
+    runtimeCandidate?.pathInvariantOk === true &&
+    Array.isArray(runtimeCandidate?.boardPath) &&
+    runtimeCandidate.boardPath.length > 0 &&
+    Array.isArray(runtimeCandidate?.currentPath) &&
+    runtimeCandidate.currentPath.length > 0 &&
+    Array.isArray(runtimeCandidate?.holdPath) &&
+    runtimeCandidate.holdPath.length > 0 &&
+    Array.isArray(runtimeCandidate?.queuePath) &&
+    runtimeCandidate.queuePath.length > 0;
+  const semanticReady =
+    value?.status === "ready" &&
+    value?.transport_error !== true;
+  let predicate = "authoritative_semantic_state";
+  if (!pathInvariantReady) {
+    predicate = "path_invariant_failed";
+  } else if (!semanticReady) {
+    predicate =
+      value?.status === "candidate_handle_invalid"
+        ? "runtime_object_unavailable"
+        : String(value?.reason ?? value?.status ?? "semantic_probe_failed");
+  } else if (!boardContractReady) {
+    predicate = "board_contract_unverified";
+  } else if (!lifecycleReady) {
+    predicate = "lifecycle_inactive";
+  } else if (!rootStageReady) {
+    predicate = "root_stage_not_authoritative";
+  }
+  return {
+    authoritative:
+      pathInvariantReady &&
+      semanticReady &&
+      boardContractReady &&
+      lifecycleReady &&
+      rootStageReady,
+    predicate,
+    rootStage,
+    boardWidth,
+    boardHeight,
+    lifecycle: summarizeQuickPlaySemanticLifecycle(value)
+  };
+}
+
+async function selectQuickPlayAuthoritativeAcceptedCandidate(
+  cdp,
+  quickPlayDiagnosticState,
+  acceptedCandidates,
+  {
+    generation = 0,
+    targetId = "",
+    capturedAt = Date.now(),
+    log = console.log
+  } = {}
+) {
+  const normalizedAccepted = Array.isArray(acceptedCandidates)
+    ? acceptedCandidates
+    : [];
+  const results = [];
+  for (let index = 0; index < normalizedAccepted.length; index += 1) {
+    const candidate = normalizedAccepted[index];
+    const runtimeCandidate = buildQuickPlayPassiveRuntimeCandidate(candidate, {
+      generation,
+      targetId,
+      capturedAt
+    });
+    if (typeof log === "function") {
+      log(
+        `[quick-play] accepted candidate metadata index=${index + 1}/${normalizedAccepted.length} candidate=${String(
+          runtimeCandidate.candidateId || "unknown"
+        )} root_path=${runtimeCandidate.rootPath.join(".") || "(root)"} board_path=${runtimeCandidate.boardPath.join(".") || "(missing)"} current_path=${runtimeCandidate.currentPath.join(".") || "(missing)"} hold_path=${runtimeCandidate.holdPath.join(".") || "(missing)"} queue_path=${runtimeCandidate.queuePath.join(".") || "(missing)"} matched_shape=${String(
+          candidate?.matchedShape ?? "unknown"
+        )} retained_root_kind=${String(runtimeCandidate.retainedRootKind ?? "binding")}`
+      );
+    }
+    let probeValue = {
+      status: "candidate_handle_invalid",
+      reason: "path_invariant_failed"
+    };
+    if (isQuickPlayPassiveRuntimeCandidateReady(runtimeCandidate)) {
+      probeValue = await probeQuickPlayPassiveSemanticState(cdp, runtimeCandidate);
+    }
+    const evaluation = evaluateQuickPlayAuthoritativeCandidateProbe(
+      runtimeCandidate,
+      probeValue
+    );
+    const rootResolved =
+      probeValue?.field_diagnostics?.root?.path_resolved === true &&
+      probeValue?.field_diagnostics?.root?.resolved_root === true;
+    const boardPathResolved = probeValue?.field_diagnostics?.board?.path_resolved === true;
+    const currentPathResolved = probeValue?.field_diagnostics?.current?.path_resolved === true;
+    const holdPathResolved = probeValue?.field_diagnostics?.hold?.path_resolved === true;
+    const queuePathResolved = probeValue?.field_diagnostics?.queue?.path_resolved === true;
+    if (typeof log === "function") {
+      log(
+        `[quick-play] accepted candidate probe index=${index + 1}/${normalizedAccepted.length} candidate=${String(
+          runtimeCandidate.candidateId || "unknown"
+        )} root_path=${runtimeCandidate.rootPath.join(".") || "(root)"} resolved_root=${rootResolved ? "true" : "false"} root_stage=${evaluation.rootStage} board_path_resolved=${boardPathResolved ? "true" : "false"} current_path_resolved=${currentPathResolved ? "true" : "false"} hold_path_resolved=${holdPathResolved ? "true" : "false"} queue_path_resolved=${queuePathResolved ? "true" : "false"} status=${String(probeValue?.status ?? "unknown")} predicate=${evaluation.predicate} authoritative=${evaluation.authoritative ? "true" : "false"} board_width=${evaluation.boardWidth} board_height=${evaluation.boardHeight} lifecycle=${evaluation.lifecycle}`
+      );
+    }
+    results.push({
+      candidate,
+      runtimeCandidate,
+      probeValue,
+      evaluation
+    });
+  }
+  const authoritative = results.filter(
+    (entry) => entry?.evaluation?.authoritative === true
+  );
+  if (typeof log === "function") {
+    log(`[quick-play] accepted authoritative candidates=${authoritative.length}`);
+  }
+  if (authoritative.length === 0) {
+    return {
+      candidate: null,
+      runtimeCandidate: null,
+      acceptedCandidates: [],
+      retainResult: null,
+      results,
+      reason: "no_authoritative_candidate"
+    };
+  }
+  const semanticGroups = [];
+  for (const authoritativeEntry of authoritative) {
+    const canonicalStateHandle = await resolveQuickPlayPassiveCanonicalStateContextHandle(
+      cdp,
+      authoritativeEntry.runtimeCandidate
+    );
+    if (canonicalStateHandle?.ok !== true) {
+      return {
+        candidate: null,
+        runtimeCandidate: null,
+        acceptedCandidates: [],
+        retainResult: null,
+        results,
+        reason: String(canonicalStateHandle?.reason ?? "canonical_state_context_unavailable")
+      };
+    }
+    authoritativeEntry.canonicalStateHandle = canonicalStateHandle;
+    let matchedGroup = null;
+    for (const group of semanticGroups) {
+      if (
+        await compareQuickPlayRuntimeObjectIdentity(
+          cdp,
+          authoritativeEntry.canonicalStateHandle?.objectId,
+          group.canonicalStateHandle?.objectId
+        )
+      ) {
+        matchedGroup = group;
+        break;
+      }
+    }
+    if (matchedGroup) {
+      matchedGroup.entries.push(authoritativeEntry);
+    } else {
+      semanticGroups.push({
+        canonicalStateHandle: authoritativeEntry.canonicalStateHandle,
+        entries: [authoritativeEntry]
+      });
+    }
+  }
+  if (typeof log === "function") {
+    log(`[quick-play] canonical semantic groups=${semanticGroups.length}`);
+    for (let index = 0; index < semanticGroups.length; index += 1) {
+      log(
+        `[quick-play] alias group size=${semanticGroups[index].entries.length} group=${index + 1}/${semanticGroups.length}`
+      );
+    }
+  }
+  if (semanticGroups.length === 1) {
+    const selectedGroup = semanticGroups[0];
+    const selected = selectedGroup.entries[0];
+    if (typeof log === "function") {
+      log(
+        `[quick-play] selected semantic group=1/${semanticGroups.length} representative_index=${results.indexOf(selected) + 1}/${normalizedAccepted.length} candidate=${String(
+          selected.runtimeCandidate?.candidateId || "unknown"
+        )}`
+      );
+    }
+    const retainResult = await retainQuickPlayPassiveCandidateHandle(
+      cdp,
+      quickPlayDiagnosticState,
+      selected.candidate,
+      {
+        generation,
+        targetId,
+        capturedAt,
+        log
+      }
+    );
+    if (typeof log === "function") {
+      log(
+        `[quick-play] selected semantic group=1/${semanticGroups.length} retain=${retainResult?.ok === true ? "success" : "failed"}${retainResult?.ok === true ? "" : ` reason=${String(retainResult?.reason ?? "unknown")}`}`
+      );
+    }
+    if (retainResult?.ok === true) {
+      return {
+        candidate: selected.candidate,
+        runtimeCandidate: selected.runtimeCandidate,
+        acceptedCandidates: [selected.candidate],
+        retainResult,
+        results,
+        reason: "authoritative_candidate_selected"
+      };
+    }
+    return {
+      candidate: null,
+      runtimeCandidate: null,
+      acceptedCandidates: [],
+      retainResult,
+      results,
+      reason: String(retainResult?.reason ?? "candidate_retain_failed")
+    };
+  }
+  return {
+    candidate: null,
+    runtimeCandidate: null,
+    acceptedCandidates: [],
+    retainResult: null,
+    results,
+    reason: "ambiguous_authoritative_candidates"
+  };
+}
+
+function isQuickPlayAuthoritativeSelectionFailClosedReason(resultType = "") {
+  const normalized = String(resultType ?? "").trim();
+  return (
+    normalized === "no_authoritative_candidate" ||
+    normalized === "ambiguous_authoritative_candidates" ||
+    normalized === "candidate_retain_failed" ||
+    normalized === "root_object_not_found" ||
+    normalized === "missing_runtime_object_handle" ||
+    normalized === "generation_mismatch" ||
+    normalized === "target_mismatch" ||
+    normalized === "candidate_ambiguous" ||
+    normalized === "root_path_invariant_failed" ||
+    normalized === "handle_released_before_retain" ||
+    normalized === "handle_clone_failed" ||
+    normalized === "canonical_state_context_unavailable"
+  );
+}
+
+async function readQuickPlayPassiveSnapshot(
+  cdp,
+  quickPlayDiagnosticState,
+  {
+    now = Date.now(),
+    log = console.log
+  } = {}
+) {
+  const bound = quickPlayDiagnosticState?.boundLocalClosureCandidate;
+  const diagnostics = quickPlayDiagnosticState?.diagnostics?.passive_snapshot;
+  if (!bound?.rootObjectId || !diagnostics) {
+    if (diagnostics) {
+      diagnostics.transport_reads_failed += 1;
+      diagnostics.reads_failed += 1;
+      diagnostics.last_failure_reason = "candidate_handle_invalid";
+    }
+    syncQuickPlayPassiveSnapshotCurrentState(quickPlayDiagnosticState);
+    return { status: "unavailable", reason: "candidate_handle_invalid" };
+  }
+  diagnostics.reads_attempted += 1;
+  const value = await probeQuickPlayPassiveSemanticState(cdp, bound);
+  if (value?.transport_error === true) {
     diagnostics.transport_reads_failed += 1;
     diagnostics.reads_failed += 1;
     return { status: "unavailable", reason: "candidate_handle_invalid" };
   }
   diagnostics.transport_reads_succeeded += 1;
-  const value = result?.result?.value ?? { status: "candidate_handle_invalid" };
   if (value.status === "candidate_handle_invalid") {
     diagnostics.semantic_reads_failed += 1;
     diagnostics.reads_failed += 1;
@@ -7424,8 +7813,32 @@ export async function scanQuickPlayClosureCandidates(
         log
       }
     );
+    let finalizedScan = scanned;
     let retainResult = null;
-    if (Array.isArray(scanned?.acceptedCandidates) && scanned.acceptedCandidates.length === 1) {
+    if (Array.isArray(scanned?.acceptedCandidates) && scanned.acceptedCandidates.length > 1) {
+      const selection = await selectQuickPlayAuthoritativeAcceptedCandidate(
+        cdp,
+        quickPlayDiagnosticState,
+        scanned.acceptedCandidates,
+        {
+          generation: quickPlayDiagnosticState.captureGeneration,
+          targetId: quickPlayDiagnosticState.currentTargetUrl,
+          capturedAt: Date.now(),
+          log
+        }
+      );
+      retainResult = selection?.retainResult ?? null;
+      finalizedScan = {
+        ...scanned,
+        acceptedCandidates: Array.isArray(selection?.acceptedCandidates)
+          ? selection.acceptedCandidates
+          : [],
+        resultType:
+          selection?.reason === "authoritative_candidate_selected"
+            ? scanned?.resultType ?? "accepted_candidates_found"
+            : String(selection?.reason ?? scanned?.resultType ?? "accepted_candidates_found")
+      };
+    } else if (Array.isArray(scanned?.acceptedCandidates) && scanned.acceptedCandidates.length === 1) {
       retainResult = await retainQuickPlayPassiveCandidateHandle(
         cdp,
         quickPlayDiagnosticState,
@@ -7444,7 +7857,7 @@ export async function scanQuickPlayClosureCandidates(
       pauseRequested: 1,
       pauseAcquired: 1,
       retainResult,
-      ...scanned
+      ...finalizedScan
     };
   } catch (error) {
     return {
@@ -7603,6 +8016,9 @@ function shouldRetryQuickPlayClosureScan(quickPlayDiagnosticState, scan) {
     return false;
   }
   if (scan?.resultType === "capture_inactive" || scan?.resultType === "stale_generation") {
+    return false;
+  }
+  if (isQuickPlayAuthoritativeSelectionFailClosedReason(scan?.resultType)) {
     return false;
   }
   if (quickPlayDiagnosticState?.boundLocalClosureCandidate?.rootObjectId) {
@@ -7837,13 +8253,24 @@ export async function maybeRunQuickPlayDiagnosticCapture({
           const acceptedCandidates = Array.isArray(scan?.acceptedCandidates)
             ? scan.acceptedCandidates
             : [];
-          if (acceptedCandidates.length === 1) {
+          let selectedAcceptedCandidate =
+            acceptedCandidates.length === 1 ? acceptedCandidates[0] : null;
+          if (!selectedAcceptedCandidate &&
+            isQuickPlayAuthoritativeSelectionFailClosedReason(scan?.resultType)) {
+            await releaseQuickPlayPassiveState(cdp, quickPlayDiagnosticState, {
+              reason: String(scan?.resultType ?? "no_authoritative_candidate"),
+              writeSnapshotStatus: true,
+              preserveDiagnostics: true,
+              log
+            });
+          }
+          if (selectedAcceptedCandidate) {
             const retainResult = scan?.retainResult && typeof scan.retainResult === "object"
               ? scan.retainResult
               : await retainQuickPlayPassiveCandidateHandle(
                   cdp,
                   quickPlayDiagnosticState,
-                  acceptedCandidates[0],
+                  selectedAcceptedCandidate,
                   {
                     generation: quickPlayDiagnosticState.captureGeneration,
                     targetId: quickPlayDiagnosticState.currentTargetUrl,
@@ -7883,13 +8310,6 @@ export async function maybeRunQuickPlayDiagnosticCapture({
                 });
               }
             }
-          } else if (acceptedCandidates.length > 1) {
-            await releaseQuickPlayPassiveState(cdp, quickPlayDiagnosticState, {
-              reason: "ambiguous_accepted_candidates",
-              writeSnapshotStatus: true,
-              preserveDiagnostics: true,
-              log
-            });
           }
           const rejectedCandidates = Math.max(
             0,

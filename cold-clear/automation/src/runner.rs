@@ -1238,6 +1238,9 @@ pub(crate) struct DryRunPlanSummary {
     pub use_hold: bool,
     pub target_x: i32,
     pub target_rotation: RotationToken,
+    pub movement_mode_used: MovementModeConfig,
+    pub fallback_from: Option<MovementModeConfig>,
+    pub fallback_reason: Option<String>,
     pub action_count: usize,
     pub actions: Vec<GameAction>,
     pub route_kind: String,
@@ -1250,9 +1253,19 @@ pub(crate) struct PreparedSnapshotExecution {
     pub execution_plan: ExecutionPlan,
 }
 
+#[derive(Debug)]
 pub(crate) enum PreparedSnapshotExecutionResult {
     Ready(PreparedSnapshotExecution),
-    Skipped { reason: String },
+    Skipped { reason: String, retryable: bool },
+}
+
+struct SnapshotExecutionAttempt {
+    planned_move: Move,
+    planner_label: String,
+    execution_result: std::result::Result<ExecutionPlanBuildResult, BuildExecutionError>,
+    movement_mode_used: MovementModeConfig,
+    fallback_from: Option<MovementModeConfig>,
+    fallback_reason: Option<String>,
 }
 
 pub(crate) fn prepare_snapshot_execution(
@@ -1265,19 +1278,74 @@ pub(crate) fn prepare_snapshot_execution(
         .first()
         .copied()
         .context("snapshot queue must include the active piece as the first element")?;
-    let planner_started_at = Instant::now();
     let Some((planned_move, planner_info)) =
         plan_move_for_mode(config, snapshot, config.bot.movement_mode, &sprint_state)?
     else {
         return Ok(PreparedSnapshotExecutionResult::Skipped {
             reason: "planner_returned_none".to_owned(),
+            retryable: true,
         });
     };
-    let execution_result =
-        build_execution_plan(config, snapshot, &planned_move, config.bot.movement_mode);
     let planner_label = format_planner_info(&planner_info);
-    let _planner_elapsed_ms = planner_started_at.elapsed().as_millis();
-    match execution_result {
+    match build_execution_plan(config, snapshot, &planned_move, config.bot.movement_mode) {
+        Ok(plan) => finalize_snapshot_execution_attempt(
+            snapshot,
+            active_piece,
+            SnapshotExecutionAttempt {
+                planned_move,
+                planner_label,
+                execution_result: Ok(plan),
+                movement_mode_used: config.bot.movement_mode,
+                fallback_from: None,
+                fallback_reason: None,
+            },
+        ),
+        Err(BuildExecutionError::NoSafeRoute(failure)) => {
+            if config.bot.movement_mode == MovementModeConfig::HardDropOnly {
+                return Ok(PreparedSnapshotExecutionResult::Skipped {
+                    reason: no_safe_route_reason(&failure),
+                    retryable: true,
+                });
+            }
+
+            let fallback_mode = MovementModeConfig::HardDropOnly;
+            let fallback_reason = no_safe_route_reason(&failure);
+            let Some((fallback_move, fallback_info)) =
+                plan_move_for_mode(config, snapshot, fallback_mode, &sprint_state)?
+            else {
+                return Ok(PreparedSnapshotExecutionResult::Skipped {
+                    reason: fallback_reason,
+                    retryable: true,
+                });
+            };
+            finalize_snapshot_execution_attempt(
+                snapshot,
+                active_piece,
+                SnapshotExecutionAttempt {
+                    planned_move: fallback_move.clone(),
+                    planner_label: format_planner_info(&fallback_info),
+                    execution_result: build_execution_plan(
+                        config,
+                        snapshot,
+                        &fallback_move,
+                        fallback_mode,
+                    ),
+                    movement_mode_used: fallback_mode,
+                    fallback_from: Some(config.bot.movement_mode),
+                    fallback_reason: Some(fallback_reason),
+                },
+            )
+        }
+        Err(BuildExecutionError::Fatal(err)) => Err(err),
+    }
+}
+
+fn finalize_snapshot_execution_attempt(
+    snapshot: &GameSnapshot,
+    active_piece: PieceToken,
+    attempt: SnapshotExecutionAttempt,
+) -> Result<PreparedSnapshotExecutionResult> {
+    match attempt.execution_result {
         Ok(plan) => {
             let actions = route_actions_with_hard_drop(&plan.execution_plan);
             Ok(PreparedSnapshotExecutionResult::Ready(
@@ -1286,15 +1354,18 @@ pub(crate) fn prepare_snapshot_execution(
                         token: snapshot.token.clone(),
                         piece: active_piece,
                         hold_piece: snapshot.hold,
-                        use_hold: planned_move.hold,
-                        target_x: planned_move.expected_location.x,
+                        use_hold: attempt.planned_move.hold,
+                        target_x: attempt.planned_move.expected_location.x,
                         target_rotation: rotation_token_from_state(
-                            planned_move.expected_location.kind.1,
+                            attempt.planned_move.expected_location.kind.1,
                         ),
+                        movement_mode_used: attempt.movement_mode_used,
+                        fallback_from: attempt.fallback_from,
+                        fallback_reason: attempt.fallback_reason,
                         action_count: actions.len(),
                         actions,
                         route_kind: plan.route_selection.route_kind.to_owned(),
-                        planner: planner_label,
+                        planner: attempt.planner_label,
                     },
                     execution_plan: plan.execution_plan,
                 },
@@ -1302,13 +1373,21 @@ pub(crate) fn prepare_snapshot_execution(
         }
         Err(BuildExecutionError::NoSafeRoute(failure)) => {
             Ok(PreparedSnapshotExecutionResult::Skipped {
-                reason: failure
-                    .representative_reject_reason
-                    .unwrap_or_else(|| "no_safe_route".to_owned()),
+                reason: attempt
+                    .fallback_reason
+                    .unwrap_or_else(|| no_safe_route_reason(&failure)),
+                retryable: true,
             })
         }
         Err(BuildExecutionError::Fatal(err)) => Err(err),
     }
+}
+
+fn no_safe_route_reason(failure: &RouteSelectionFailure) -> String {
+    failure
+        .representative_reject_reason
+        .clone()
+        .unwrap_or_else(|| "no_safe_route".to_owned())
 }
 
 fn log_route_skip<F>(
@@ -2917,6 +2996,123 @@ mod tests {
         assert_eq!(plan.execution_plan.movement_actions, vec![GameAction::Left]);
         assert!(plan.execution_plan.hard_drop);
         assert_eq!(plan.route_selection.route_kind, "SpawnTapCountSafe");
+    }
+
+    #[test]
+    fn snapshot_execution_attempt_returns_ready_for_hard_drop_fallback() {
+        let snapshot = runner_test_snapshot("zenith-fallback-ready", 3);
+        let planned_move = Move {
+            inputs: Default::default(),
+            expected_location: FallingPiece {
+                kind: PieceState(Piece::J, RotationState::North),
+                x: 4,
+                y: 0,
+                tspin: TspinStatus::None,
+            },
+            hold: false,
+        };
+
+        let result = finalize_snapshot_execution_attempt(
+            &snapshot,
+            PieceToken::J,
+            SnapshotExecutionAttempt {
+                planned_move,
+                planner_label: "normal nodes=1 depth=1 rank=0".to_owned(),
+                execution_result: Ok(ExecutionPlanBuildResult {
+                    execution_plan: ExecutionPlan {
+                        hold: false,
+                        movement_actions: vec![GameAction::Left],
+                        hard_drop: true,
+                    },
+                    route_selection: RouteSelection {
+                        route_kind: "SpawnTapCountSafe",
+                        movement_actions: vec![GameAction::Left],
+                        candidate_count: 1,
+                        rejected_count: 0,
+                        representative_reject_reason: None,
+                        estimated_input_cost: 1,
+                        rotation_count: 0,
+                        direction_changes: 0,
+                        action_count: 1,
+                        soft_drop_count: 0,
+                        is_spin_route: false,
+                        used_spin_fallback: false,
+                    },
+                }),
+                movement_mode_used: MovementModeConfig::HardDropOnly,
+                fallback_from: Some(MovementModeConfig::ZeroGSafe),
+                fallback_reason: Some(
+                    "post_softdrop_horizontal_blocked actions=Left x1".to_owned(),
+                ),
+            },
+        )
+        .unwrap();
+
+        match result {
+            PreparedSnapshotExecutionResult::Ready(prepared) => {
+                assert_eq!(
+                    prepared.summary.movement_mode_used,
+                    MovementModeConfig::HardDropOnly
+                );
+                assert_eq!(
+                    prepared.summary.fallback_from,
+                    Some(MovementModeConfig::ZeroGSafe)
+                );
+                assert_eq!(
+                    prepared.summary.fallback_reason.as_deref(),
+                    Some("post_softdrop_horizontal_blocked actions=Left x1")
+                );
+                assert_eq!(
+                    prepared.execution_plan.movement_actions,
+                    vec![GameAction::Left]
+                );
+            }
+            other => panic!("expected fallback ready result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_execution_attempt_keeps_primary_reason_when_fallback_also_fails() {
+        let snapshot = runner_test_snapshot("zenith-fallback-skip", 3);
+        let planned_move = Move {
+            inputs: Default::default(),
+            expected_location: FallingPiece {
+                kind: PieceState(Piece::J, RotationState::North),
+                x: 4,
+                y: 0,
+                tspin: TspinStatus::None,
+            },
+            hold: false,
+        };
+
+        let result = finalize_snapshot_execution_attempt(
+            &snapshot,
+            PieceToken::J,
+            SnapshotExecutionAttempt {
+                planned_move,
+                planner_label: "normal nodes=1 depth=1 rank=0".to_owned(),
+                execution_result: Err(BuildExecutionError::NoSafeRoute(RouteSelectionFailure {
+                    candidate_count: 1,
+                    rejected_count: 1,
+                    representative_reject_reason: Some("spawn_tap_route_misses_target".to_owned()),
+                    rejected_route_samples: vec![],
+                })),
+                movement_mode_used: MovementModeConfig::HardDropOnly,
+                fallback_from: Some(MovementModeConfig::ZeroGSafe),
+                fallback_reason: Some(
+                    "post_softdrop_horizontal_blocked actions=Left x1".to_owned(),
+                ),
+            },
+        )
+        .unwrap();
+
+        match result {
+            PreparedSnapshotExecutionResult::Skipped { reason, retryable } => {
+                assert!(retryable);
+                assert_eq!(reason, "post_softdrop_horizontal_blocked actions=Left x1");
+            }
+            other => panic!("expected retryable skipped result, got {other:?}"),
+        }
     }
 
     #[test]

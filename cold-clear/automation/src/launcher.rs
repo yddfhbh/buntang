@@ -740,7 +740,8 @@ struct ZenithDryRunController {
     last_game_id: Option<String>,
     last_capture_generation: Option<u64>,
     last_candidate_id: Option<String>,
-    last_snapshot_token: Option<String>,
+    last_attempted_file_signature: Option<String>,
+    last_processed_snapshot_token: Option<String>,
     last_piece_counter: Option<u32>,
     last_current_signature: Option<String>,
     last_planned_at: Option<Instant>,
@@ -757,7 +758,8 @@ impl ZenithDryRunController {
         self.last_game_id = None;
         self.last_capture_generation = None;
         self.last_candidate_id = None;
-        self.last_snapshot_token = None;
+        self.last_attempted_file_signature = None;
+        self.last_processed_snapshot_token = None;
         self.last_piece_counter = None;
         self.last_current_signature = None;
         self.last_planned_at = None;
@@ -768,16 +770,29 @@ impl ZenithDryRunController {
         self.last_skip_key = None;
     }
 
-    fn record_processed(&mut self, snapshot: &ZenithPassivePlannerSnapshot) {
+    fn record_attempted(&mut self, snapshot: &ZenithPassivePlannerSnapshot, file_signature: &str) {
         self.last_game_id = Some(snapshot.gameid.clone());
         self.last_capture_generation = Some(snapshot.capture_generation);
         self.last_candidate_id = Some(snapshot.candidate_id.clone());
-        self.last_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.last_attempted_file_signature = Some(file_signature.to_owned());
         self.last_piece_counter = snapshot.snapshot.piece_counter;
         self.last_current_signature = Some(snapshot.current_signature.clone());
-        self.last_planned_at = Some(Instant::now());
         self.active = true;
         self.clear_skip_reason();
+    }
+
+    fn record_processed(&mut self, snapshot: &ZenithPassivePlannerSnapshot, file_signature: &str) {
+        self.record_attempted(snapshot, file_signature);
+        self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.last_planned_at = Some(Instant::now());
+    }
+
+    fn is_duplicate_attempt(&self, file_signature: &str) -> bool {
+        self.last_attempted_file_signature.as_deref() == Some(file_signature)
+    }
+
+    fn is_duplicate_processed_piece(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
+        self.last_processed_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
     }
 
     fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
@@ -2525,12 +2540,18 @@ impl LauncherApp {
                 self.defer_zenith_live_input_for_pacing(snapshot, remaining);
                 return;
             }
-        } else if self.zenith_dry_run.last_snapshot_token.as_deref()
-            == Some(snapshot.snapshot.token.as_str())
-        {
+        } else if self.zenith_dry_run.is_duplicate_processed_piece(snapshot) {
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "duplicate_piece",
                 "[zenith-dry-run] snapshot skipped reason=duplicate_piece".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        } else if self.zenith_dry_run.is_duplicate_attempt(&file_signature) {
+            if let Some(line) = self.zenith_dry_run.note_skip(
+                "duplicate_snapshot",
+                "[zenith-dry-run] snapshot skipped reason=duplicate_snapshot".to_owned(),
             ) {
                 self.push_log(line);
             }
@@ -2564,6 +2585,14 @@ impl LauncherApp {
         match prepare_snapshot_execution(&config, &snapshot.snapshot) {
             Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => {
                 let plan = &prepared.summary;
+                if let Some(fallback_from) = plan.fallback_from {
+                    self.push_log(format!(
+                        "[zenith-dry-run] fallback mode={} from={} reason={}",
+                        movement_mode_label(plan.movement_mode_used),
+                        movement_mode_label(fallback_from),
+                        plan.fallback_reason.as_deref().unwrap_or("unknown")
+                    ));
+                }
                 self.push_log(format!(
                     "[zenith-dry-run] plan ready token={} piece={} hold_piece={} use_hold={} target_x={} rotation={:?} action_count={} actions={:?} route={} planner={}",
                     plan.token,
@@ -2577,6 +2606,8 @@ impl LauncherApp {
                     plan.route_kind,
                     plan.planner
                 ));
+                self.zenith_dry_run
+                    .record_processed(snapshot, &file_signature);
                 if let Some(line) = self.zenith_live.note_startup_stage("first_plan") {
                     self.push_log(line);
                 }
@@ -2654,9 +2685,11 @@ impl LauncherApp {
                     }
                 }
             }
-            Ok(PreparedSnapshotExecutionResult::Skipped { reason }) => {
+            Ok(PreparedSnapshotExecutionResult::Skipped { reason, retryable }) => {
+                self.zenith_dry_run
+                    .record_attempted(snapshot, &file_signature);
                 self.push_log(format!(
-                    "[zenith-dry-run] plan skipped token={} piece={} reason={reason}",
+                    "[zenith-dry-run] plan skipped token={} piece={} retryable={} reason={reason}",
                     snapshot.snapshot.token,
                     snapshot
                         .snapshot
@@ -2664,10 +2697,13 @@ impl LauncherApp {
                         .first()
                         .copied()
                         .map(|piece| piece.label())
-                        .unwrap_or("?")
+                        .unwrap_or("?"),
+                    retryable
                 ));
             }
             Err(err) => {
+                self.zenith_dry_run
+                    .record_attempted(snapshot, &file_signature);
                 self.push_log(format!(
                     "[zenith-dry-run] plan skipped token={} piece={} reason={err:#}",
                     snapshot.snapshot.token,
@@ -2681,7 +2717,6 @@ impl LauncherApp {
                 ));
             }
         }
-        self.zenith_dry_run.record_processed(snapshot);
     }
 
     fn maybe_resume_bot_runner(&mut self) {
@@ -5416,6 +5451,27 @@ mod tests {
             .iter()
             .any(|line| line.contains("[zenith-dry-run] plan ready")));
         assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_dry_run_attempted_snapshot_is_retryable_on_fresher_same_piece() {
+        let paths = test_paths("zenith-dry-run-attempted-contract");
+        write_zenith_passive_snapshot(&paths, "ready", "running", 3, json!(false));
+        let snapshot = read_test_zenith_passive_snapshot(&paths);
+        let mut controller = ZenithDryRunController::default();
+
+        controller.record_attempted(&snapshot, "sig-a");
+
+        assert!(controller.is_duplicate_attempt("sig-a"));
+        assert!(!controller.is_duplicate_attempt("sig-b"));
+        assert!(!controller.is_duplicate_processed_piece(&snapshot));
+
+        controller.record_processed(&snapshot, "sig-b");
+
+        assert!(controller.is_duplicate_processed_piece(&snapshot));
+        assert!(controller.is_duplicate_attempt("sig-b"));
 
         cleanup_test_paths(&paths);
     }

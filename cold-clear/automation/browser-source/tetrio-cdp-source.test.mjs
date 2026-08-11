@@ -24,11 +24,13 @@ import {
   clearSnapshotFile,
   completeNextGameReacquire,
   collectQuickPlayClosureDiagnosticFromPausedScopes,
+  computeFriendlyVsBindRetryDelay,
   consumeGameStartSignal,
   createBrowserControlState,
   createBootstrapState,
   createClosureCaptureState,
   createEndedGameCandidateState,
+  createFriendlyVsPassiveCaptureState,
   createGameStartSignalState,
   createInteractionTrackerInstallState,
   createNextGameReacquireState,
@@ -61,6 +63,7 @@ import {
   quickPlayClosureCandidateScanExpression,
   quickPlaySessionCandidateSurveyExpression,
   maybeRunQuickPlayDiagnosticCapture,
+  maybeRunFriendlyVsPassiveCapture,
   maybeRunZenithBootstrapCheck,
   mergeQuickPlaySessionSurvey,
   noteGameStartSignal,
@@ -377,6 +380,230 @@ function makeQuickPlayPassiveRetainedRoot({
   return state;
 }
 
+function makeFriendlyVsPassiveState(paths) {
+  const state = createFriendlyVsPassiveCaptureState();
+  state.passiveSnapshotPath = path.join(paths.dir, "friendly-vs-passive-snapshot.json");
+  state.soloClosureFingerprintPath = paths.fingerprintPath;
+  return state;
+}
+
+function makeClosureOtherCallFrames(closureScopeCounts, { localScopeCount = 1 } = {}) {
+  return closureScopeCounts.map((closureScopeCount, frameIndex) => ({
+    callFrameId: `frame-${frameIndex}`,
+    functionName: `closureFrame${frameIndex}`,
+    location: {
+      scriptId: `${frameIndex + 1}`,
+      lineNumber: 20 + frameIndex,
+      columnNumber: 0
+    },
+    scopeChain: [
+      ...Array.from({ length: localScopeCount }, (_, localIndex) => ({
+        type: "local",
+        object: { objectId: `frame-${frameIndex}-local-${localIndex}` }
+      })),
+      ...Array.from({ length: closureScopeCount }, (_, closureIndex) => ({
+        type: "closure",
+        object: { objectId: `frame-${frameIndex}-closure-${closureIndex}` }
+      }))
+    ]
+  }));
+}
+
+function buildScopeDescriptorsForCallFrames(callFrames, overrides = {}) {
+  const descriptorsByObjectId = {};
+  for (const callFrame of callFrames) {
+    for (const scope of callFrame?.scopeChain ?? []) {
+      const objectId = String(scope?.object?.objectId ?? "").trim();
+      if (!objectId || objectId in descriptorsByObjectId) {
+        continue;
+      }
+      descriptorsByObjectId[objectId] = [
+        {
+          name: "counter",
+          value: {
+            type: "number",
+            value: 1
+          }
+        }
+      ];
+    }
+  }
+  return {
+    ...descriptorsByObjectId,
+    ...overrides
+  };
+}
+
+function createFriendlyGameplayFrameAcquisitionHarness(
+  candidateSpecs,
+  {
+    pollValueByRetainedObjectId = {},
+    pollTargetByRetainedObjectId = {},
+    waitingProbeCount = 0
+  } = {}
+) {
+  const waitingFrames = makeClosureOtherCallFrames([2, 1, 4, 4, 4]);
+  const callFramesSequence = [
+    ...Array.from({ length: Math.max(0, Number(waitingProbeCount ?? 0)) }, () => waitingFrames),
+    [
+      {
+        callFrameId: "frame-1",
+        functionName: "_tick",
+        location: {
+          scriptId: "1",
+          lineNumber: 14,
+          columnNumber: 0
+        },
+        scopeChain: [null, null, null, null, {
+          type: "closure",
+          object: { objectId: "scope-4" }
+        }]
+      }
+    ]
+  ];
+  return createQuickPlayMultiAcceptedPausedFixture(candidateSpecs, {
+    pollValueByRetainedObjectId,
+    pollTargetByRetainedObjectId,
+    callFramesSequence
+  });
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function createFriendlyDeferredAcquisitionHarness({
+  pausedEvent = { callFrames: makeClosureOtherCallFrames([2, 1, 4, 4, 4]) },
+  pauseDelayMs = 0,
+  deferPausedEvent = false
+} = {}) {
+  const calls = [];
+  let resumeCount = 0;
+  let getPropertiesCalls = 0;
+  let callFunctionCalls = 0;
+  let pauseDeferred = null;
+  const createPauseDeferred = () => {
+    let resolve;
+    const promise = new Promise((innerResolve) => {
+      resolve = innerResolve;
+    });
+    return { promise, resolve };
+  };
+  if (deferPausedEvent) {
+    pauseDeferred = createPauseDeferred();
+  }
+  return {
+    calls,
+    cdp: {
+      async send(method, params = {}) {
+        calls.push({ method, params });
+        if (
+          method === "Debugger.enable" ||
+          method === "Debugger.pause" ||
+          method === "Debugger.disable" ||
+          method === "Debugger.resume" ||
+          method === "Runtime.releaseObjectGroup" ||
+          method === "Runtime.releaseObject"
+        ) {
+          if (method === "Debugger.resume") {
+            resumeCount += 1;
+          }
+          return {};
+        }
+        if (method === "Runtime.getProperties") {
+          getPropertiesCalls += 1;
+          return { result: [] };
+        }
+        if (method === "Runtime.callFunctionOn") {
+          callFunctionCalls += 1;
+          return { result: { value: null } };
+        }
+        throw new Error(`unexpected method ${method}`);
+      },
+      async waitForEvent(method) {
+        if (method === "Debugger.paused") {
+          if (deferPausedEvent) {
+            return pauseDeferred.promise;
+          }
+          if (pauseDelayMs > 0) {
+            await delay(pauseDelayMs);
+          }
+          return pausedEvent;
+        }
+        if (method === "Debugger.resumed") {
+          return {};
+        }
+        throw new Error(`unexpected event ${method}`);
+      }
+    },
+    resolvePausedEvent() {
+      if (!pauseDeferred) {
+        return false;
+      }
+      pauseDeferred.resolve(pausedEvent);
+      pauseDeferred = createPauseDeferred();
+      return true;
+    },
+    counts() {
+      return {
+        resumeCount,
+        getPropertiesCalls,
+        callFunctionCalls
+      };
+    }
+  };
+}
+
+function createPausedScopeBindingHarness({
+  descriptors = [],
+  objectMap = {},
+  scopeObjectId = "scope-4",
+  functionName = "_tick"
+} = {}) {
+  return {
+    async send(method, params = {}) {
+      if (method === "Runtime.getProperties") {
+        return {
+          result: String(params.objectId ?? "").trim() === scopeObjectId ? descriptors : []
+        };
+      }
+      if (method === "Runtime.callFunctionOn") {
+        const target = objectMap[String(params.objectId ?? "").trim()];
+        if (!target) {
+          throw new Error(`unexpected inspection ${params.objectId}`);
+        }
+        return {
+          result: {
+            value: executeObjectFunction(
+              params.functionDeclaration,
+              target,
+              (params.arguments ?? []).map((entry) => entry?.value)
+            )
+          }
+        };
+      }
+      throw new Error(`unexpected method ${method}`);
+    },
+    pausedEvent: {
+      callFrames: [
+        {
+          callFrameId: "frame-1",
+          functionName,
+          location: {
+            scriptId: "1",
+            lineNumber: 14,
+            columnNumber: 0
+          },
+          scopeChain: [null, null, null, null, {
+            type: "closure",
+            object: { objectId: scopeObjectId }
+          }]
+        }
+      ]
+    }
+  };
+}
+
 function createPassiveSnapshotEvalCdp(retainedRoot) {
   return {
     async send(method, params = {}) {
@@ -664,6 +891,25 @@ test("local_tetrio_username control clears the configured username on blank inpu
 
   assert.equal(applied, true);
   assert.equal(controlState.localTetrioUsername, null);
+});
+
+test("friendly_vs_capture_enabled control updates the browser gate", () => {
+  const controlState = createBrowserControlState();
+
+  const applied = applyBrowserControlMessage({
+    message: {
+      type: "friendly_vs_capture_enabled",
+      enabled: true
+    },
+    controlState,
+    closureCaptureState: createClosureCaptureState(),
+    nextGameReacquireState: createNextGameReacquireState(),
+    now: 1_000,
+    log: () => {}
+  });
+
+  assert.equal(applied, true);
+  assert.equal(controlState.friendlyVsCaptureEnabled, true);
 });
 
 test("zenith passive owner starts while bot is enabled and avoids manual artifacts", () => {
@@ -2665,6 +2911,361 @@ test("_tick scope4 primary falls back to scope3 in the same frame when scope4 ha
   }
 });
 
+test("friendly structural fallback activates for closure_other frames and bounds enumeration to closure-rich tops", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const callFrames = makeClosureOtherCallFrames([2, 1, 4, 4, 4]);
+  const descriptorsByObjectId = buildScopeDescriptorsForCallFrames(callFrames);
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.getProperties") {
+            return {
+              result: descriptorsByObjectId[String(params.objectId ?? "").trim()] ?? []
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      { callFrames },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        allowStructuralFrameFallback: true,
+        structuralFallbackFrameLimit: 3,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    const enumeratedScopesByFrame = new Map(
+      result.frameAcquisitionSummaries.map((summary) => [summary.frameIndex, summary.enumeratedScopes])
+    );
+    assert.equal(result.resultType, "completed_not_found");
+    assert.equal(result.tickFramesSeen, 0);
+    assert.equal(result.structuralFallbackUsed, true);
+    assert.equal(result.structuralFallbackFrameCount, 3);
+    assert.equal(result.matchingFramesSeen, 3);
+    assert.equal(enumeratedScopesByFrame.get(0), 0);
+    assert.equal(enumeratedScopesByFrame.get(1), 0);
+    assert.equal(enumeratedScopesByFrame.get(2) > 0, true);
+    assert.equal(enumeratedScopesByFrame.get(3) > 0, true);
+    assert.equal(enumeratedScopesByFrame.get(4) > 0, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("preferred eligible _tick frame keeps the existing path even when structural fallback is allowed", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const inspectedObjectIds = [];
+  const callFrames = [
+    ...makeClosureOtherCallFrames([4]),
+    {
+      callFrameId: "frame-tick",
+      functionName: "_tick",
+      location: {
+        scriptId: "9",
+        lineNumber: 90,
+        columnNumber: 0
+      },
+      scopeChain: [
+        { type: "local", object: { objectId: "frame-tick-local-0" } },
+        { type: "closure", object: { objectId: "frame-tick-closure-0" } },
+        { type: "closure", object: { objectId: "frame-tick-closure-1" } },
+        { type: "closure", object: { objectId: "frame-tick-closure-2" } },
+        { type: "closure", object: { objectId: "frame-tick-closure-3" } },
+        { type: "closure", object: { objectId: "frame-tick-closure-4" } }
+      ]
+    }
+  ];
+  const descriptorsByObjectId = buildScopeDescriptorsForCallFrames(callFrames, {
+    "frame-0-closure-3": [
+      {
+        name: "closureOther",
+        value: {
+          type: "object",
+          objectId: "obj-closure-other"
+        }
+      }
+    ],
+    "frame-tick-closure-3": [
+      {
+        name: "tickBinding",
+        value: {
+          type: "object",
+          objectId: "obj-tick"
+        }
+      }
+    ]
+  });
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.getProperties") {
+            return {
+              result: descriptorsByObjectId[String(params.objectId ?? "").trim()] ?? []
+            };
+          }
+          if (method === "Runtime.callFunctionOn") {
+            inspectedObjectIds.push(String(params.objectId ?? "").trim());
+            if (String(params.objectId ?? "").trim() === "obj-tick") {
+              const candidate = makeQuickPlayAcceptedCandidateFixture({
+                candidateId: "cand-tick",
+                rootObjectId: "obj-tick",
+                bindingName: "tickBinding",
+                matchedShape: "game.state.board",
+                retainedRootKind: "state",
+                retainedRootPath: ["state"],
+                boardPath: ["state", "board"],
+                currentPath: ["state", "current"],
+                holdPath: ["state", "hold"],
+                queuePath: ["state", "queue"],
+                gameid: 7007
+              });
+              candidate.callFrameIndex = 1;
+              candidate.scopeIndex = 4;
+              candidate.fullPath = "frame[1].scope[4].tickBinding.state.board";
+              return {
+                result: {
+                  value: candidate
+                }
+              };
+            }
+            throw new Error(`unexpected inspection ${params.objectId}`);
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      { callFrames },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        allowStructuralFrameFallback: true,
+        structuralFallbackFrameLimit: 3,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "accepted_candidates_found");
+    assert.equal(result.tickFramesSeen, 1);
+    assert.equal(result.selectedTickFrames, 1);
+    assert.equal(result.structuralFallbackUsed, false);
+    assert.equal(result.matchingFramesSeen, 1);
+    assert.deepEqual(inspectedObjectIds, ["obj-tick"]);
+    assert.equal(result.acceptedCandidates[0]?.bindingName, "tickBinding");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("no closure scopes means friendly structural fallback does not run", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const callFrames = [
+    {
+      callFrameId: "frame-local-0",
+      functionName: "localOnly0",
+      location: {
+        scriptId: "1",
+        lineNumber: 1,
+        columnNumber: 0
+      },
+      scopeChain: [
+        { type: "local", object: { objectId: "frame-local-0-scope-0" } },
+        { type: "local", object: { objectId: "frame-local-0-scope-1" } }
+      ]
+    },
+    {
+      callFrameId: "frame-local-1",
+      functionName: "localOnly1",
+      location: {
+        scriptId: "2",
+        lineNumber: 2,
+        columnNumber: 0
+      },
+      scopeChain: [{ type: "local", object: { objectId: "frame-local-1-scope-0" } }]
+    }
+  ];
+  const descriptorsByObjectId = buildScopeDescriptorsForCallFrames(callFrames);
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      {
+        async send(method, params = {}) {
+          if (method === "Runtime.getProperties") {
+            return {
+              result: descriptorsByObjectId[String(params.objectId ?? "").trim()] ?? []
+            };
+          }
+          throw new Error(`unexpected method ${method}`);
+        }
+      },
+      { callFrames },
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        allowStructuralFrameFallback: true,
+        structuralFallbackFrameLimit: 3,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "matching_frame_missing");
+    assert.equal(result.tickFramesSeen, 0);
+    assert.equal(result.totalClosureScopeCount, 0);
+    assert.equal(result.structuralFallbackUsed, false);
+    assert.equal(result.matchingFramesSeen, 0);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("shared collector can surface a gameplay state nested under a depth1 wrapper root", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const harness = createPausedScopeBindingHarness({
+    descriptors: [
+      {
+        name: "bindingWrap",
+        value: {
+          type: "object",
+          objectId: "binding-wrap"
+        }
+      }
+    ],
+    objectMap: {
+      "binding-wrap": {
+        wrapper: {
+          board: createBoard(),
+          current: "t",
+          hold: "i",
+          queue: ["o", "s", "z"],
+          gameid: 8005,
+          seed: 9005,
+          userid: "user-depth1"
+        }
+      }
+    }
+  });
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      harness,
+      harness.pausedEvent,
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "accepted_candidates_found");
+    assert.equal(result.acceptedCandidates.length, 1);
+    assert.deepEqual(Array.from(result.acceptedCandidates[0]?.retainedRootPath ?? []), ["wrapper"]);
+    assert.equal(result.acceptedCandidates[0]?.gameid, 8005);
+    assert.equal(result.acceptedCandidates[0]?.hasBoardLike, true);
+    assert.equal(result.acceptedCandidates[0]?.hasCurrentLike, true);
+    assert.equal(result.acceptedCandidates[0]?.hasHoldLike, true);
+    assert.equal(result.acceptedCandidates[0]?.hasQueueLike, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("shared collector can surface a gameplay state nested under a depth2 wrapper root", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const harness = createPausedScopeBindingHarness({
+    descriptors: [
+      {
+        name: "bindingDeepWrap",
+        value: {
+          type: "object",
+          objectId: "binding-deep-wrap"
+        }
+      }
+    ],
+    objectMap: {
+      "binding-deep-wrap": {
+        outer: {
+          inner: {
+            board: createBoard(),
+            current: "t",
+            hold: "i",
+            queue: ["o", "s", "z"],
+            gameid: 8015,
+            seed: 9015,
+            userid: "user-depth2"
+          }
+        }
+      }
+    }
+  });
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      harness,
+      harness.pausedEvent,
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "accepted_candidates_found");
+    assert.equal(result.acceptedCandidates.length, 1);
+    assert.deepEqual(Array.from(result.acceptedCandidates[0]?.retainedRootPath ?? []), ["outer", "inner"]);
+    assert.equal(result.acceptedCandidates[0]?.gameid, 8015);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("cyclic wrapper roots stay bounded and complete without infinite traversal", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const diagnosticState = makeQuickPlayState(paths);
+  const child = {};
+  const root = { child };
+  child.parent = root;
+  const harness = createPausedScopeBindingHarness({
+    descriptors: [
+      {
+        name: "bindingCycle",
+        value: {
+          type: "object",
+          objectId: "binding-cycle"
+        }
+      }
+    ],
+    objectMap: {
+      "binding-cycle": root
+    }
+  });
+  try {
+    const result = await collectQuickPlayClosureDiagnosticFromPausedScopes(
+      harness,
+      harness.pausedEvent,
+      {
+        quickPlayDiagnosticState: diagnosticState,
+        attempt: 1,
+        perScanBudgetMs: 500,
+        log: () => {}
+      }
+    );
+
+    assert.equal(result.resultType, "completed_not_found");
+    assert.equal(result.rawCandidates.length, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
 test("self remains unresolved without explicit evidence and known userid is never hardcoded", () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const diagnosticState = makeQuickPlayState(paths);
@@ -3002,6 +3603,11 @@ function makeQuickPlayAcceptedCandidateFixture({
   current = "t",
   hold = "i",
   queue = ["o", "s", "z"],
+  gameid = null,
+  gameidSourceKind = "missing",
+  ancestorGameids = [],
+  ownerGameids = [],
+  familyGameids = [],
   playing = true,
   ended = false
 } = {}) {
@@ -3042,6 +3648,11 @@ function makeQuickPlayAcceptedCandidateFixture({
     current,
     hold,
     queue,
+    gameid,
+    gameidSourceKind,
+    ancestorGameids,
+    ownerGameids,
+    familyGameids,
     pieceCounter: 4,
     boardWidth: 10,
     boardHeight: 40,
@@ -3148,12 +3759,18 @@ function createQuickPlayMultiAcceptedPausedFixture(
   candidateSpecs,
   {
     pollValueByRetainedObjectId = {},
-    pollTargetByRetainedObjectId = {}
+    pollTargetByRetainedObjectId = {},
+    callFrames = null,
+    callFramesSequence = null,
+    scopeDescriptorsByObjectId = {}
   } = {}
 ) {
   const calls = [];
   let pausedHandlesLive = false;
+  let pauseEventIndex = 0;
   let resumeCount = 0;
+  let getPropertiesCalls = 0;
+  let callFunctionCalls = 0;
   let semanticProbeCalls = 0;
   let canonicalStateHandleCalls = 0;
   let canonicalIdentityCompareCalls = 0;
@@ -3170,7 +3787,69 @@ function createQuickPlayMultiAcceptedPausedFixture(
       .filter((spec) => String(spec.retainedObjectId ?? "").trim() !== "")
       .map((spec) => [spec.retainedObjectId, spec])
   );
+  const candidateDescriptorsByScopeObjectId = new Map();
+  for (const spec of candidateSpecs) {
+    const scopeObjectId = String(spec.scopeObjectId ?? "scope-4").trim() || "scope-4";
+    const descriptors = candidateDescriptorsByScopeObjectId.get(scopeObjectId) ?? [];
+    descriptors.push({
+      name: spec.candidate.bindingName,
+      value: {
+        type: "object",
+        objectId: spec.candidate.rootObjectId
+      }
+    });
+    candidateDescriptorsByScopeObjectId.set(scopeObjectId, descriptors);
+  }
+  const effectiveScopeDescriptorsByObjectId = new Map(
+    Object.entries(scopeDescriptorsByObjectId).map(([objectId, descriptors]) => [
+      objectId,
+      Array.isArray(descriptors) ? descriptors : []
+    ])
+  );
+  for (const [scopeObjectId, descriptors] of candidateDescriptorsByScopeObjectId.entries()) {
+    if (!effectiveScopeDescriptorsByObjectId.has(scopeObjectId)) {
+      effectiveScopeDescriptorsByObjectId.set(scopeObjectId, descriptors);
+    }
+  }
   const canonicalHandleTargets = new Map();
+  const pausedCallFrames = Array.isArray(callFrames)
+    ? callFrames
+    : [
+        {
+          callFrameId: "frame-1",
+          functionName: "_tick",
+          location: {
+            scriptId: "1",
+            lineNumber: 14,
+            columnNumber: 0
+          },
+          scopeChain: [null, null, null, null, {
+            type: "closure",
+            object: { objectId: "scope-4" }
+          }]
+        }
+      ];
+  const pausedCallFramesSequence =
+    Array.isArray(callFramesSequence) && callFramesSequence.length > 0
+      ? callFramesSequence
+      : [pausedCallFrames];
+  const scopeLocationByObjectId = new Map();
+  pausedCallFramesSequence.forEach((sequenceFrames) => {
+    (Array.isArray(sequenceFrames) ? sequenceFrames : []).forEach((callFrame, callFrameIndex) => {
+      (callFrame?.scopeChain ?? []).forEach((scope, scopeIndex) => {
+        const objectId = String(scope?.object?.objectId ?? "").trim();
+        if (!objectId || scopeLocationByObjectId.has(objectId)) {
+          return;
+        }
+        scopeLocationByObjectId.set(objectId, {
+          callFrameIndex,
+          scopeIndex,
+          functionName: String(callFrame?.functionName ?? ""),
+          scopeType: String(scope?.type ?? "")
+        });
+      });
+    });
+  });
   const cdp = {
     async send(method, params = {}) {
       calls.push({ method, params });
@@ -3186,18 +3865,14 @@ function createQuickPlayMultiAcceptedPausedFixture(
         resumeCount += 1;
         return {};
       }
-      if (method === "Runtime.getProperties" && params.objectId === "scope-4") {
+      if (method === "Runtime.getProperties") {
+        getPropertiesCalls += 1;
         return {
-          result: candidateSpecs.map((spec) => ({
-            name: spec.candidate.bindingName,
-            value: {
-              type: "object",
-              objectId: spec.candidate.rootObjectId
-            }
-          }))
+          result: effectiveScopeDescriptorsByObjectId.get(String(params.objectId ?? "").trim()) ?? []
         };
       }
       if (method === "Runtime.callFunctionOn") {
+        callFunctionCalls += 1;
         const argumentCount = Array.isArray(params.arguments) ? params.arguments.length : 0;
         if (canonicalHandleTargets.has(params.objectId)) {
           if (!pausedHandlesLive) {
@@ -3312,7 +3987,26 @@ function createQuickPlayMultiAcceptedPausedFixture(
           }
           return {
             result: {
-              value: spec.candidate
+              value: (() => {
+                const scopeObjectId = String(spec.scopeObjectId ?? "scope-4").trim() || "scope-4";
+                const scopeLocation = scopeLocationByObjectId.get(scopeObjectId) ?? null;
+                const candidateValue = {
+                  ...spec.candidate
+                };
+                if (scopeLocation) {
+                  candidateValue.functionName = scopeLocation.functionName;
+                  candidateValue.callFrameIndex = scopeLocation.callFrameIndex;
+                  candidateValue.scopeIndex = scopeLocation.scopeIndex;
+                  candidateValue.scopeType = scopeLocation.scopeType;
+                  if (
+                    String(candidateValue.bindingName ?? "").trim() !== "" &&
+                    Array.isArray(candidateValue.boardPath)
+                  ) {
+                    candidateValue.fullPath = `frame[${scopeLocation.callFrameIndex}].scope[${scopeLocation.scopeIndex}].${candidateValue.bindingName}.${candidateValue.boardPath.join(".")}`;
+                  }
+                }
+                return candidateValue;
+              })()
             }
           };
         }
@@ -3344,22 +4038,12 @@ function createQuickPlayMultiAcceptedPausedFixture(
     async waitForEvent(method) {
       assert.equal(method, "Debugger.paused");
       pausedHandlesLive = true;
+      const callFramesForEvent =
+        pausedCallFramesSequence[Math.min(pauseEventIndex, pausedCallFramesSequence.length - 1)] ??
+        pausedCallFrames;
+      pauseEventIndex += 1;
       return {
-        callFrames: [
-          {
-            callFrameId: "frame-1",
-            functionName: "_tick",
-            location: {
-              scriptId: "1",
-              lineNumber: 14,
-              columnNumber: 0
-            },
-            scopeChain: [null, null, null, null, {
-              type: "closure",
-              object: { objectId: "scope-4" }
-            }]
-          }
-        ]
+        callFrames: callFramesForEvent
       };
     }
   };
@@ -3369,6 +4053,8 @@ function createQuickPlayMultiAcceptedPausedFixture(
     counts() {
       return {
         resumeCount,
+        getPropertiesCalls,
+        callFunctionCalls,
         semanticProbeCalls,
         canonicalStateHandleCalls,
         canonicalIdentityCompareCalls,
@@ -3635,6 +4321,1270 @@ test("multiple accepted candidates retain exactly one authoritative semantic can
         line.includes("retain=success")
       )
     );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture binds only the local gameid candidate", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture(
+    [
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-opponent",
+            rootObjectId: "obj-opponent",
+            bindingName: "bindingOpponent",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 99
+        },
+        semanticProbeTarget: {
+          game: {
+            state: makeQuickPlayPassiveRetainedRoot()
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-opponent"
+      },
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local",
+            rootObjectId: "obj-local",
+            bindingName: "bindingLocal",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 100
+        },
+        semanticProbeTarget: {
+          game: {
+            state: {
+              ...makeQuickPlayPassiveRetainedRoot({
+                current: { type: "t", x: 4, y: 19, rotation: 1 },
+                hold: "i",
+                queue: ["o", "s", "z"],
+                pieceCounter: 4
+              }),
+              falling: { type: "t", x: 4, y: 19, rotation: 1 },
+              bag: ["o", "s", "z"],
+              current: undefined,
+              queue: undefined,
+              pieceCounter: 4
+            }
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local": {
+          ...makeQuickPlayPassiveRetainedRoot({
+            current: { type: "t", x: 4, y: 19, rotation: 1 },
+            hold: "i",
+            queue: ["o", "s", "z"],
+            pieceCounter: 4
+          }),
+          falling: { type: "t", x: 4, y: 19, rotation: 1 },
+          bag: ["o", "s", "z"],
+          current: undefined,
+          queue: undefined
+        }
+      }
+    }
+  );
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_500,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local");
+    const snapshot = JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.source, "friendly_vs_passive");
+    assert.equal(snapshot.snapshot.round_id, "100:seed-1");
+    assert.equal(snapshot.snapshot.gameid, 100);
+    assert.equal(snapshot.snapshot.candidate_id, "cand-local");
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_650,
+      log: () => {}
+    });
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 1);
+    assert.equal(harness.counts().pollCalls >= 2, true);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture waits for a preferred gameplay frame before running heavy survey", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyGameplayFrameAcquisitionHarness(
+    [
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-opponent-preferred",
+            rootObjectId: "obj-opponent-preferred",
+            bindingName: "bindingOpponentPreferred",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 8004
+        },
+        semanticProbeTarget: {
+          game: {
+            state: makeQuickPlayPassiveRetainedRoot()
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-opponent-preferred"
+      },
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local-preferred",
+            rootObjectId: "obj-local-preferred",
+            bindingName: "bindingLocalPreferred",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 8005
+        },
+        semanticProbeTarget: {
+          game: {
+            state: {
+              ...makeQuickPlayPassiveRetainedRoot({
+                current: { type: "t", x: 4, y: 19, rotation: 1 },
+                hold: "i",
+                queue: ["o", "s", "z"],
+                pieceCounter: 4
+              }),
+              falling: { type: "t", x: 4, y: 19, rotation: 1 },
+              bag: ["o", "s", "z"],
+              current: undefined,
+              queue: undefined,
+              pieceCounter: 4
+            }
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local-preferred"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local-preferred": {
+          ...makeQuickPlayPassiveRetainedRoot({
+            current: { type: "t", x: 4, y: 19, rotation: 1 },
+            hold: "i",
+            queue: ["o", "s", "z"],
+            pieceCounter: 4
+          }),
+          falling: { type: "t", x: 4, y: 19, rotation: 1 },
+          bag: ["o", "s", "z"],
+          current: undefined,
+          queue: undefined
+        }
+      },
+      waitingProbeCount: 4
+    }
+  );
+  const logs = [];
+  try {
+    for (let index = 0; index < 4; index += 1) {
+      await maybeRunFriendlyVsPassiveCapture({
+        cdp: harness.cdp,
+        friendlyVsPassiveCaptureState: friendlyState,
+        browserControlState: controlState,
+        transientState: { lastRuntimeError: "" },
+        targetUrl: "https://tetr.io/",
+        roundStatus: {
+          active: true,
+          roundId: "8005:seed-1",
+          localGameId: 8005
+        },
+        now: 8_500 + index * 200,
+        log: (line) => logs.push(line)
+      });
+    }
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "");
+    assert.equal(harness.counts().retainCloneCalls, 0);
+    assert.equal(harness.counts().pollCalls, 0);
+    assert.equal(harness.counts().getPropertiesCalls, 0);
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 4);
+
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "8005:seed-1",
+        localGameId: 8005
+      },
+      now: 9_300,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local-preferred");
+    assert.equal(logs.includes("[friendly-vs-capture] acquisition waiting"), true);
+    assert.equal(logs.includes("[friendly-vs-capture] gameplay frame acquired"), true);
+    assert.equal(
+      logs.includes("[friendly-vs-capture] bound local gameplay state gameid=8005"),
+      true
+    );
+    assert.equal(
+      logs.some((line) => line.startsWith("[friendly-vs-capture] bind timing paused_ms=")),
+      true
+    );
+    assert.equal(harness.counts().retainCloneCalls, 1);
+    assert.equal(harness.counts().pollCalls, 1);
+    assert.equal(harness.counts().getPropertiesCalls, 1);
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 5);
+    assert.equal(harness.calls.some((entry) => String(entry.method ?? "").startsWith("Input.")), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly preferred gameplay frame still selects the local gameid when candidate order changes", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyGameplayFrameAcquisitionHarness(
+    [
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-opponent-order-shift",
+            rootObjectId: "obj-opponent-order-shift",
+            bindingName: "bindingOpponentShift",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 8104
+        },
+        semanticProbeTarget: {
+          game: {
+            state: makeQuickPlayPassiveRetainedRoot()
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-opponent-order-shift"
+      },
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local-order-shift",
+            rootObjectId: "obj-local-order-shift",
+            bindingName: "bindingLocalShift",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 8105
+        },
+        semanticProbeTarget: {
+          game: {
+            state: {
+              ...makeQuickPlayPassiveRetainedRoot({
+                current: { type: "t", x: 4, y: 19, rotation: 1 },
+                hold: "i",
+                queue: ["o", "s", "z"],
+                pieceCounter: 4
+              }),
+              falling: { type: "t", x: 4, y: 19, rotation: 1 },
+              bag: ["o", "s", "z"],
+              current: undefined,
+              queue: undefined,
+              pieceCounter: 4
+            }
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local-order-shift"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local-order-shift": {
+          ...makeQuickPlayPassiveRetainedRoot({
+            current: { type: "t", x: 4, y: 19, rotation: 1 },
+            hold: "i",
+            queue: ["o", "s", "z"],
+            pieceCounter: 4
+          }),
+          falling: { type: "t", x: 4, y: 19, rotation: 1 },
+          bag: ["o", "s", "z"],
+          current: undefined,
+          queue: undefined
+        }
+      },
+      waitingProbeCount: 0
+    }
+  );
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "8105:seed-2",
+        localGameId: 8105
+      },
+      now: 9_100,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local-order-shift");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly fast path continues past an opponent-only primary scope to bind the local secondary scope", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture(
+    [
+      {
+        scopeObjectId: "scope-4",
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-opponent-primary",
+            rootObjectId: "obj-opponent-primary",
+            bindingName: "bindingOpponentPrimary",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 9104
+        },
+        semanticProbeTarget: {
+          game: {
+            state: makeQuickPlayPassiveRetainedRoot()
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-opponent-primary"
+      },
+      {
+        scopeObjectId: "scope-3",
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local-secondary",
+            rootObjectId: "obj-local-secondary",
+            bindingName: "bindingLocalSecondary",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 9105
+        },
+        semanticProbeTarget: {
+          game: {
+            state: {
+              ...makeQuickPlayPassiveRetainedRoot({
+                current: { type: "t", x: 4, y: 19, rotation: 1 },
+                hold: "i",
+                queue: ["o", "s", "z"],
+                pieceCounter: 6
+              }),
+              falling: { type: "t", x: 4, y: 19, rotation: 1 },
+              bag: ["o", "s", "z"],
+              current: undefined,
+              queue: undefined,
+              pieceCounter: 6
+            }
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local-secondary"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local-secondary": {
+          ...makeQuickPlayPassiveRetainedRoot({
+            current: { type: "t", x: 4, y: 19, rotation: 1 },
+            hold: "i",
+            queue: ["o", "s", "z"],
+            pieceCounter: 6
+          }),
+          falling: { type: "t", x: 4, y: 19, rotation: 1 },
+          bag: ["o", "s", "z"],
+          current: undefined,
+          queue: undefined
+        }
+      },
+      callFrames: [
+        {
+          callFrameId: "frame-1",
+          functionName: "_tick",
+          location: {
+            scriptId: "1",
+            lineNumber: 14,
+            columnNumber: 0
+          },
+          scopeChain: [
+            null,
+            null,
+            null,
+            { type: "closure", object: { objectId: "scope-3" } },
+            { type: "closure", object: { objectId: "scope-4" } }
+          ]
+        }
+      ]
+    }
+  );
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "9105:seed-2",
+        localGameId: 9105
+      },
+      now: 9_500,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local-secondary");
+    assert.equal(harness.counts().getPropertiesCalls, 2);
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 1);
+    assert.equal(harness.counts().pollCalls, 1);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture rearms on round change after a mismatch", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const opponentOnlyHarness = createQuickPlayMultiAcceptedPausedFixture([
+    {
+      candidate: {
+        ...makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-opponent",
+          rootObjectId: "obj-opponent",
+          bindingName: "bindingOpponent",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["game", "state"],
+          boardPath: ["board"],
+          currentPath: ["falling"],
+          holdPath: ["hold"],
+          queuePath: ["bag"]
+        }),
+        gameid: 99
+      },
+      semanticProbeTarget: {
+        game: {
+          state: makeQuickPlayPassiveRetainedRoot()
+        }
+      },
+      rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+        requestedPath: ["game", "state"],
+        retainedObjectStage: "state"
+      }),
+      retainedObjectId: "retained-opponent"
+    }
+  ]);
+  const localHarness = createQuickPlayMultiAcceptedPausedFixture(
+    [
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local",
+            rootObjectId: "obj-local",
+            bindingName: "bindingLocal",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 100
+        },
+        semanticProbeTarget: {
+          game: {
+            state: {
+              ...makeQuickPlayPassiveRetainedRoot({
+                current: { type: "l", x: 5, y: 18, rotation: 0 },
+                hold: "j",
+                queue: ["i", "o", "t"],
+                pieceCounter: 5
+              }),
+              falling: { type: "l", x: 5, y: 18, rotation: 0 },
+              bag: ["i", "o", "t"],
+              current: undefined,
+              queue: undefined,
+              pieceCounter: 5
+            }
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local": {
+          ...makeQuickPlayPassiveRetainedRoot({
+            current: { type: "l", x: 5, y: 18, rotation: 0 },
+            hold: "j",
+            queue: ["i", "o", "t"],
+            pieceCounter: 5
+          }),
+          falling: { type: "l", x: 5, y: 18, rotation: 0 },
+          bag: ["i", "o", "t"],
+          current: undefined,
+          queue: undefined
+        }
+      }
+    }
+  );
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: opponentOnlyHarness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_600,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "");
+    assert.equal(
+      JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8")).reason,
+      "gameid_mismatch"
+    );
+
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: localHarness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "101:seed-2",
+        localGameId: 100
+      },
+      now: 2_700,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local");
+    const snapshot = JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8"));
+    assert.equal(snapshot.status, "ready");
+    assert.equal(snapshot.snapshot.gameid, 100);
+    assert.equal(snapshot.snapshot.piece_counter, 5);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture logs survey timing once per round", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture([
+    {
+      candidate: {
+        ...makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-opponent",
+          rootObjectId: "obj-opponent",
+          bindingName: "bindingOpponent",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["game", "state"],
+          boardPath: ["board"],
+          currentPath: ["falling"],
+          holdPath: ["hold"],
+          queuePath: ["bag"]
+        }),
+        gameid: null,
+        gameidSourceKind: "ancestor",
+        ancestorGameids: [100]
+      },
+      retainedObjectId: "retained-empty"
+    }
+  ]);
+  const logs = [];
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => 2_080;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_000,
+      log: (line) => logs.push(line)
+    });
+
+    Date.now = () => 2_580;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_500,
+      log: (line) => logs.push(line)
+    });
+
+    Date.now = () => 3_180;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 3_100,
+      log: (line) => logs.push(line)
+    });
+
+    Date.now = () => 3_320;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "101:seed-2",
+        localGameId: 100
+      },
+      now: 3_200,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(
+      logs.filter((line) => line === "[friendly-vs-capture] survey elapsed_ms=80").length,
+      1
+    );
+    assert.equal(
+      logs.filter((line) => line === "[friendly-vs-capture] survey elapsed_ms=120").length,
+      1
+    );
+  } finally {
+    Date.now = originalDateNow;
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture bounds preferred-frame probes per round and rearms on bot off on", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const waitingFrames = makeClosureOtherCallFrames([2, 1, 4, 4, 4]);
+  const harness = createQuickPlayMultiAcceptedPausedFixture([], {
+    callFrames: waitingFrames,
+    scopeDescriptorsByObjectId: buildScopeDescriptorsForCallFrames(waitingFrames)
+  });
+  const logs = [];
+  const originalDateNow = Date.now;
+  try {
+    for (let index = 0; index < 100; index += 1) {
+      const tickNow = 10_000 + index * 40;
+      Date.now = () => tickNow + 80;
+      await maybeRunFriendlyVsPassiveCapture({
+        cdp: harness.cdp,
+        friendlyVsPassiveCaptureState: friendlyState,
+        browserControlState: controlState,
+        transientState: { lastRuntimeError: "" },
+        targetUrl: "https://tetr.io/",
+        roundStatus: {
+          active: true,
+          roundId: "5331:2034695406",
+          localGameId: 5331
+        },
+        now: tickNow,
+        log: (line) => logs.push(line)
+      });
+    }
+
+    assert.equal(
+      logs.filter((line) => line === "[friendly-vs-capture] gameplay frame acquisition timed out")
+        .length,
+      1
+    );
+    assert.equal(
+      JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8")).reason,
+      "awaiting_gameplay_frame"
+    );
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 10);
+    assert.equal(harness.counts().semanticProbeCalls, 0);
+
+    controlState.botEnabled = false;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "5331:2034695406",
+        localGameId: 5331
+      },
+      now: 20_500,
+      log: (line) => logs.push(line)
+    });
+
+    controlState.botEnabled = true;
+    Date.now = () => 20_620;
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "5331:2034695406",
+        localGameId: 5331
+      },
+      now: 20_540,
+      log: (line) => logs.push(line)
+      });
+
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 11);
+  } finally {
+    Date.now = originalDateNow;
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly acquisition does not issue a second pause while the prior probe is still marked running", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  friendlyState.active = true;
+  friendlyState.roundId = "6001:seed-1";
+  friendlyState.localGameId = 6001;
+  friendlyState.currentTargetUrl = "https://tetr.io/";
+  friendlyState.nextClosureSurveyAt = 12_000;
+  friendlyState.closureScanState.running = true;
+  const calls = [];
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: {
+        async send(method) {
+          calls.push(method);
+          return {};
+        }
+      },
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "6001:seed-1",
+        localGameId: 6001
+      },
+      now: 12_000,
+      log: () => {}
+    });
+    assert.equal(calls.includes("Debugger.pause"), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly acquisition aborts the cycle after one long cheap probe", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyDeferredAcquisitionHarness({
+    pauseDelayMs: 170
+  });
+  const logs = [];
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "6002:seed-1",
+        localGameId: 6002
+      },
+      now: 12_100,
+      log: (line) => logs.push(line)
+    });
+
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "6002:seed-1",
+        localGameId: 6002
+      },
+      now: 12_200,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 1);
+    assert.equal(harness.counts().getPropertiesCalls, 0);
+    assert.equal(harness.counts().callFunctionCalls, 0);
+    assert.equal(
+      logs.includes("[friendly-vs-capture] gameplay frame acquisition timed out"),
+      true
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly pending acquisition is cancelled when Bot OFF arrives", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  friendlyState.active = true;
+  friendlyState.roundId = "6003:seed-1";
+  friendlyState.localGameId = 6003;
+  friendlyState.currentTargetUrl = "https://tetr.io/";
+  friendlyState.nextClosureSurveyAt = 12_300;
+  friendlyState.closureScanState.running = true;
+  const calls = [];
+  try {
+    controlState.botEnabled = false;
+    const cancelled = await maybeRunFriendlyVsPassiveCapture({
+      cdp: {
+        async send(method) {
+          calls.push(method);
+          return {};
+        }
+      },
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "6003:seed-1",
+        localGameId: 6003
+      },
+      now: 12_320,
+      log: () => {}
+    });
+    assert.equal(cancelled.reason, "mode_inactive");
+    assert.equal(friendlyState.active, false);
+    assert.equal(calls.includes("Debugger.pause"), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture stops and clears the bound candidate when the round ends", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture(
+    [
+      {
+        candidate: {
+          ...makeQuickPlayAcceptedCandidateFixture({
+            candidateId: "cand-local",
+            rootObjectId: "obj-local",
+            bindingName: "bindingLocal",
+            matchedShape: "game.state.board",
+            retainedRootKind: "state",
+            retainedRootPath: ["game", "state"],
+            boardPath: ["board"],
+            currentPath: ["falling"],
+            holdPath: ["hold"],
+            queuePath: ["bag"]
+          }),
+          gameid: 100
+        },
+        semanticProbeTarget: {
+          game: {
+            state: makeQuickPlayPassiveRetainedRoot()
+          }
+        },
+        rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+          requestedPath: ["game", "state"],
+          retainedObjectStage: "state"
+        }),
+        retainedObjectId: "retained-local"
+      }
+    ],
+    {
+      pollTargetByRetainedObjectId: {
+        "retained-local": makeQuickPlayPassiveRetainedRoot()
+      }
+    }
+  );
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_800,
+      log: () => {}
+    });
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local");
+
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: false,
+        roundId: "",
+        localGameId: ""
+      },
+      now: 2_900,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.active, false);
+    assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "");
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture stays disabled until the Rust admission gate opens", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = false;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture([
+    {
+      candidate: {
+        ...makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-local",
+          rootObjectId: "obj-local",
+          bindingName: "bindingLocal",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["game", "state"],
+          boardPath: ["board"],
+          currentPath: ["falling"],
+          holdPath: ["hold"],
+          queuePath: ["bag"]
+        }),
+        gameid: 100
+      },
+      semanticProbeTarget: {
+        game: {
+          state: makeQuickPlayPassiveRetainedRoot()
+        }
+      },
+      rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+        requestedPath: ["game", "state"],
+        retainedObjectStage: "state"
+      }),
+      retainedObjectId: "retained-local"
+    }
+  ]);
+
+  try {
+    const skipped = await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_500,
+      log: () => {}
+    });
+
+    assert.equal(skipped.ran, false);
+    assert.equal(skipped.reason, "admission_pending");
+    assert.equal(friendlyState.active, false);
+    assert.equal(existsSync(friendlyState.passiveSnapshotPath), false);
+
+    controlState.friendlyVsCaptureEnabled = true;
+    const started = await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_600,
+      log: () => {}
+    });
+
+    assert.equal(started.ran, true);
+    assert.equal(friendlyState.active, true);
+    assert.equal(friendlyState.roundId, "100:seed-1");
+    assert.equal(friendlyState.localGameId, 100);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly vs passive capture stops immediately when the Rust admission gate closes", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createQuickPlayMultiAcceptedPausedFixture([
+    {
+      candidate: {
+        ...makeQuickPlayAcceptedCandidateFixture({
+          candidateId: "cand-local",
+          rootObjectId: "obj-local",
+          bindingName: "bindingLocal",
+          matchedShape: "game.state.board",
+          retainedRootKind: "state",
+          retainedRootPath: ["game", "state"],
+          boardPath: ["board"],
+          currentPath: ["falling"],
+          holdPath: ["hold"],
+          queuePath: ["bag"]
+        }),
+        gameid: 100
+      },
+      semanticProbeTarget: {
+        game: {
+          state: makeQuickPlayPassiveRetainedRoot()
+        }
+      },
+      rootProbeValue: makeQuickPlayRootProbeFixtureValue({
+        requestedPath: ["game", "state"],
+        retainedObjectStage: "state"
+      }),
+      retainedObjectId: "retained-local"
+    }
+  ]);
+
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_500,
+      log: () => {}
+    });
+
+    assert.equal(friendlyState.active, true);
+
+    controlState.friendlyVsCaptureEnabled = false;
+    const stopped = await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 2_600,
+      log: () => {}
+    });
+
+    assert.equal(stopped.ran, false);
+    assert.equal(stopped.reason, "admission_pending");
+    assert.equal(friendlyState.active, false);
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);
   }
@@ -11273,4 +13223,19 @@ test("zenith ribbon seeds do not create Solo generations", () => {
     "utf8"
   );
   assert.match(source, /if \(isZenithGameplayOptions\(options\)\) \{\s*return;\s*\}/);
+});
+
+test("writeSnapshot replaces snapshot atomically without deleting the live file first", () => {
+  const source = readFileSync(
+    new URL("./tetrio-cdp-source.mjs", import.meta.url),
+    "utf8"
+  );
+  assert.match(
+    source,
+    /function writeSnapshot\(snapshotPath, payload\) \{[\s\S]*writeFileSync\(temporaryPath, JSON\.stringify\(payload, null, 2\)\);[\s\S]*renameSync\(temporaryPath, snapshotPath\);[\s\S]*\}/
+  );
+  assert.doesNotMatch(
+    source,
+    /function writeSnapshot\(snapshotPath, payload\) \{[\s\S]*rmSync\(snapshotPath, \{ force: true \}\);[\s\S]*renameSync\(temporaryPath, snapshotPath\);[\s\S]*\}/
+  );
 });

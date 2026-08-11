@@ -61,6 +61,10 @@ const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_MAX_NONPRODUCTIVE_ATTEMPTS = 10;
 const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_MAX_RAW_CANDIDATES = 200;
 const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_TIMEOUT_MS = 700;
 const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_BUDGET_MS = 250;
+const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_INTERVAL_MS = 200;
+const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_MAX_ATTEMPTS = 10;
+const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS = 2200;
+const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS = 150;
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS = [80, 160, 280, 450, 700, 1000];
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_JITTER_MS = 30;
 const DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS = [50, 75, 100, 125, 150, 200];
@@ -83,6 +87,10 @@ const DEFAULT_QUICK_PLAY_CALLFRAME_PATH = path.join(
 const DEFAULT_QUICK_PLAY_PASSIVE_SNAPSHOT_PATH = path.join(
   "automation",
   "quick-play-passive-snapshot.json"
+);
+const DEFAULT_FRIENDLY_VS_PASSIVE_SNAPSHOT_PATH = path.join(
+  "automation",
+  "friendly-vs-passive-snapshot.json"
 );
 const DEFAULT_SOLO_CLOSURE_FINGERPRINT_PATH = path.join(
   "automation",
@@ -1324,7 +1332,8 @@ export function createBrowserControlState() {
     botEnabled: false,
     selectedMode: RUNTIME_MODE_SOLO,
     modeGeneration: 0,
-    localTetrioUsername: null
+    localTetrioUsername: null,
+    friendlyVsCaptureEnabled: false
   };
 }
 
@@ -1386,6 +1395,8 @@ export function createQuickPlayDiagnosticState() {
     lastPassiveSnapshotLogAt: 0,
     lastPassiveRootProbeSignature: "",
     lastPassiveSnapshotFailureLogReason: "",
+    friendlyVsBindFailureCount: 0,
+    friendlyVsSurveyAttemptedGeneration: 0,
     boundLocalClosureCandidate: {
       generation: 0,
       targetId: "",
@@ -4089,7 +4100,13 @@ async function readScopeBindingNames(cdp, scopeObjectId) {
     .slice(0, MAX_SCOPE_PROPERTIES_PER_SCOPE);
 }
 
-async function buildQuickPlayPausedFrameInventory(cdp, pausedEvent) {
+async function buildQuickPlayPausedFrameInventory(
+  cdp,
+  pausedEvent,
+  {
+    includeBindingNames = true
+  } = {}
+) {
   if (!pausedEvent || !("callFrames" in pausedEvent)) {
     return {
       resultType: "callframes_missing",
@@ -4105,7 +4122,9 @@ async function buildQuickPlayPausedFrameInventory(cdp, pausedEvent) {
     const scopes = [];
     for (let scopeIndex = 0; scopeIndex < scopeChain.length; scopeIndex += 1) {
       const scope = scopeChain[scopeIndex];
-      const bindingNames = await readScopeBindingNames(cdp, scope?.object?.objectId);
+      const bindingNames = includeBindingNames
+        ? await readScopeBindingNames(cdp, scope?.object?.objectId)
+        : [];
       scopes.push({
         scope_index: scopeIndex,
         scope_type: normalizedScalar(scope?.type) ?? null,
@@ -4139,6 +4158,216 @@ async function buildQuickPlayPausedFrameInventory(cdp, pausedEvent) {
     callFrames,
     frameInventory
   };
+}
+
+function analyzeQuickPlayPausedFrameInventory(inventory, quickPlayDiagnosticState = null) {
+  const callFrames = Array.isArray(inventory?.callFrames) ? inventory.callFrames : [];
+  const soloFingerprint = readJsonFileIfPresent(
+    quickPlayDiagnosticState?.soloClosureFingerprintPath ??
+      DEFAULT_SOLO_CLOSURE_FINGERPRINT_PATH
+  );
+  const frameInventory = (inventory?.frameInventory ?? []).map((row, frameIndex) => ({
+    frameIndex,
+    callFrame: callFrames[frameIndex],
+    bindingNames: [
+      ...new Set(
+        (row?.scopes ?? []).flatMap((scope) =>
+          Array.isArray(scope?.binding_names) ? scope.binding_names.slice(0, 20) : []
+        )
+      )
+    ],
+    scopeTypes: Array.isArray(row?.scope_types) ? row.scope_types : [],
+    scopes: (row?.scopes ?? []).map((scope) => ({
+      scopeIndex: Math.max(0, Number(scope?.scope_index ?? 0)),
+      scopeType: normalizedScalar(scope?.scope_type) ?? "",
+      bindingNames: Array.isArray(scope?.binding_names) ? scope.binding_names.slice(0, 80) : []
+    }))
+  }));
+  const frameAcquisitionSummaries = frameInventory.map((entry) => ({
+    frameIndex: entry.frameIndex,
+    functionName: normalizedScalar(entry.callFrame?.functionName) ?? null,
+    scopeCount: Array.isArray(entry.scopes) ? entry.scopes.length : 0,
+    closureScopes: (entry.scopes ?? []).filter(
+      (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
+    ).length,
+    localScopes: (entry.scopes ?? []).filter(
+      (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "local"
+    ).length,
+    enumeratedScopes: 0,
+    candidateRoots: 0,
+    frameKind: classifyQuickPlayPausedFrameKind(entry)
+  }));
+  const frameAcquisitionSummaryByIndex = new Map(
+    frameAcquisitionSummaries.map((summary) => [summary.frameIndex, summary])
+  );
+  const totalScopeCount = frameAcquisitionSummaries.reduce(
+    (total, summary) => total + Math.max(0, Number(summary.scopeCount ?? 0)),
+    0
+  );
+  const totalClosureScopeCount = frameAcquisitionSummaries.reduce(
+    (total, summary) => total + Math.max(0, Number(summary.closureScopes ?? 0)),
+    0
+  );
+  const totalLocalScopeCount = frameAcquisitionSummaries.reduce(
+    (total, summary) => total + Math.max(0, Number(summary.localScopes ?? 0)),
+    0
+  );
+  const tickFrames = frameInventory.filter(
+    (entry) =>
+      normalizeIdentityText(entry.callFrame?.functionName) === "_tick" &&
+      entry.scopes.some(
+        (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
+      )
+  );
+  const preferredFrames = tickFrames
+    .map((entry) => ({
+      ...entry,
+      frameScore: scoreQuickPlayCallFrame(entry.callFrame, {
+        soloFingerprint,
+        bindingNames: entry.bindingNames,
+        scopeTypes: entry.scopeTypes,
+        frameIndex: entry.frameIndex
+      })
+    }))
+    .sort((left, right) => right.frameScore - left.frameScore || left.frameIndex - right.frameIndex)
+    .slice(0, 1);
+  return {
+    callFrames,
+    soloFingerprint,
+    frameInventory,
+    frameAcquisitionSummaries,
+    frameAcquisitionSummaryByIndex,
+    totalScopeCount,
+    totalClosureScopeCount,
+    totalLocalScopeCount,
+    tickFramesSeen: tickFrames.length,
+    preferredFrames,
+    selectedTickFrames: preferredFrames.length
+  };
+}
+
+function analyzeFriendlyVsPausedCallFrames(pausedEvent) {
+  const callFrames = Array.isArray(pausedEvent?.callFrames) ? pausedEvent.callFrames : [];
+  const frameEntries = callFrames.map((callFrame, frameIndex) => {
+    const scopes = Array.isArray(callFrame?.scopeChain)
+      ? callFrame.scopeChain
+          .map((scope, scopeIndex) => ({
+            scopeIndex,
+            scopeType: normalizedScalar(scope?.type) ?? "",
+            objectIdPresent: Boolean(normalizedScalar(scope?.object?.objectId))
+          }))
+          .filter((scopeEntry) => scopeEntry.scopeType)
+      : [];
+    return {
+      frameIndex,
+      callFrame,
+      scopes,
+      scopeTypes: scopes.map((scopeEntry) => scopeEntry.scopeType)
+    };
+  });
+  const closureFrameEntries = frameEntries.filter((entry) =>
+    entry.scopes.some((scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure")
+  );
+  const tickFrames = closureFrameEntries
+    .filter((entry) => normalizeIdentityText(entry.callFrame?.functionName) === "_tick")
+    .map((entry) => ({
+      ...entry,
+      frameScore: scoreQuickPlayCallFrame(entry.callFrame, {
+        bindingNames: [],
+        scopeTypes: entry.scopeTypes,
+        frameIndex: entry.frameIndex
+      })
+    }))
+    .sort((left, right) => right.frameScore - left.frameScore || left.frameIndex - right.frameIndex);
+  return {
+    callFrames,
+    callframeCount: frameEntries.length,
+    closureScopeCount: closureFrameEntries.reduce(
+      (total, entry) =>
+        total +
+        entry.scopes.filter(
+          (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
+        ).length,
+      0
+    ),
+    closureFrameCount: closureFrameEntries.length,
+    preferredFrames: tickFrames.slice(0, 1),
+    preferredFrameCount: tickFrames.length
+  };
+}
+
+function classifyQuickPlayPausedFrameKind(frameEntry = null) {
+  const functionName = normalizeIdentityText(frameEntry?.functionName);
+  const scopes = Array.isArray(frameEntry?.scopes) ? frameEntry.scopes : [];
+  const closureScopes = scopes.filter(
+    (scopeEntry) => normalizeIdentityText(scopeEntry?.scopeType ?? scopeEntry?.scope_type) === "closure"
+  ).length;
+  const localScopes = scopes.filter(
+    (scopeEntry) => normalizeIdentityText(scopeEntry?.scopeType ?? scopeEntry?.scope_type) === "local"
+  ).length;
+  if (functionName === "_tick" && closureScopes > 0) {
+    return "tick_closure";
+  }
+  if (functionName === "_tick") {
+    return "tick_nonclosure";
+  }
+  if (closureScopes > 0) {
+    return "closure_other";
+  }
+  if (localScopes > 0) {
+    return "local_only";
+  }
+  return "other";
+}
+
+function buildQuickPlayPreferredScopeOrder(frameEntry, soloFingerprint = null) {
+  const closureScopes = (frameEntry?.scopes ?? [])
+    .filter((scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure")
+    .sort((left, right) => {
+      const leftPriority = left.scopeIndex === 4 ? 2 : left.scopeIndex === 3 ? 1 : 0;
+      const rightPriority = right.scopeIndex === 4 ? 2 : right.scopeIndex === 3 ? 1 : 0;
+      if (rightPriority !== leftPriority) {
+        return rightPriority - leftPriority;
+      }
+      const scoreDelta =
+        scoreQuickPlayScope(right, soloFingerprint) - scoreQuickPlayScope(left, soloFingerprint);
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+      return left.scopeIndex - right.scopeIndex;
+    });
+  const scopeOrder = [];
+  const primaryScope = closureScopes.find((scopeEntry) => scopeEntry.scopeIndex === 4) ?? null;
+  const secondaryScope = closureScopes.find((scopeEntry) => scopeEntry.scopeIndex === 3) ?? null;
+  if (primaryScope) {
+    scopeOrder.push(primaryScope.scopeIndex);
+  }
+  if (secondaryScope && secondaryScope.scopeIndex !== primaryScope?.scopeIndex) {
+    scopeOrder.push(secondaryScope.scopeIndex);
+  }
+  return scopeOrder;
+}
+
+function buildQuickPlayStructuralFallbackScopeOrder(frameEntry, soloFingerprint = null) {
+  return (frameEntry?.scopes ?? [])
+    .filter((scopeEntry) => {
+      const scopeType = normalizeIdentityText(scopeEntry.scopeType);
+      return scopeType === "closure" || scopeType === "local";
+    })
+    .sort((left, right) => {
+      const leftClosure = normalizeIdentityText(left.scopeType) === "closure" ? 1 : 0;
+      const rightClosure = normalizeIdentityText(right.scopeType) === "closure" ? 1 : 0;
+      if (rightClosure !== leftClosure) {
+        return rightClosure - leftClosure;
+      }
+      const scoreDelta =
+        scoreQuickPlayScope(right, soloFingerprint) - scoreQuickPlayScope(left, soloFingerprint);
+      if (scoreDelta !== 0) {
+        return scoreDelta;
+      }
+      return left.scopeIndex - right.scopeIndex;
+    })
+    .map((scopeEntry) => scopeEntry.scopeIndex);
 }
 
 function writeQuickPlayCallFrameInventory(
@@ -4412,6 +4641,787 @@ export async function releaseQuickPlayPassiveState(
     log(`[quick-play] passive snapshot unavailable reason=${reason}`);
   }
   return true;
+}
+
+export function startFriendlyVsPassiveCapture(
+  friendlyVsPassiveCaptureState,
+  {
+    roundId,
+    localGameId,
+    targetUrl = "",
+    now = Date.now(),
+    log = console.log
+  } = {}
+) {
+  if (!friendlyVsPassiveCaptureState) {
+    return false;
+  }
+  const normalizedRoundId = String(roundId ?? "").trim();
+  const normalizedLocalGameId = normalizedScalar(localGameId);
+  if (!normalizedRoundId || normalizedLocalGameId === null) {
+    return false;
+  }
+  const signature = `${normalizedRoundId}|${normalizedLocalGameId}`;
+  if (
+    friendlyVsPassiveCaptureState.active === true &&
+    friendlyVsPassiveCaptureState.lastArmedSignature === signature
+  ) {
+    friendlyVsPassiveCaptureState.currentTargetUrl = String(targetUrl ?? "");
+    return false;
+  }
+  const fresh = createQuickPlayDiagnosticState();
+  friendlyVsPassiveCaptureState.active = true;
+  friendlyVsPassiveCaptureState.startedAt = Math.max(0, Number(now ?? Date.now()));
+  friendlyVsPassiveCaptureState.finishedAt = 0;
+  friendlyVsPassiveCaptureState.stopReason = "";
+  friendlyVsPassiveCaptureState.roundObserved = true;
+  friendlyVsPassiveCaptureState.roundCompleted = false;
+  friendlyVsPassiveCaptureState.captureGeneration =
+    Math.max(0, Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)) + 1;
+  friendlyVsPassiveCaptureState.currentTargetUrl = String(targetUrl ?? "");
+  friendlyVsPassiveCaptureState.roundId = normalizedRoundId;
+  friendlyVsPassiveCaptureState.localGameId = normalizedLocalGameId;
+  friendlyVsPassiveCaptureState.nextClosureSurveyAt =
+    Math.max(0, Number(now ?? Date.now()));
+  friendlyVsPassiveCaptureState.nextPassiveSnapshotAt = 0;
+  friendlyVsPassiveCaptureState.lastArmedSignature = signature;
+  friendlyVsPassiveCaptureState.lastBoundSignature = "";
+  friendlyVsPassiveCaptureState.wsEnvelopes = [];
+  friendlyVsPassiveCaptureState.wsPlayers = new Map();
+  friendlyVsPassiveCaptureState.sessionCandidates = new Map();
+  friendlyVsPassiveCaptureState.closureCandidates = new Map();
+  friendlyVsPassiveCaptureState.pendingIdentity = fresh.pendingIdentity;
+  friendlyVsPassiveCaptureState.boundLocalClosureCandidate =
+    fresh.boundLocalClosureCandidate;
+  friendlyVsPassiveCaptureState.closureScanState = fresh.closureScanState;
+  friendlyVsPassiveCaptureState.sessionScanState = fresh.sessionScanState;
+  friendlyVsPassiveCaptureState.diagnostics = fresh.diagnostics;
+  friendlyVsPassiveCaptureState.lastUsablePassiveSnapshot = null;
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotError = null;
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotLogSignature = "";
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotLogAt = 0;
+  friendlyVsPassiveCaptureState.lastPassiveRootProbeSignature = "";
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotFailureLogReason = "";
+  friendlyVsPassiveCaptureState.friendlyVsBindFailureCount = 0;
+  friendlyVsPassiveCaptureState.friendlyVsSurveyAttemptedGeneration = 0;
+  writeQuickPlayPassiveSnapshotState(friendlyVsPassiveCaptureState, {
+    status: "unavailable",
+    reason: "awaiting_local_board"
+  });
+  log?.(
+    `[friendly-vs-capture] armed round_id=${normalizedRoundId} gameid=${normalizedLocalGameId}`
+  );
+  return true;
+}
+
+export async function stopFriendlyVsPassiveCapture(
+  cdp,
+  friendlyVsPassiveCaptureState,
+  {
+    reason = "inactive",
+    log = console.log,
+    writeSnapshotStatus = true
+  } = {}
+) {
+  if (!friendlyVsPassiveCaptureState) {
+    return false;
+  }
+  friendlyVsPassiveCaptureState.active = false;
+  friendlyVsPassiveCaptureState.roundId = "";
+  friendlyVsPassiveCaptureState.localGameId = "";
+  friendlyVsPassiveCaptureState.currentTargetUrl = "";
+  friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
+  friendlyVsPassiveCaptureState.nextPassiveSnapshotAt = 0;
+  friendlyVsPassiveCaptureState.lastBoundSignature = "";
+  friendlyVsPassiveCaptureState.friendlyVsBindFailureCount = 0;
+  friendlyVsPassiveCaptureState.friendlyVsSurveyAttemptedGeneration = 0;
+  await releaseQuickPlayPassiveState(cdp, friendlyVsPassiveCaptureState, {
+    reason,
+    writeSnapshotStatus,
+    preserveDiagnostics: true,
+    log: () => {}
+  });
+  return true;
+}
+
+async function scanFriendlyVsClosureCandidates(
+  cdp,
+  transientState,
+  friendlyVsPassiveCaptureState,
+  {
+    now = Date.now(),
+    log = console.log
+  } = {}
+) {
+  const scanState = friendlyVsPassiveCaptureState?.closureScanState;
+  if (!friendlyVsPassiveCaptureState?.active || !scanState) {
+    return { status: "skipped", reason: "inactive" };
+  }
+  if (scanState.running === true) {
+    return { status: "skipped", reason: "acquisition_in_progress" };
+  }
+  scanState.running = true;
+  scanState.attempts = Math.max(0, Number(scanState.attempts ?? 0)) + 1;
+  const attempt = scanState.attempts;
+  friendlyVsPassiveCaptureState.diagnostics.closure_scan.attempts += 1;
+  const bindStartedAt = Date.now();
+  const bindTiming = createFriendlyVsBindTimingRecord();
+  const expectedGeneration = Math.max(
+    0,
+    Number(friendlyVsPassiveCaptureState?.captureGeneration ?? 0)
+  );
+  let debuggerEnabled = false;
+  let paused = false;
+  let pauseStartedAt = 0;
+  let probeStartedAt = 0;
+  let scan = null;
+  try {
+    if (
+      !cdp ||
+      typeof cdp.send !== "function" ||
+      typeof cdp.waitForEvent !== "function"
+    ) {
+      scan = createQuickPlayClosureSkipResult("target_not_available");
+    } else if (!friendlyVsPassiveCaptureState?.active) {
+      scan = createQuickPlayClosureSkipResult("capture_inactive");
+    } else if (
+      Math.max(0, Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)) !==
+      expectedGeneration
+    ) {
+        scan = createQuickPlayClosureSkipResult("stale_generation");
+      } else {
+        try {
+          await cdp.send("Debugger.enable");
+          debuggerEnabled = true;
+        } catch (error) {
+          scan = createQuickPlayClosureSkipResult("debugger_not_enabled", {
+            error: error?.message ?? error ?? "debugger_not_enabled"
+        });
+      }
+      if (!scan) {
+        try {
+          probeStartedAt = Date.now();
+          pauseStartedAt = Date.now();
+          await cdp.send("Debugger.pause");
+        } catch (error) {
+          scan = createQuickPlayClosureSkipResult("pause_request_failed", {
+            pauseRequested: 1,
+            error: error?.message ?? error ?? "pause_request_failed"
+          });
+        }
+      }
+      let pausedEvent = null;
+      if (!scan) {
+        try {
+          pausedEvent = await cdp.waitForEvent(
+            "Debugger.paused",
+            () => true,
+            DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_TIMEOUT_MS
+          );
+        } catch (error) {
+          scan = createQuickPlayClosureSkipResult("pause_timeout", {
+            pauseRequested: 1,
+            error: error?.message ?? error ?? "pause_timeout"
+          });
+        }
+      }
+      if (!scan && !pausedEvent) {
+        scan = createQuickPlayClosureSkipResult("paused_event_not_received", {
+          pauseRequested: 1
+        });
+      }
+      if (!scan) {
+        paused = true;
+        if (!friendlyVsPassiveCaptureState?.active) {
+          scan = createQuickPlayClosureSkipResult("capture_inactive", {
+            pauseRequested: 1,
+            pauseAcquired: 1
+          });
+        } else if (
+          Math.max(0, Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)) !==
+          expectedGeneration
+        ) {
+          scan = createQuickPlayClosureSkipResult("stale_generation", {
+            pauseRequested: 1,
+            pauseAcquired: 1
+          });
+        } else {
+          const acquisition = analyzeFriendlyVsPausedCallFrames(pausedEvent);
+          const preferredFrames = Array.isArray(acquisition?.preferredFrames)
+            ? acquisition.preferredFrames
+            : [];
+          if (preferredFrames.length === 0) {
+            const acquisitionElapsedMs =
+              Math.max(0, Number(now ?? Date.now())) -
+              Math.max(0, Number(friendlyVsPassiveCaptureState.startedAt ?? now));
+            const acquisitionTimedOut =
+              attempt >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_MAX_ATTEMPTS ||
+              acquisitionElapsedMs >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS;
+            if (attempt === 1) {
+              log?.("[friendly-vs-capture] acquisition waiting");
+              log?.(`attempt=${attempt}`);
+              log?.("preferred_frames=0");
+            }
+            if (acquisitionTimedOut) {
+              friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
+              markQuickPlayPassiveSnapshotUnavailable(
+                friendlyVsPassiveCaptureState,
+                "awaiting_gameplay_frame"
+              );
+              log?.("[friendly-vs-capture] gameplay frame acquisition timed out");
+              log?.(`attempts=${attempt}`);
+            } else {
+              friendlyVsPassiveCaptureState.nextClosureSurveyAt =
+                Math.max(0, Number(now ?? Date.now())) +
+                DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_INTERVAL_MS;
+            }
+            scan = {
+              ...createQuickPlayClosureSkipResult("awaiting_gameplay_frame", {
+                pauseRequested: 1,
+                pauseAcquired: 1,
+                callframesSeen: acquisition.callFrames.length,
+                matchingFramesSeen: 0,
+                matchingScopesSeen: 0
+              }),
+              heavySurveyRan: false,
+              consumeSurveyAttempt: acquisitionTimedOut
+            };
+          } else {
+            log?.("[friendly-vs-capture] gameplay frame acquired");
+            log?.(`attempt=${attempt}`);
+            const inventoryStartedAt = Date.now();
+            const inventory = await buildQuickPlayPausedFrameInventory(
+              cdp,
+              pausedEvent,
+              { includeBindingNames: false }
+            );
+            bindTiming.pauseToInventoryMs =
+              pauseStartedAt > 0 ? Math.max(0, inventoryStartedAt - pauseStartedAt) : 0;
+            bindTiming.inventoryToPreferredMs = Math.max(
+              0,
+              Date.now() - inventoryStartedAt
+            );
+            const scanned = await collectFriendlyVsPreferredFrameCandidatesFromPausedScopes(
+              cdp,
+              pausedEvent,
+              {
+                quickPlayDiagnosticState: friendlyVsPassiveCaptureState,
+                attempt,
+                prebuiltInventory: inventory,
+                expectedGameId: friendlyVsPassiveCaptureState.localGameId
+              }
+            );
+            bindTiming.scopeEnumerationMs = Math.max(
+              0,
+              Number(scanned?.timing?.scopeEnumerationMs ?? 0)
+            );
+            bindTiming.candidateGraphScanMs = Math.max(
+              0,
+              Number(scanned?.timing?.candidateGraphScanMs ?? 0)
+            );
+            const rawCandidates = Array.isArray(scanned?.rawCandidates)
+              ? scanned.rawCandidates
+              : [];
+            const acceptedCandidates = Array.isArray(scanned?.acceptedCandidates)
+              ? scanned.acceptedCandidates
+              : [];
+            const gameIdFilterStartedAt = Date.now();
+            const matchingAcceptedCandidates = acceptedCandidates.filter((candidate) =>
+              valuesEqual(candidate?.gameid, friendlyVsPassiveCaptureState.localGameId)
+            );
+            bindTiming.gameidFilterMs = Math.max(
+              0,
+              Date.now() - gameIdFilterStartedAt
+            );
+            let retainResult = null;
+            let resultType = String(scanned?.resultType ?? "completed_not_found");
+            let selectedAcceptedCandidates = matchingAcceptedCandidates;
+            if (acceptedCandidates.length > 0 && matchingAcceptedCandidates.length === 0) {
+              resultType = "gameid_mismatch";
+            } else if (matchingAcceptedCandidates.length > 1) {
+              const selection = await selectQuickPlayAuthoritativeAcceptedCandidate(
+                cdp,
+                friendlyVsPassiveCaptureState,
+                matchingAcceptedCandidates,
+                {
+                  generation: friendlyVsPassiveCaptureState.captureGeneration,
+                  targetId: friendlyVsPassiveCaptureState.currentTargetUrl,
+                  capturedAt: now,
+                  log: () => {}
+                }
+              );
+              retainResult = selection?.retainResult ?? null;
+              bindTiming.semanticValidationMs = Math.max(
+                0,
+                Number(selection?.timing?.semanticValidationMs ?? 0)
+              );
+              bindTiming.canonicalDedupMs = Math.max(
+                0,
+                Number(selection?.timing?.canonicalDedupMs ?? 0)
+              );
+              bindTiming.retainBindMs = Math.max(
+                0,
+                Number(selection?.timing?.retainBindMs ?? 0)
+              );
+              selectedAcceptedCandidates = Array.isArray(selection?.acceptedCandidates)
+                ? selection.acceptedCandidates
+                : [];
+              resultType =
+                selection?.reason === "authoritative_candidate_selected"
+                  ? "accepted_candidates_found"
+                  : String(selection?.reason ?? resultType);
+            } else if (matchingAcceptedCandidates.length === 1) {
+              const retainStartedAt = Date.now();
+              retainResult = await retainQuickPlayPassiveCandidateHandle(
+                cdp,
+                friendlyVsPassiveCaptureState,
+                matchingAcceptedCandidates[0],
+                {
+                  generation: friendlyVsPassiveCaptureState.captureGeneration,
+                  targetId: friendlyVsPassiveCaptureState.currentTargetUrl,
+                  capturedAt: now,
+                  log: () => {}
+                }
+              );
+              bindTiming.retainBindMs = Math.max(0, Date.now() - retainStartedAt);
+            }
+            scan = {
+              status: "ready",
+              exception: false,
+              pauseRequested: 1,
+              pauseAcquired: 1,
+              ...scanned,
+              rawCandidates,
+              allAcceptedCandidates: acceptedCandidates,
+              acceptedCandidates: selectedAcceptedCandidates,
+              retainResult,
+              resultType,
+              heavySurveyRan: true,
+              consumeSurveyAttempt: true,
+              bindTiming
+            };
+          }
+        }
+      }
+    }
+  } catch (error) {
+    scan = {
+      status: "error",
+      resultType: "exception",
+      exception: true,
+      error: String(error?.message ?? error ?? "unknown"),
+      rawCandidates: [],
+      acceptedCandidates: []
+    };
+  } finally {
+    if (paused) {
+      const resumeStartedAt = Date.now();
+      await cdp.send("Debugger.resume").catch(() => undefined);
+      bindTiming.resumeMs = Math.max(0, Date.now() - resumeStartedAt);
+      bindTiming.totalPausedMs =
+        pauseStartedAt > 0 ? Math.max(0, Date.now() - pauseStartedAt) : 0;
+    }
+    await cdp.send("Runtime.releaseObjectGroup", {
+      objectGroup: "fusion-quick-play-diagnostic"
+    }).catch(() => undefined);
+    if (debuggerEnabled) {
+      await cdp.send("Debugger.disable").catch(() => undefined);
+    }
+  }
+  bindTiming.totalMs = Math.max(0, Date.now() - bindStartedAt);
+  const probeTotalMs = probeStartedAt > 0 ? Math.max(0, Date.now() - probeStartedAt) : 0;
+  if (
+    scan?.resultType === "awaiting_gameplay_frame" &&
+    scan?.consumeSurveyAttempt !== true &&
+    probeTotalMs >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS
+  ) {
+    friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
+    markQuickPlayPassiveSnapshotUnavailable(
+      friendlyVsPassiveCaptureState,
+      "awaiting_gameplay_frame"
+    );
+    log?.("[friendly-vs-capture] gameplay frame acquisition timed out");
+    log?.(`attempts=${attempt}`);
+    scan = {
+      ...scan,
+      consumeSurveyAttempt: true
+    };
+  }
+  friendlyVsPassiveCaptureState.diagnostics.closure_scan.completed += 1;
+  recordQuickPlayClosureScanDiagnostics(friendlyVsPassiveCaptureState, scan);
+  if (scan?.consumeSurveyAttempt === true) {
+    friendlyVsPassiveCaptureState.friendlyVsSurveyAttemptedGeneration = expectedGeneration;
+  }
+  if (scan?.productive === true) {
+    scanState.productiveAttempts += 1;
+  } else {
+    scanState.nonproductiveAttempts += 1;
+  }
+  const rawCandidates = Array.isArray(scan?.rawCandidates) ? scan.rawCandidates : [];
+  const allAcceptedCandidates = Array.isArray(scan?.allAcceptedCandidates)
+    ? scan.allAcceptedCandidates
+    : Array.isArray(scan?.acceptedCandidates)
+      ? scan.acceptedCandidates
+      : [];
+  const retainResult = scan?.retainResult ?? null;
+  const resultType = String(scan?.resultType ?? "completed_not_found");
+  const selectedAcceptedCandidates = Array.isArray(scan?.acceptedCandidates)
+    ? scan.acceptedCandidates
+    : [];
+  const boundCandidate = friendlyVsPassiveCaptureState.boundLocalClosureCandidate;
+  if (retainResult?.ok === true && boundCandidate) {
+    friendlyVsPassiveCaptureState.friendlyVsBindFailureCount = 0;
+    boundCandidate.userid = null;
+    boundCandidate.gameid = normalizedScalar(friendlyVsPassiveCaptureState.localGameId);
+    boundCandidate.wsPlayerId = `friendly_vs|${String(
+      friendlyVsPassiveCaptureState.localGameId
+    )}`;
+    boundCandidate.identityBound = true;
+    syncQuickPlayPassiveSnapshotCurrentState(friendlyVsPassiveCaptureState);
+    const boundSignature = [
+      boundCandidate.candidateId ?? "",
+      friendlyVsPassiveCaptureState.localGameId ?? "",
+      friendlyVsPassiveCaptureState.captureGeneration ?? 0
+    ].join("|");
+    if (friendlyVsPassiveCaptureState.lastBoundSignature !== boundSignature) {
+      friendlyVsPassiveCaptureState.lastBoundSignature = boundSignature;
+      log?.(
+        `[friendly-vs-capture] bound local gameplay state gameid=${String(
+          friendlyVsPassiveCaptureState.localGameId
+        )}`
+      );
+      logFriendlyVsBindTiming(friendlyVsPassiveCaptureState, bindTiming, { log });
+    }
+    friendlyVsPassiveCaptureState.nextPassiveSnapshotAt = now;
+  } else {
+    friendlyVsPassiveCaptureState.friendlyVsBindFailureCount = Math.max(
+      0,
+      Number(friendlyVsPassiveCaptureState.friendlyVsBindFailureCount ?? 0)
+    ) + 1;
+    if (scan?.consumeSurveyAttempt === true) {
+      friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
+    }
+  }
+  scanState.running = false;
+  return {
+    status: "ready",
+    resultType,
+    retainResult,
+    rawCandidates,
+    allAcceptedCandidates,
+    acceptedCandidates: selectedAcceptedCandidates,
+    heavySurveyRan: scan?.heavySurveyRan === true,
+    bindTiming
+  };
+}
+
+async function readFriendlyVsPassiveSnapshot(
+  cdp,
+  friendlyVsPassiveCaptureState,
+  {
+    now = Date.now()
+  } = {}
+) {
+  const bound = friendlyVsPassiveCaptureState?.boundLocalClosureCandidate;
+  const diagnostics = friendlyVsPassiveCaptureState?.diagnostics?.passive_snapshot;
+  if (!bound?.rootObjectId || !diagnostics) {
+    if (diagnostics) {
+      diagnostics.transport_reads_failed += 1;
+      diagnostics.reads_failed += 1;
+      diagnostics.last_failure_reason = "candidate_handle_invalid";
+    }
+    syncQuickPlayPassiveSnapshotCurrentState(friendlyVsPassiveCaptureState);
+    return { status: "unavailable", reason: "candidate_handle_invalid" };
+  }
+  diagnostics.reads_attempted += 1;
+  const value = await probeQuickPlayPassiveSemanticState(cdp, bound);
+  if (value?.transport_error === true) {
+    diagnostics.transport_reads_failed += 1;
+    diagnostics.reads_failed += 1;
+    return { status: "unavailable", reason: "candidate_handle_invalid" };
+  }
+  diagnostics.transport_reads_succeeded += 1;
+  if (value.status === "candidate_handle_invalid") {
+    diagnostics.semantic_reads_failed += 1;
+    diagnostics.reads_failed += 1;
+    diagnostics.last_failure_reason = "candidate_handle_invalid";
+    incrementQuickPlayDiagnosticBucket(
+      diagnostics.semantic_failure_reasons,
+      diagnostics.last_failure_reason
+    );
+    return { status: "unavailable", reason: "candidate_handle_invalid" };
+  }
+  diagnostics.field_diagnostics = value.field_diagnostics ?? null;
+  diagnostics.board_normalized = value.board_normalized === true;
+  diagnostics.current_normalized = value.current_normalized === true;
+  diagnostics.hold_normalized = value.hold_normalized === true;
+  diagnostics.queue_normalized = value.queue_normalized === true;
+  if (value.status !== "ready") {
+    diagnostics.semantic_reads_failed += 1;
+    diagnostics.reads_failed += 1;
+    diagnostics.last_failure_reason = String(value.reason ?? "semantic_read_failed");
+    incrementQuickPlayDiagnosticBucket(
+      diagnostics.semantic_failure_reasons,
+      diagnostics.last_failure_reason
+    );
+    friendlyVsPassiveCaptureState.lastPassiveSnapshotError = {
+      reason: diagnostics.last_failure_reason,
+      field_diagnostics: value.field_diagnostics ?? null
+    };
+    syncQuickPlayPassiveSnapshotCurrentState(friendlyVsPassiveCaptureState);
+    return {
+      status: "unavailable",
+      reason: diagnostics.last_failure_reason,
+      field_diagnostics: value.field_diagnostics ?? null
+    };
+  }
+  diagnostics.semantic_reads_succeeded += 1;
+  diagnostics.reads_succeeded += 1;
+  diagnostics.last_success_at = Math.max(0, Number(now ?? Date.now()));
+  diagnostics.last_failure_reason = "";
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotError = null;
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotFailureLogReason = "";
+  syncQuickPlayPassiveSnapshotCurrentState(friendlyVsPassiveCaptureState);
+  const payload = {
+    version: 1,
+    source: "friendly_vs_passive",
+    round_id: String(friendlyVsPassiveCaptureState.roundId ?? ""),
+    capture_generation: Math.max(
+      0,
+      Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)
+    ),
+    timestamp: Math.max(0, Number(now ?? Date.now())),
+    userid: normalizedScalar(bound.userid),
+    gameid: normalizedScalar(bound.gameid),
+    candidate_id: normalizedScalar(bound.candidateId),
+    playing: value.playing ?? null,
+    started: value.started ?? null,
+    countdown_started: value.countdown_started ?? null,
+    paused: typeof value.paused === "boolean" ? value.paused : false,
+    destroyed: value.destroyed ?? null,
+    successful: value.successful ?? null,
+    gameoverreason: normalizedScalar(value.gameoverreason),
+    board: Array.isArray(value.board) ? value.board : null,
+    current:
+      value.current && typeof value.current === "object"
+        ? {
+            type: normalizedScalar(value.current.type),
+            x: Number.isFinite(Number(value.current.x))
+              ? Number(value.current.x)
+              : null,
+            y: Number.isFinite(Number(value.current.y))
+              ? Number(value.current.y)
+              : null,
+            rotation: Number.isFinite(Number(value.current.rotation))
+              ? Number(value.current.rotation)
+              : null
+          }
+        : normalizedScalar(value.current)
+          ? {
+              type: normalizedScalar(value.current),
+              x: null,
+              y: null,
+              rotation: null
+            }
+          : null,
+    hold: value.hold === null ? null : normalizedScalar(value.hold),
+    queue: Array.isArray(value.queue)
+      ? value.queue
+          .slice(0, 20)
+          .map((entry) => normalizedScalar(entry))
+          .filter(Boolean)
+      : [],
+    piece_counter: Math.max(0, Number(value.piece_counter ?? 0)),
+    board_width: Math.max(0, Number(value.board_width ?? 0)),
+    board_height: Math.max(0, Number(value.board_height ?? 0))
+  };
+  friendlyVsPassiveCaptureState.lastUsablePassiveSnapshot = payload;
+  writeQuickPlayPassiveSnapshotState(friendlyVsPassiveCaptureState, {
+    status: "ready",
+    capture_status: friendlyVsPassiveCaptureState.active ? "running" : "stopped",
+    snapshot: payload,
+    last_read_error: null
+  });
+  return { status: "ready", snapshot: payload };
+}
+
+async function pollFriendlyVsPassiveSnapshotNow(
+  cdp,
+  friendlyVsPassiveCaptureState,
+  {
+    now = Date.now()
+  } = {}
+) {
+  const diagnostics = friendlyVsPassiveCaptureState?.diagnostics?.passive_snapshot;
+  const boundCandidate = friendlyVsPassiveCaptureState?.boundLocalClosureCandidate;
+  if (!diagnostics || !boundCandidate?.rootObjectId || boundCandidate.identityBound !== true) {
+    return { status: "skipped", reason: "binding_incomplete" };
+  }
+  const snapshot = await readFriendlyVsPassiveSnapshot(cdp, friendlyVsPassiveCaptureState, {
+    now
+  });
+  friendlyVsPassiveCaptureState.nextPassiveSnapshotAt =
+    now +
+    Math.max(
+      100,
+      Number(friendlyVsPassiveCaptureState.passiveSnapshotIntervalMs ?? 150)
+    );
+  if (snapshot.status !== "ready") {
+    markQuickPlayPassiveSnapshotUnavailable(
+      friendlyVsPassiveCaptureState,
+      snapshot.reason ?? "candidate_handle_invalid"
+    );
+  }
+  return snapshot;
+}
+
+export async function maybeRunFriendlyVsPassiveCapture({
+  cdp,
+  friendlyVsPassiveCaptureState,
+  browserControlState,
+  transientState,
+  targetUrl = "",
+  roundStatus = null,
+  now = Date.now(),
+  log = console.log
+} = {}) {
+  if (!friendlyVsPassiveCaptureState) {
+    return { ran: false, reason: "state_missing" };
+  }
+  const startedAt = Math.max(0, Number(now ?? Date.now()));
+  const modeActive =
+    isFriendlyVsModeSelected(browserControlState) &&
+    Boolean(browserControlState?.botEnabled);
+  const captureEnabled = Boolean(browserControlState?.friendlyVsCaptureEnabled);
+  const roundId = String(roundStatus?.roundId ?? "").trim();
+  const localGameId = normalizedScalar(roundStatus?.localGameId);
+  const roundActive = Boolean(roundStatus?.active) && roundId && localGameId !== null;
+  if (!modeActive || !captureEnabled || !roundActive) {
+    if (
+      friendlyVsPassiveCaptureState.active ||
+      String(
+        friendlyVsPassiveCaptureState?.boundLocalClosureCandidate?.rootObjectId ?? ""
+      ).trim()
+    ) {
+      await stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+        reason: !modeActive
+          ? "mode_inactive"
+          : !captureEnabled
+            ? "admission_pending"
+            : "round_inactive",
+        log,
+        writeSnapshotStatus: true
+      });
+    }
+    return {
+      ran: false,
+      reason: !modeActive
+        ? "mode_inactive"
+        : !captureEnabled
+          ? "admission_pending"
+          : "round_inactive"
+    };
+  }
+  if (
+    !friendlyVsPassiveCaptureState.active ||
+    friendlyVsPassiveCaptureState.roundId !== roundId ||
+    !valuesEqual(friendlyVsPassiveCaptureState.localGameId, localGameId)
+  ) {
+    if (
+      friendlyVsPassiveCaptureState.active ||
+      String(
+        friendlyVsPassiveCaptureState?.boundLocalClosureCandidate?.rootObjectId ?? ""
+      ).trim()
+    ) {
+      await stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+        reason: "round_changed",
+        log,
+        writeSnapshotStatus: true
+      });
+    }
+    startFriendlyVsPassiveCapture(friendlyVsPassiveCaptureState, {
+      roundId,
+      localGameId,
+      targetUrl,
+      now,
+      log
+    });
+  }
+  friendlyVsPassiveCaptureState.currentTargetUrl = String(targetUrl ?? "");
+  const currentGeneration = Math.max(
+    0,
+    Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)
+  );
+  if (
+    !friendlyVsPassiveCaptureState?.boundLocalClosureCandidate?.rootObjectId &&
+    friendlyVsPassiveCaptureState?.closureScanState?.running !== true &&
+    Math.max(
+      0,
+      Number(friendlyVsPassiveCaptureState.friendlyVsSurveyAttemptedGeneration ?? 0)
+    ) !== currentGeneration &&
+    now >= Number(friendlyVsPassiveCaptureState.nextClosureSurveyAt ?? 0)
+  ) {
+    const bindStartedAt = Math.max(0, Number(now ?? Date.now()));
+    const scan = await scanFriendlyVsClosureCandidates(
+      cdp,
+      transientState,
+      friendlyVsPassiveCaptureState,
+      {
+        now,
+        log
+      }
+    );
+    if (scan?.resultType === "gameid_mismatch") {
+      markQuickPlayPassiveSnapshotUnavailable(
+        friendlyVsPassiveCaptureState,
+        "gameid_mismatch"
+      );
+    }
+    if (scan?.heavySurveyRan === true) {
+      maybeLogFriendlyVsCaptureTiming(
+        friendlyVsPassiveCaptureState,
+        "survey",
+        Math.max(0, Number(Date.now()) - bindStartedAt),
+        { now: Date.now(), log }
+      );
+    }
+  }
+  if (
+    friendlyVsPassiveCaptureState?.boundLocalClosureCandidate?.rootObjectId &&
+    friendlyVsPassiveCaptureState?.boundLocalClosureCandidate?.identityBound === true &&
+    now >= Number(friendlyVsPassiveCaptureState.nextPassiveSnapshotAt ?? 0)
+  ) {
+    const snapshotStartedAt = Math.max(0, Number(now ?? Date.now()));
+    const snapshot = await pollFriendlyVsPassiveSnapshotNow(
+      cdp,
+      friendlyVsPassiveCaptureState,
+      { now }
+    );
+    if ((snapshot?.reason ?? "") === "candidate_handle_invalid") {
+      await releaseQuickPlayPassiveState(cdp, friendlyVsPassiveCaptureState, {
+        reason: "candidate_handle_invalid",
+        writeSnapshotStatus: true,
+        preserveDiagnostics: true,
+        log: () => {}
+      });
+      friendlyVsPassiveCaptureState.nextClosureSurveyAt = now;
+      friendlyVsPassiveCaptureState.friendlyVsSurveyAttemptedGeneration = 0;
+      friendlyVsPassiveCaptureState.lastBoundSignature = "";
+    }
+    maybeLogFriendlyVsCaptureTiming(
+      friendlyVsPassiveCaptureState,
+      "snapshot",
+      Math.max(0, Number(Date.now()) - snapshotStartedAt),
+      { now: Date.now(), log }
+    );
+  }
+  maybeLogFriendlyVsCaptureTiming(
+    friendlyVsPassiveCaptureState,
+    "poll",
+    Math.max(0, Number(Date.now()) - startedAt),
+    { now: Date.now(), log }
+  );
+  return { ran: true };
 }
 
 function buildQuickPlayBoardPathFromCandidate(candidate = null) {
@@ -5781,6 +6791,120 @@ async function resolveQuickPlayPassiveCanonicalStateContextHandle(cdp, runtimeCa
   };
 }
 
+export function createFriendlyVsPassiveCaptureState() {
+  const state = createQuickPlayDiagnosticState();
+  state.rawWsPath = "";
+  state.closurePath = "";
+  state.callframePath = "";
+  state.reportPath = "";
+  state.passiveSnapshotPath = DEFAULT_FRIENDLY_VS_PASSIVE_SNAPSHOT_PATH;
+  state.active = false;
+  state.roundObserved = true;
+  state.roundCompleted = false;
+  state.currentTargetUrl = "";
+  state.roundId = "";
+  state.localGameId = "";
+  state.lastArmedSignature = "";
+  state.lastBoundSignature = "";
+  state.lastTimingLogsAt = {
+    poll: 0,
+    bind: 0,
+    survey: 0,
+    snapshot: 0
+  };
+  return state;
+}
+
+function maybeLogFriendlyVsCaptureTiming(
+  friendlyVsPassiveCaptureState,
+  stage,
+  elapsedMs,
+  {
+    now = Date.now(),
+    log = console.log,
+    periodicThresholdMs = 12,
+    slowThresholdMs = 100,
+    intervalMs = 1000,
+    slowIntervalMs = 250
+  } = {}
+) {
+  if (
+    typeof log !== "function" ||
+    !friendlyVsPassiveCaptureState ||
+    !Number.isFinite(Number(elapsedMs))
+  ) {
+    return false;
+  }
+  const normalizedStage = String(stage ?? "").trim();
+  if (!normalizedStage) {
+    return false;
+  }
+  const elapsed = Math.max(0, Math.round(Number(elapsedMs)));
+  const timingLogsAt = friendlyVsPassiveCaptureState.lastTimingLogsAt ?? {};
+  const lastLoggedAt = Math.max(0, Number(timingLogsAt[normalizedStage] ?? 0));
+  const currentNow = Math.max(0, Number(now ?? Date.now()));
+  if (elapsed < periodicThresholdMs) {
+    return false;
+  }
+  if (elapsed >= slowThresholdMs && currentNow - lastLoggedAt < slowIntervalMs) {
+    return false;
+  }
+  if (elapsed < slowThresholdMs && currentNow - lastLoggedAt < intervalMs) {
+    return false;
+  }
+  if (!friendlyVsPassiveCaptureState.lastTimingLogsAt) {
+    friendlyVsPassiveCaptureState.lastTimingLogsAt = {};
+  }
+  friendlyVsPassiveCaptureState.lastTimingLogsAt[normalizedStage] = currentNow;
+  log(`[friendly-vs-capture] ${normalizedStage} elapsed_ms=${elapsed}`);
+  return true;
+}
+
+export function computeFriendlyVsBindRetryDelay(failureCount = 1) {
+  const normalizedCount = Math.max(1, Number(failureCount ?? 1));
+  if (normalizedCount <= 1) {
+    return 500;
+  }
+  if (normalizedCount === 2) {
+    return 1000;
+  }
+  return 2000;
+}
+
+function createFriendlyVsBindTimingRecord() {
+  return {
+    pauseToInventoryMs: 0,
+    inventoryToPreferredMs: 0,
+    scopeEnumerationMs: 0,
+    candidateGraphScanMs: 0,
+    semanticValidationMs: 0,
+    gameidFilterMs: 0,
+    canonicalDedupMs: 0,
+    retainBindMs: 0,
+    resumeMs: 0,
+    totalPausedMs: 0,
+    totalMs: 0
+  };
+}
+
+function logFriendlyVsBindTiming(
+  friendlyVsPassiveCaptureState,
+  timing,
+  {
+    log = console.log
+  } = {}
+) {
+  if (typeof log !== "function" || !timing) {
+    return false;
+  }
+  const pausedMs = Math.max(0, Math.round(Number(timing.totalPausedMs ?? 0)));
+  const totalMs = Math.max(0, Math.round(Number(timing.totalMs ?? 0)));
+  log(
+    `[friendly-vs-capture] bind timing paused_ms=${pausedMs} total_ms=${totalMs} pause_to_inventory_ms=${Math.max(0, Math.round(Number(timing.pauseToInventoryMs ?? 0)))} scope_enumeration_ms=${Math.max(0, Math.round(Number(timing.scopeEnumerationMs ?? 0)))} candidate_graph_scan_ms=${Math.max(0, Math.round(Number(timing.candidateGraphScanMs ?? 0)))} resume_ms=${Math.max(0, Math.round(Number(timing.resumeMs ?? 0)))}`
+  );
+  return true;
+}
+
 async function compareQuickPlayRuntimeObjectIdentity(cdp, leftObjectId, rightObjectId) {
   const left = String(leftObjectId ?? "").trim();
   const right = String(rightObjectId ?? "").trim();
@@ -5889,6 +7013,11 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
   const normalizedAccepted = Array.isArray(acceptedCandidates)
     ? acceptedCandidates
     : [];
+  const timing = {
+    semanticValidationMs: 0,
+    canonicalDedupMs: 0,
+    retainBindMs: 0
+  };
   const results = [];
   for (let index = 0; index < normalizedAccepted.length; index += 1) {
     const candidate = normalizedAccepted[index];
@@ -5911,7 +7040,9 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
       reason: "path_invariant_failed"
     };
     if (isQuickPlayPassiveRuntimeCandidateReady(runtimeCandidate)) {
+      const probeStartedAt = Date.now();
       probeValue = await probeQuickPlayPassiveSemanticState(cdp, runtimeCandidate);
+      timing.semanticValidationMs += Math.max(0, Date.now() - probeStartedAt);
     }
     const evaluation = evaluateQuickPlayAuthoritativeCandidateProbe(
       runtimeCandidate,
@@ -5951,15 +7082,18 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
       acceptedCandidates: [],
       retainResult: null,
       results,
+      timing,
       reason: "no_authoritative_candidate"
     };
   }
   const semanticGroups = [];
   for (const authoritativeEntry of authoritative) {
+    const canonicalStartedAt = Date.now();
     const canonicalStateHandle = await resolveQuickPlayPassiveCanonicalStateContextHandle(
       cdp,
       authoritativeEntry.runtimeCandidate
     );
+    timing.canonicalDedupMs += Math.max(0, Date.now() - canonicalStartedAt);
     if (canonicalStateHandle?.ok !== true) {
       return {
         candidate: null,
@@ -5967,12 +7101,14 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
         acceptedCandidates: [],
         retainResult: null,
         results,
+        timing,
         reason: String(canonicalStateHandle?.reason ?? "canonical_state_context_unavailable")
       };
     }
     authoritativeEntry.canonicalStateHandle = canonicalStateHandle;
     let matchedGroup = null;
     for (const group of semanticGroups) {
+      const compareStartedAt = Date.now();
       if (
         await compareQuickPlayRuntimeObjectIdentity(
           cdp,
@@ -5980,9 +7116,11 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
           group.canonicalStateHandle?.objectId
         )
       ) {
+        timing.canonicalDedupMs += Math.max(0, Date.now() - compareStartedAt);
         matchedGroup = group;
         break;
       }
+      timing.canonicalDedupMs += Math.max(0, Date.now() - compareStartedAt);
     }
     if (matchedGroup) {
       matchedGroup.entries.push(authoritativeEntry);
@@ -6011,6 +7149,7 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
         )}`
       );
     }
+    const retainStartedAt = Date.now();
     const retainResult = await retainQuickPlayPassiveCandidateHandle(
       cdp,
       quickPlayDiagnosticState,
@@ -6022,6 +7161,7 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
         log
       }
     );
+    timing.retainBindMs += Math.max(0, Date.now() - retainStartedAt);
     if (typeof log === "function") {
       log(
         `[quick-play] selected semantic group=1/${semanticGroups.length} retain=${retainResult?.ok === true ? "success" : "failed"}${retainResult?.ok === true ? "" : ` reason=${String(retainResult?.reason ?? "unknown")}`}`
@@ -6034,6 +7174,7 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
         acceptedCandidates: [selected.candidate],
         retainResult,
         results,
+        timing,
         reason: "authoritative_candidate_selected"
       };
     }
@@ -6043,6 +7184,7 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
       acceptedCandidates: [],
       retainResult,
       results,
+      timing,
       reason: String(retainResult?.reason ?? "candidate_retain_failed")
     };
   }
@@ -6052,6 +7194,7 @@ async function selectQuickPlayAuthoritativeAcceptedCandidate(
     acceptedCandidates: [],
     retainResult: null,
     results,
+    timing,
     reason: "ambiguous_authoritative_candidates"
   };
 }
@@ -6805,6 +7948,78 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
         }
         return { ok: true, value: current };
       };
+      const uniqueScalars = (values) => {
+        const seen = new Set();
+        const ordered = [];
+        for (const value of values) {
+          const normalized = scalar(value);
+          if (normalized === undefined || normalized === null) {
+            continue;
+          }
+          const key = String(normalized);
+          if (seen.has(key)) {
+            continue;
+          }
+          seen.add(key);
+          ordered.push(normalized);
+        }
+        return ordered;
+      };
+      const directGameIdFrom = (value) => scalar(value?.gameid ?? value?.game_id);
+      const ownerGameIdsFrom = (...roots) => {
+        const seenNodes = new Set();
+        const ownerGameIds = [];
+        const ownerKeys = [
+          "owner",
+          "player",
+          "players",
+          "user",
+          "users",
+          "self",
+          "local",
+          "client",
+          "session",
+          "room",
+          "options",
+          "game",
+          "state"
+        ];
+        const visit = (node) => {
+          if (!node || typeof node !== "object" || seenNodes.has(node)) {
+            return;
+          }
+          seenNodes.add(node);
+          ownerGameIds.push(scalar(node?.options?.gameid), scalar(node?.room?.gameid));
+          for (const key of ownerKeys) {
+            const next = node?.[key];
+            if (Array.isArray(next)) {
+              for (const entry of next.slice(0, 4)) {
+                ownerGameIds.push(directGameIdFrom(entry));
+                ownerGameIds.push(scalar(entry?.options?.gameid), scalar(entry?.room?.gameid));
+              }
+              continue;
+            }
+            ownerGameIds.push(directGameIdFrom(next));
+            ownerGameIds.push(scalar(next?.options?.gameid), scalar(next?.room?.gameid));
+          }
+        };
+        for (const root of roots) {
+          visit(root);
+        }
+        return uniqueScalars(ownerGameIds);
+      };
+      const ancestorGameIdsForPath = (root, parts) => {
+        const gameids = [];
+        for (let index = 1; index < parts.length; index += 1) {
+          const entry = readPath(root, parts.slice(0, index));
+          if (!entry.ok) {
+            continue;
+          }
+          gameids.push(directGameIdFrom(entry.value));
+          gameids.push(scalar(entry.value?.options?.gameid), scalar(entry.value?.room?.gameid));
+        }
+        return uniqueScalars(gameids);
+      };
       const hasStateShape = (value) => {
         if (!value || typeof value !== "object") return false;
         const directBoard = boardFrom(value);
@@ -6910,9 +8125,26 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
         const current = normalizePiece(activeState);
         const hold = normalizePiece(holdAccessor.value);
         const queue = queueFrom(queueAccessor.value);
-        const gameid = scalar(
-          state?.gameid ?? state?.game_id ?? state?.options?.gameid ?? state?.room?.gameid
-        );
+        const directGameId = directGameIdFrom(state);
+        const resolvedPath = [...pathParts, ...statePath];
+        const ancestorGameids = ancestorGameIdsForPath(this, resolvedPath);
+        const ownerGameids = ownerGameIdsFrom(value, state);
+        let gameid = directGameId;
+        let gameidSourceKind = "missing";
+        if (gameid !== undefined && gameid !== null) {
+          gameidSourceKind =
+            statePath.length === 0 ? "direct" : statePath.length === 1 ? "parent" : "ancestor";
+        } else {
+          const ownerGameId = uniqueScalars([
+            scalar(state?.options?.gameid),
+            scalar(state?.room?.gameid),
+            ...ownerGameids
+          ])[0];
+          if (ownerGameId !== undefined && ownerGameId !== null) {
+            gameid = ownerGameId;
+            gameidSourceKind = "owner";
+          }
+        }
         const seed = scalar(
           state?.seed ?? state?.options?.seed ?? state?.room?.seed
         );
@@ -6991,9 +8223,14 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
           hold,
           queue,
           gameid,
+          gameidSourceKind,
+          semanticDepth: Math.max(0, resolvedPath.length),
           seed,
           userid,
           pieceCounter,
+          ancestorGameids,
+          ownerGameids,
+          familyGameids: [],
           discoveredPaths: {
             board: boardAccessor.path.slice(0, 8),
             current: currentAccessor.path.slice(0, 8),
@@ -7200,7 +8437,8 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
             const rootShape = pathParts.length === 0
               ? "binding"
               : normalizeKey(pathParts[pathParts.length - 1] ?? "binding");
-            candidateRecords.push(summarizeNode(value, pathParts, rootShape));
+            const summarizedRecord = summarizeNode(value, pathParts, rootShape);
+            candidateRecords.push(summarizedRecord);
             for (const preferred of preferredPaths) {
               const preferredRecord = walkPreferredPath(
                 value,
@@ -7256,6 +8494,13 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
             bestRecord = record;
           }
         }
+        bestRecord.familyGameids = uniqueScalars(
+          candidateRecords.flatMap((record) => [
+            record?.gameid,
+            ...(Array.isArray(record?.ancestorGameids) ? record.ancestorGameids : []),
+            ...(Array.isArray(record?.ownerGameids) ? record.ownerGameids : [])
+          ])
+        );
         return bestRecord;
       } catch {
         return {
@@ -7273,6 +8518,11 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
           hasGameId: false,
           hasSeed: false,
           hasUserId: false,
+          gameidSourceKind: "missing",
+          semanticDepth: 0,
+          ancestorGameids: [],
+          ownerGameids: [],
+          familyGameids: [],
           rejectedReason: ["inspection_failed"],
           accepted: false
         };
@@ -7297,6 +8547,11 @@ async function inspectQuickPlayClosureDiagnosticCandidate(
         hasGameId: false,
         hasSeed: false,
         hasUserId: false,
+        gameidSourceKind: "missing",
+        semanticDepth: 0,
+        ancestorGameids: [],
+        ownerGameids: [],
+        familyGameids: [],
         rejectedReason: [
           `inspect_failed:${String(error?.message ?? error ?? "unknown")}`
         ]
@@ -7316,16 +8571,24 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
     mainFrameId = "",
     maxRawCandidates = DEFAULT_QUICK_PLAY_CLOSURE_SCAN_MAX_RAW_CANDIDATES,
     perScanBudgetMs = DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_BUDGET_MS,
+    prebuiltInventory = null,
+    allowStructuralFrameFallback = false,
+    structuralFallbackFrameLimit = 3,
+    onStructuralFrameFallback = null,
     log = quickPlayDiagnosticState?.logFn ?? console.log
   } = {}
 ) {
-  const inventory = await buildQuickPlayPausedFrameInventory(cdp, pausedEvent);
+  const inventory = prebuiltInventory ?? (await buildQuickPlayPausedFrameInventory(cdp, pausedEvent));
   const callFrames = inventory.callFrames ?? [];
   const baseResult = {
     rawCandidates: [],
     acceptedCandidates: [],
     framesScanned: 0,
     scopesScanned: 0,
+    totalScopeCount: 0,
+    totalClosureScopeCount: 0,
+    totalLocalScopeCount: 0,
+    totalPropertyProbeCount: 0,
     durationMs: 0,
     callframesSeen: callFrames.length,
     tickFramesSeen: 0,
@@ -7339,6 +8602,9 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
     genericTargetsSeen: 0,
     targetHandoffMismatches: 0,
     inventoryRowsWritten: 0,
+    structuralFallbackUsed: false,
+    structuralFallbackFrameCount: 0,
+    frameAcquisitionSummaries: [],
     productive: false
   };
   if (inventory.resultType === "callframes_missing") {
@@ -7365,49 +8631,77 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       noTickAttempt: summarizeQuickPlayNoTickCallFrames(callFrames, attempt)
     };
   }
-  const soloFingerprint = readJsonFileIfPresent(
-    quickPlayDiagnosticState?.soloClosureFingerprintPath ??
-      DEFAULT_SOLO_CLOSURE_FINGERPRINT_PATH
-  );
-  const frameInventory = inventory.frameInventory.map((row, frameIndex) => ({
-    frameIndex,
-    callFrame: callFrames[frameIndex],
-    bindingNames: [
-      ...new Set(
-        (row?.scopes ?? []).flatMap((scope) =>
-          Array.isArray(scope?.binding_names) ? scope.binding_names.slice(0, 20) : []
-        )
-      )
-    ],
-    scopeTypes: Array.isArray(row?.scope_types) ? row.scope_types : [],
-    scopes: (row?.scopes ?? []).map((scope) => ({
-      scopeIndex: Math.max(0, Number(scope?.scope_index ?? 0)),
-      scopeType: normalizedScalar(scope?.scope_type) ?? "",
-      bindingNames: Array.isArray(scope?.binding_names) ? scope.binding_names.slice(0, 80) : []
-    }))
-  }));
-  const tickFrames = frameInventory.filter(
-    (entry) =>
-      normalizeIdentityText(entry.callFrame?.functionName) === "_tick" &&
-      entry.scopes.some(
-        (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
-      )
-  );
-  baseResult.tickFramesSeen = tickFrames.length;
-  const selectedFrames = tickFrames
-    .map((entry) => ({
-      ...entry,
-      frameScore: scoreQuickPlayCallFrame(entry.callFrame, {
-        soloFingerprint,
-        bindingNames: entry.bindingNames,
-        scopeTypes: entry.scopeTypes,
-        frameIndex: entry.frameIndex
+  const {
+    soloFingerprint,
+    frameInventory,
+    frameAcquisitionSummaries,
+    frameAcquisitionSummaryByIndex,
+    totalScopeCount,
+    totalClosureScopeCount,
+    totalLocalScopeCount,
+    tickFramesSeen,
+    preferredFrames
+  } = analyzeQuickPlayPausedFrameInventory(inventory, quickPlayDiagnosticState);
+  baseResult.frameAcquisitionSummaries = frameAcquisitionSummaries;
+  baseResult.totalScopeCount = totalScopeCount;
+  baseResult.totalClosureScopeCount = totalClosureScopeCount;
+  baseResult.totalLocalScopeCount = totalLocalScopeCount;
+  baseResult.tickFramesSeen = tickFramesSeen;
+  let selectedFrames = preferredFrames;
+  let structuralFallbackUsed = false;
+  if (
+    selectedFrames.length === 0 &&
+    allowStructuralFrameFallback === true &&
+    baseResult.totalClosureScopeCount > 0
+  ) {
+    const fallbackFrameCap = Math.max(1, Math.min(3, Number(structuralFallbackFrameLimit ?? 3)));
+    const structuralFallbackFrames = frameInventory
+      .map((entry) => ({
+        ...entry,
+        scopeCount: Array.isArray(entry.scopes) ? entry.scopes.length : 0,
+        closureScopeCount: (entry.scopes ?? []).filter(
+          (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
+        ).length,
+        localScopeCount: (entry.scopes ?? []).filter(
+          (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "local"
+        ).length,
+        frameScore: scoreQuickPlayCallFrame(entry.callFrame, {
+          soloFingerprint,
+          bindingNames: entry.bindingNames,
+          scopeTypes: entry.scopeTypes,
+          frameIndex: entry.frameIndex
+        })
+      }))
+      .filter((entry) => entry.closureScopeCount > 0 && entry.scopeCount > 0)
+      .sort((left, right) => {
+        if (right.closureScopeCount !== left.closureScopeCount) {
+          return right.closureScopeCount - left.closureScopeCount;
+        }
+        if (right.scopeCount !== left.scopeCount) {
+          return right.scopeCount - left.scopeCount;
+        }
+        if (right.localScopeCount !== left.localScopeCount) {
+          return right.localScopeCount - left.localScopeCount;
+        }
+        if (right.frameScore !== left.frameScore) {
+          return right.frameScore - left.frameScore;
+        }
+        return left.frameIndex - right.frameIndex;
       })
-    }))
-    .sort((left, right) => right.frameScore - left.frameScore || left.frameIndex - right.frameIndex)
-    .slice(0, 1);
+      .slice(0, fallbackFrameCap);
+    if (structuralFallbackFrames.length > 0) {
+      selectedFrames = structuralFallbackFrames;
+      structuralFallbackUsed = true;
+      baseResult.structuralFallbackUsed = true;
+      baseResult.structuralFallbackFrameCount = structuralFallbackFrames.length;
+      onStructuralFrameFallback?.({
+        eligibleFrames: preferredFrames.length,
+        fallbackFrames: structuralFallbackFrames.length
+      });
+    }
+  }
   baseResult.matchingFramesSeen = selectedFrames.length;
-  baseResult.selectedTickFrames = selectedFrames.length;
+  baseResult.selectedTickFrames = preferredFrames.length;
   if (selectedFrames.length === 0) {
     return {
       ...baseResult,
@@ -7415,36 +8709,27 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       noTickAttempt: summarizeQuickPlayNoTickCallFrames(callFrames, attempt)
     };
   }
-  const frameEntry = selectedFrames[0];
-  const callFrame = callFrames[frameEntry.frameIndex];
-  const closureScopes = frameEntry.scopes
-    .filter((scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure")
-    .sort((left, right) => {
-      const leftPriority = left.scopeIndex === 4 ? 2 : left.scopeIndex === 3 ? 1 : 0;
-      const rightPriority = right.scopeIndex === 4 ? 2 : right.scopeIndex === 3 ? 1 : 0;
-      if (rightPriority !== leftPriority) {
-        return rightPriority - leftPriority;
-      }
-      const scoreDelta = scoreQuickPlayScope(right, soloFingerprint) - scoreQuickPlayScope(left, soloFingerprint);
-      if (scoreDelta !== 0) {
-        return scoreDelta;
-      }
-      return left.scopeIndex - right.scopeIndex;
-    });
-  baseResult.candidateClosureScopesSeen = closureScopes.length;
-  const scopeOrder = [];
-  const primaryScope = closureScopes.find((scopeEntry) => scopeEntry.scopeIndex === 4) ?? null;
-  const secondaryScope = closureScopes.find((scopeEntry) => scopeEntry.scopeIndex === 3) ?? null;
-  if (primaryScope) {
-    scopeOrder.push(primaryScope.scopeIndex);
-    baseResult.selectedPrimaryScopes = 1;
-  }
-  if (secondaryScope && secondaryScope.scopeIndex !== primaryScope?.scopeIndex) {
-    scopeOrder.push(secondaryScope.scopeIndex);
-    baseResult.selectedSecondaryScopes = 1;
-  }
-  baseResult.matchingScopesSeen = scopeOrder.length;
-  if (scopeOrder.length === 0) {
+  const scopeOrdersByFrameIndex = new Map(
+    selectedFrames.map((frameEntry) => [
+      frameEntry.frameIndex,
+      structuralFallbackUsed
+        ? buildQuickPlayStructuralFallbackScopeOrder(frameEntry, soloFingerprint)
+        : buildQuickPlayPreferredScopeOrder(frameEntry, soloFingerprint)
+    ])
+  );
+  baseResult.candidateClosureScopesSeen = selectedFrames.reduce(
+    (total, frameEntry) =>
+      total +
+      (frameEntry.scopes ?? []).filter(
+        (scopeEntry) => normalizeIdentityText(scopeEntry.scopeType) === "closure"
+      ).length,
+    0
+  );
+  baseResult.matchingScopesSeen = [...scopeOrdersByFrameIndex.values()].reduce(
+    (total, scopeOrder) => total + Math.max(0, Number(scopeOrder?.length ?? 0)),
+    0
+  );
+  if (baseResult.matchingScopesSeen === 0) {
     return { ...baseResult, resultType: "matching_scope_missing" };
   }
   const startedAt = Date.now();
@@ -7452,7 +8737,7 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
   const rawCandidates = [];
   const acceptedCandidates = [];
   let lastInspection = null;
-  const buildTarget = (scopeIndex) => {
+  const buildTarget = (frameEntry, callFrame, scopeIndex) => {
     const scope = callFrame?.scopeChain?.[scopeIndex] ?? null;
     const scopeInventory = frameEntry.scopes.find((entry) => entry.scopeIndex === scopeIndex) ?? null;
     if (!scope?.object?.objectId) {
@@ -7481,12 +8766,413 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
         : []
     };
   };
-  const primaryTarget = buildTarget(scopeOrder[0]);
-  if (primaryTarget && typeof log === "function") {
-    log(
-      `[quick-play] closure target selected attempt=${attempt} function=${primaryTarget.functionName ?? ""} frame=${primaryTarget.callFrameIndex} scope=${primaryTarget.scopeIndex} scope_type=${primaryTarget.scopeType ?? ""} bindings=${primaryTarget.bindingNames.join(",")}`
+  const makeInspection = (target, propertiesBindingCount, skippedPrimitiveBindings, skippedFunctionBindings, result) =>
+    buildQuickPlayInspectionResult(target, {
+      attempt,
+      inventoryBindingCount: target?.inventoryBindingCount ?? 0,
+      propertiesBindingCount,
+      inspectedObjectBindings: [],
+      skippedPrimitiveBindings,
+      skippedFunctionBindings,
+      result
+    });
+  const noteFrameEnumeration = (inspectionTarget, propertyProbeCount = 0, candidateRootCount = 0) => {
+    const frameSummary = frameAcquisitionSummaryByIndex.get(
+      Math.max(0, Number(inspectionTarget?.callFrameIndex ?? -1))
     );
+    if (!frameSummary) {
+      return;
+    }
+    frameSummary.enumeratedScopes += 1;
+    frameSummary.candidateRoots += Math.max(0, Number(candidateRootCount ?? 0));
+    baseResult.totalPropertyProbeCount += Math.max(0, Number(propertyProbeCount ?? 0));
+  };
+  for (const frameEntry of selectedFrames) {
+    if (Date.now() - startedAt >= perScanBudgetMs) {
+      break;
+    }
+    const callFrame = callFrames[frameEntry.frameIndex];
+    const scopeOrder = scopeOrdersByFrameIndex.get(frameEntry.frameIndex) ?? [];
+    if (
+      structuralFallbackUsed !== true &&
+      frameEntry.frameIndex === selectedFrames[0]?.frameIndex
+    ) {
+      baseResult.selectedPrimaryScopes = scopeOrder.includes(4) ? 1 : 0;
+      baseResult.selectedSecondaryScopes = scopeOrder.includes(3) ? 1 : 0;
+    }
+    const primaryTarget = buildTarget(frameEntry, callFrame, scopeOrder[0]);
+    if (primaryTarget && typeof log === "function") {
+      log(
+        `[quick-play] closure target selected attempt=${attempt} function=${primaryTarget.functionName ?? ""} frame=${primaryTarget.callFrameIndex} scope=${primaryTarget.scopeIndex} scope_type=${primaryTarget.scopeType ?? ""} bindings=${primaryTarget.bindingNames.join(",")}`
+      );
+    }
+    let countedFrameScan = false;
+    for (const scopeIndex of scopeOrder) {
+      if (Date.now() - startedAt >= perScanBudgetMs) {
+        break;
+      }
+      const inspectionTarget = buildTarget(frameEntry, callFrame, scopeIndex);
+      if (!inspectionTarget) {
+        continue;
+      }
+      const normalizedScopeType = normalizeIdentityText(inspectionTarget.scopeType);
+      const scopeTypeAllowed =
+        structuralFallbackUsed === true
+          ? normalizedScopeType === "closure" || normalizedScopeType === "local"
+          : normalizedScopeType === "closure";
+      const functionAllowed =
+        structuralFallbackUsed === true
+          ? true
+          : normalizeIdentityText(inspectionTarget.functionName) === "_tick";
+      if (!functionAllowed || !scopeTypeAllowed) {
+        return {
+          ...baseResult,
+          resultType: "target_handoff_mismatch",
+          durationMs: Math.max(0, Date.now() - startedAt),
+          targetedInspections: 1,
+          targetHandoffMismatches: 1,
+          totalScopeCount: baseResult.totalScopeCount,
+          totalClosureScopeCount: baseResult.totalClosureScopeCount,
+          totalLocalScopeCount: baseResult.totalLocalScopeCount,
+          totalPropertyProbeCount: baseResult.totalPropertyProbeCount,
+          frameAcquisitionSummaries,
+          productive: true,
+          targetedBindingInspection: buildQuickPlayInspectionResult(inspectionTarget, {
+            attempt,
+            inventoryBindingCount: inspectionTarget.inventoryBindingCount,
+            result: "target_handoff_mismatch"
+          })
+        };
+      }
+      if (!countedFrameScan) {
+        baseResult.framesScanned += 1;
+        countedFrameScan = true;
+      }
+      baseResult.scopesScanned += 1;
+      if (typeof log === "function") {
+        log(
+          `[quick-play] closure inspection started attempt=${attempt} function=${inspectionTarget.functionName ?? ""} frame=${inspectionTarget.callFrameIndex} scope=${inspectionTarget.scopeIndex} scope_object_id_present=${inspectionTarget.scopeObjectId ? "true" : "false"}`
+        );
+      }
+      const properties = await cdp.send("Runtime.getProperties", {
+        objectId: inspectionTarget.scopeObjectId,
+        ownProperties: true,
+        accessorPropertiesOnly: false,
+        generatePreview: false
+      }).catch(() => null);
+      const rawDescriptors = (properties?.result ?? []).slice(0, MAX_SCOPE_PROPERTIES_PER_SCOPE);
+      const candidateRootCount = rawDescriptors.filter((descriptor) =>
+        shouldInspectQuickPlayBindingDescriptor(descriptor)
+      ).length;
+      noteFrameEnumeration(inspectionTarget, rawDescriptors.length, candidateRootCount);
+      lastInspection = makeInspection(
+        inspectionTarget,
+        rawDescriptors.length,
+        rawDescriptors
+          .filter((descriptor) => !descriptor?.get && !descriptor?.set)
+          .filter((descriptor) => {
+            const type = String(descriptor?.value?.type ?? "").trim();
+            return type && type !== "object" && type !== "function";
+          })
+          .map((descriptor) => String(descriptor?.name ?? "").trim())
+          .filter(Boolean),
+        rawDescriptors
+          .filter((descriptor) => !descriptor?.get && !descriptor?.set)
+          .filter((descriptor) => String(descriptor?.value?.type ?? "").trim() === "function")
+          .map((descriptor) => String(descriptor?.name ?? "").trim())
+          .filter(Boolean),
+        "inspection_started"
+      );
+      if (inspectionTarget.inventoryBindingCount > 0 && rawDescriptors.length === 0) {
+        return {
+          ...baseResult,
+          resultType: "target_handoff_mismatch",
+          durationMs: Math.max(0, Date.now() - startedAt),
+          targetedInspections: 1,
+          targetHandoffMismatches: 1,
+          totalScopeCount: baseResult.totalScopeCount,
+          totalClosureScopeCount: baseResult.totalClosureScopeCount,
+          totalLocalScopeCount: baseResult.totalLocalScopeCount,
+          totalPropertyProbeCount: baseResult.totalPropertyProbeCount,
+          frameAcquisitionSummaries,
+          productive: true,
+          targetedBindingInspection: {
+            ...lastInspection,
+            result: "target_handoff_mismatch"
+          }
+        };
+      }
+      const descriptors = rawDescriptors
+        .map((descriptor, index) => ({ descriptor, index }))
+        .sort((left, right) => {
+          const scoreDelta =
+            scorePausedScopeDescriptor(right.descriptor, []) -
+            scorePausedScopeDescriptor(left.descriptor, []);
+          return scoreDelta !== 0 ? scoreDelta : left.index - right.index;
+        })
+        .map(({ descriptor }) => descriptor);
+      for (let propertyIndex = 0; propertyIndex < descriptors.length; propertyIndex += 1) {
+        if (
+          rawCandidates.length >= maxRawCandidates ||
+          Date.now() - startedAt >= perScanBudgetMs
+        ) {
+          break;
+        }
+        const descriptor = descriptors[propertyIndex];
+        if (descriptor?.get || descriptor?.set) {
+          continue;
+        }
+        if (!shouldInspectQuickPlayBindingDescriptor(descriptor)) {
+          continue;
+        }
+        const valueObjectId = descriptor?.value?.objectId;
+        const locator = String(descriptor?.name ?? "").trim();
+        if (!valueObjectId || !locator) {
+          continue;
+        }
+        const candidateKey = [
+          inspectionTarget.callFrameIndex,
+          inspectionTarget.scopeIndex,
+          inspectionTarget.scopeObjectId,
+          propertyIndex,
+          locator,
+          valueObjectId
+        ].join(":");
+        if (seenCandidateKeys.has(candidateKey)) {
+          continue;
+        }
+        seenCandidateKeys.add(candidateKey);
+        lastInspection.inspected_object_bindings.push(locator);
+        const candidateId = `paused:${inspectionTarget.callFrameIndex}:${inspectionTarget.scopeIndex}:${propertyIndex}:${locator}`;
+        const inspected = await inspectQuickPlayClosureDiagnosticCandidate(
+          cdp,
+          valueObjectId,
+          candidateId,
+          locator,
+          inspectionTarget
+        );
+        if (!inspected || typeof inspected !== "object") {
+          continue;
+        }
+        if (
+          (Number.isFinite(Number(inspected.callFrameIndex)) &&
+            Number(inspected.callFrameIndex) !== inspectionTarget.callFrameIndex) ||
+          (Number.isFinite(Number(inspected.scopeIndex)) &&
+            Number(inspected.scopeIndex) !== inspectionTarget.scopeIndex)
+        ) {
+          return {
+            ...baseResult,
+            resultType: "target_handoff_mismatch",
+            durationMs: Math.max(0, Date.now() - startedAt),
+            targetedInspections: 1,
+            targetHandoffMismatches: 1,
+            totalScopeCount: baseResult.totalScopeCount,
+            totalClosureScopeCount: baseResult.totalClosureScopeCount,
+            totalLocalScopeCount: baseResult.totalLocalScopeCount,
+            totalPropertyProbeCount: baseResult.totalPropertyProbeCount,
+            frameAcquisitionSummaries,
+            productive: true,
+            targetedBindingInspection: {
+              ...lastInspection,
+              result: "target_handoff_mismatch"
+            }
+          };
+        }
+        inspected.attempt = attempt;
+        inspected.rootObjectId = valueObjectId;
+        inspected.functionName = inspectionTarget.functionName;
+        inspected.callFrameIndex = inspectionTarget.callFrameIndex;
+        inspected.scopeIndex = inspectionTarget.scopeIndex;
+        inspected.scopeType = inspectionTarget.scopeType;
+        rawCandidates.push(inspected);
+        if (typeof log === "function") {
+          log(
+            `[quick-play] closure candidate emitted function=${inspected.functionName ?? ""} frame=${inspected.callFrameIndex} scope=${inspected.scopeIndex} binding=${inspected.bindingName ?? ""} full_path=${inspected.fullPath ?? ""}`
+          );
+        }
+        if (inspected.accepted === true) {
+          acceptedCandidates.push(inspected);
+        }
+      }
+      if (acceptedCandidates.length > 0) {
+        break;
+      }
+    }
+    if (acceptedCandidates.length > 0) {
+      break;
+    }
   }
+  return {
+    resultType:
+      Date.now() - startedAt >= perScanBudgetMs
+        ? "paused_budget_reached"
+        : rawCandidates.length >= maxRawCandidates
+          ? "raw_candidate_limit_reached"
+          : acceptedCandidates.length > 0
+            ? "accepted_candidates_found"
+            : "completed_not_found",
+    rawCandidates,
+    acceptedCandidates,
+    framesScanned: baseResult.framesScanned,
+    scopesScanned: baseResult.scopesScanned,
+    totalScopeCount: baseResult.totalScopeCount,
+    totalClosureScopeCount: baseResult.totalClosureScopeCount,
+    totalLocalScopeCount: baseResult.totalLocalScopeCount,
+    totalPropertyProbeCount: baseResult.totalPropertyProbeCount,
+    durationMs: Math.max(0, Date.now() - startedAt),
+    callframesSeen: callFrames.length,
+    tickFramesSeen: baseResult.tickFramesSeen,
+    selectedTickFrames: baseResult.selectedTickFrames,
+    matchingFramesSeen: baseResult.matchingFramesSeen,
+    matchingScopesSeen: baseResult.matchingScopesSeen,
+    candidateClosureScopesSeen: baseResult.candidateClosureScopesSeen,
+    selectedPrimaryScopes: baseResult.selectedPrimaryScopes,
+    selectedSecondaryScopes: baseResult.selectedSecondaryScopes,
+    targetedInspections: lastInspection ? 1 : 0,
+    genericTargetsSeen: 0,
+    targetHandoffMismatches: 0,
+    inventoryRowsWritten: baseResult.inventoryRowsWritten,
+    structuralFallbackUsed: baseResult.structuralFallbackUsed,
+    structuralFallbackFrameCount: baseResult.structuralFallbackFrameCount,
+    frameAcquisitionSummaries,
+    productive: true,
+    targetedBindingInspection: lastInspection
+      ? {
+          ...lastInspection,
+          result:
+            acceptedCandidates.length > 0 ? "accepted_candidates_found" : "completed_not_found"
+        }
+      : null
+  };
+}
+
+async function collectFriendlyVsPreferredFrameCandidatesFromPausedScopes(
+  cdp,
+  pausedEvent,
+  {
+    quickPlayDiagnosticState = null,
+    attempt = 1,
+    prebuiltInventory = null,
+    expectedGameId = null,
+    perScanBudgetMs = DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_BUDGET_MS
+  } = {}
+) {
+  const inventory =
+    prebuiltInventory ??
+    (await buildQuickPlayPausedFrameInventory(cdp, pausedEvent, {
+      includeBindingNames: false
+    }));
+  const acquisition = analyzeQuickPlayPausedFrameInventory(
+    inventory,
+    quickPlayDiagnosticState
+  );
+  const callFrames = Array.isArray(acquisition?.callFrames) ? acquisition.callFrames : [];
+  const preferredFrames = Array.isArray(acquisition?.preferredFrames)
+    ? acquisition.preferredFrames
+    : [];
+  const frameAcquisitionSummaries = Array.isArray(acquisition?.frameAcquisitionSummaries)
+    ? acquisition.frameAcquisitionSummaries
+    : [];
+  const frameAcquisitionSummaryByIndex = new Map(
+    frameAcquisitionSummaries.map((summary) => [summary.frameIndex, summary])
+  );
+  const baseResult = {
+    callFrames,
+    tickFramesSeen: Math.max(0, Number(acquisition?.tickFramesSeen ?? 0)),
+    selectedTickFrames: Math.max(0, Number(acquisition?.selectedTickFrames ?? 0)),
+    matchingFramesSeen: preferredFrames.length,
+    matchingScopesSeen: preferredFrames.length > 0
+      ? preferredFrames.reduce(
+          (total, entry) =>
+            total +
+            (Array.isArray(entry?.scopes)
+              ? entry.scopes.filter(
+                  (scopeEntry) =>
+                    normalizeIdentityText(scopeEntry?.scopeType) === "closure"
+                ).length
+              : 0),
+          0
+        )
+      : 0,
+    totalScopeCount: Math.max(0, Number(acquisition?.totalScopeCount ?? 0)),
+    totalClosureScopeCount: Math.max(0, Number(acquisition?.totalClosureScopeCount ?? 0)),
+    totalLocalScopeCount: Math.max(0, Number(acquisition?.totalLocalScopeCount ?? 0)),
+    totalPropertyProbeCount: 0,
+    frameAcquisitionSummaries,
+    inventoryRowsWritten: Math.max(0, Number(callFrames.length ?? 0)),
+    candidateClosureScopesSeen: 0,
+    selectedPrimaryScopes: 0,
+    selectedSecondaryScopes: 0,
+    structuralFallbackUsed: false,
+    structuralFallbackFrameCount: 0,
+    framesScanned: 0,
+    scopesScanned: 0
+  };
+  if (preferredFrames.length === 0) {
+    return {
+      ...baseResult,
+      resultType: "matching_frame_missing",
+      rawCandidates: [],
+      acceptedCandidates: [],
+      durationMs: 0,
+      productive: false,
+      timing: {
+        scopeEnumerationMs: 0,
+        candidateGraphScanMs: 0
+      }
+    };
+  }
+  const startedAt = Date.now();
+  const frameEntry = preferredFrames[0];
+  const callFrame = callFrames[frameEntry.frameIndex];
+  const scopeOrder = (Array.isArray(frameEntry?.scopes) ? frameEntry.scopes : [])
+    .filter(
+      (scopeEntry) => normalizeIdentityText(scopeEntry?.scopeType) === "closure"
+    )
+    .sort(
+      (left, right) =>
+        scoreQuickPlayScope(right, acquisition?.soloFingerprint) -
+          scoreQuickPlayScope(left, acquisition?.soloFingerprint) ||
+        left.scopeIndex - right.scopeIndex
+    )
+    .map((scopeEntry) => Math.max(0, Number(scopeEntry?.scopeIndex ?? 0)));
+  const seenCandidateKeys = new Set();
+  const rawCandidates = [];
+  const acceptedCandidates = [];
+  const matchingAcceptedCandidates = [];
+  let lastInspection = null;
+  let scopeEnumerationMs = 0;
+  let candidateGraphScanMs = 0;
+  const buildTarget = (scopeIndex) => {
+    const scope = callFrame?.scopeChain?.[scopeIndex] ?? null;
+    const scopeInventory =
+      frameEntry.scopes.find((entry) => entry.scopeIndex === scopeIndex) ?? null;
+    if (!scope?.object?.objectId) {
+      return null;
+    }
+    return {
+      attempt,
+      callFrameId: normalizedScalar(callFrame?.callFrameId) ?? null,
+      callFrameIndex: frameEntry.frameIndex,
+      functionName: normalizedScalar(callFrame?.functionName) ?? null,
+      scriptId: normalizedScalar(callFrame?.location?.scriptId) ?? null,
+      lineNumber: Number.isFinite(Number(callFrame?.location?.lineNumber))
+        ? Math.max(0, Number(callFrame.location.lineNumber))
+        : null,
+      columnNumber: Number.isFinite(Number(callFrame?.location?.columnNumber))
+        ? Math.max(0, Number(callFrame.location.columnNumber))
+        : null,
+      scopeIndex,
+      scopeType: normalizedScalar(scope?.type) ?? null,
+      scopeObjectId: normalizedScalar(scope.object?.objectId) ?? null,
+      inventoryBindingCount: Array.isArray(scopeInventory?.bindingNames)
+        ? scopeInventory.bindingNames.length
+        : 0,
+      bindingNames: Array.isArray(scopeInventory?.bindingNames)
+        ? scopeInventory.bindingNames.slice(0, 80)
+        : []
+    };
+  };
   const makeInspection = (target, propertiesBindingCount, skippedPrimitiveBindings, skippedFunctionBindings, result) =>
     buildQuickPlayInspectionResult(target, {
       attempt,
@@ -7505,38 +9191,33 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
     if (!inspectionTarget) {
       continue;
     }
-    if (
-      normalizeIdentityText(inspectionTarget.functionName) !== "_tick" ||
-      normalizeIdentityText(inspectionTarget.scopeType) !== "closure"
-    ) {
-      return {
-        ...baseResult,
-        resultType: "target_handoff_mismatch",
-        durationMs: Math.max(0, Date.now() - startedAt),
-        targetedInspections: 1,
-        targetHandoffMismatches: 1,
-        productive: true,
-        targetedBindingInspection: buildQuickPlayInspectionResult(inspectionTarget, {
-          attempt,
-          inventoryBindingCount: inspectionTarget.inventoryBindingCount,
-          result: "target_handoff_mismatch"
-        })
-      };
+    if (scopeIndex === 4) {
+      baseResult.selectedPrimaryScopes = 1;
+    } else if (scopeIndex === 3) {
+      baseResult.selectedSecondaryScopes = 1;
     }
     baseResult.framesScanned = 1;
     baseResult.scopesScanned += 1;
-    if (typeof log === "function") {
-      log(
-        `[quick-play] closure inspection started attempt=${attempt} function=${inspectionTarget.functionName ?? ""} frame=${inspectionTarget.callFrameIndex} scope=${inspectionTarget.scopeIndex} scope_object_id_present=${inspectionTarget.scopeObjectId ? "true" : "false"}`
-      );
-    }
+    baseResult.candidateClosureScopesSeen += 1;
+    const getPropertiesStartedAt = Date.now();
     const properties = await cdp.send("Runtime.getProperties", {
       objectId: inspectionTarget.scopeObjectId,
       ownProperties: true,
       accessorPropertiesOnly: false,
       generatePreview: false
     }).catch(() => null);
+    scopeEnumerationMs += Math.max(0, Date.now() - getPropertiesStartedAt);
     const rawDescriptors = (properties?.result ?? []).slice(0, MAX_SCOPE_PROPERTIES_PER_SCOPE);
+    const frameSummary = frameAcquisitionSummaryByIndex.get(
+      Math.max(0, Number(inspectionTarget?.callFrameIndex ?? -1))
+    );
+    if (frameSummary) {
+      frameSummary.enumeratedScopes += 1;
+      frameSummary.candidateRoots += rawDescriptors.filter((descriptor) =>
+        shouldInspectQuickPlayBindingDescriptor(descriptor)
+      ).length;
+    }
+    baseResult.totalPropertyProbeCount += rawDescriptors.length;
     lastInspection = makeInspection(
       inspectionTarget,
       rawDescriptors.length,
@@ -7559,13 +9240,20 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       return {
         ...baseResult,
         resultType: "target_handoff_mismatch",
+        rawCandidates,
+        acceptedCandidates,
         durationMs: Math.max(0, Date.now() - startedAt),
-        targetedInspections: 1,
-        targetHandoffMismatches: 1,
         productive: true,
+        targetedInspections: 1,
+        genericTargetsSeen: 0,
+        targetHandoffMismatches: 1,
         targetedBindingInspection: {
           ...lastInspection,
           result: "target_handoff_mismatch"
+        },
+        timing: {
+          scopeEnumerationMs,
+          candidateGraphScanMs
         }
       };
     }
@@ -7579,10 +9267,7 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       })
       .map(({ descriptor }) => descriptor);
     for (let propertyIndex = 0; propertyIndex < descriptors.length; propertyIndex += 1) {
-      if (
-        rawCandidates.length >= maxRawCandidates ||
-        Date.now() - startedAt >= perScanBudgetMs
-      ) {
+      if (Date.now() - startedAt >= perScanBudgetMs) {
         break;
       }
       const descriptor = descriptors[propertyIndex];
@@ -7611,6 +9296,7 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       seenCandidateKeys.add(candidateKey);
       lastInspection.inspected_object_bindings.push(locator);
       const candidateId = `paused:${inspectionTarget.callFrameIndex}:${inspectionTarget.scopeIndex}:${propertyIndex}:${locator}`;
+      const inspectStartedAt = Date.now();
       const inspected = await inspectQuickPlayClosureDiagnosticCandidate(
         cdp,
         valueObjectId,
@@ -7618,6 +9304,7 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
         locator,
         inspectionTarget
       );
+      candidateGraphScanMs += Math.max(0, Date.now() - inspectStartedAt);
       if (!inspected || typeof inspected !== "object") {
         continue;
       }
@@ -7630,13 +9317,20 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
         return {
           ...baseResult,
           resultType: "target_handoff_mismatch",
+          rawCandidates,
+          acceptedCandidates,
           durationMs: Math.max(0, Date.now() - startedAt),
-          targetedInspections: 1,
-          targetHandoffMismatches: 1,
           productive: true,
+          targetedInspections: 1,
+          genericTargetsSeen: 0,
+          targetHandoffMismatches: 1,
           targetedBindingInspection: {
             ...lastInspection,
             result: "target_handoff_mismatch"
+          },
+          timing: {
+            scopeEnumerationMs,
+            candidateGraphScanMs
           }
         };
       }
@@ -7647,53 +9341,45 @@ export async function collectQuickPlayClosureDiagnosticFromPausedScopes(
       inspected.scopeIndex = inspectionTarget.scopeIndex;
       inspected.scopeType = inspectionTarget.scopeType;
       rawCandidates.push(inspected);
-      if (typeof log === "function") {
-        log(
-          `[quick-play] closure candidate emitted function=${inspected.functionName ?? ""} frame=${inspected.callFrameIndex} scope=${inspected.scopeIndex} binding=${inspected.bindingName ?? ""} full_path=${inspected.fullPath ?? ""}`
-        );
-      }
       if (inspected.accepted === true) {
         acceptedCandidates.push(inspected);
+        if (valuesEqual(inspected?.gameid, expectedGameId)) {
+          matchingAcceptedCandidates.push(inspected);
+        }
       }
     }
-    if (acceptedCandidates.length > 0) {
+    if (matchingAcceptedCandidates.length > 0) {
       break;
     }
   }
   return {
+    ...baseResult,
     resultType:
       Date.now() - startedAt >= perScanBudgetMs
         ? "paused_budget_reached"
-        : rawCandidates.length >= maxRawCandidates
-          ? "raw_candidate_limit_reached"
-          : acceptedCandidates.length > 0
-            ? "accepted_candidates_found"
-            : "completed_not_found",
+        : matchingAcceptedCandidates.length > 0 || acceptedCandidates.length > 0
+          ? "accepted_candidates_found"
+          : "completed_not_found",
     rawCandidates,
     acceptedCandidates,
-    framesScanned: baseResult.framesScanned,
-    scopesScanned: baseResult.scopesScanned,
     durationMs: Math.max(0, Date.now() - startedAt),
-    callframesSeen: callFrames.length,
-    tickFramesSeen: baseResult.tickFramesSeen,
-    selectedTickFrames: baseResult.selectedTickFrames,
-    matchingFramesSeen: baseResult.matchingFramesSeen,
-    matchingScopesSeen: baseResult.matchingScopesSeen,
-    candidateClosureScopesSeen: baseResult.candidateClosureScopesSeen,
-    selectedPrimaryScopes: baseResult.selectedPrimaryScopes,
-    selectedSecondaryScopes: baseResult.selectedSecondaryScopes,
+    productive: true,
     targetedInspections: lastInspection ? 1 : 0,
     genericTargetsSeen: 0,
     targetHandoffMismatches: 0,
-    inventoryRowsWritten: baseResult.inventoryRowsWritten,
-    productive: true,
     targetedBindingInspection: lastInspection
       ? {
           ...lastInspection,
           result:
-            acceptedCandidates.length > 0 ? "accepted_candidates_found" : "completed_not_found"
+            matchingAcceptedCandidates.length > 0 || acceptedCandidates.length > 0
+              ? "accepted_candidates_found"
+              : "completed_not_found"
         }
-      : null
+      : null,
+    timing: {
+      scopeEnumerationMs,
+      candidateGraphScanMs
+    }
   };
 }
 
@@ -9667,6 +11353,16 @@ export function applyBrowserControlMessage({
     controlState.localTetrioUsername = nextUsername;
     return true;
   }
+  if (
+    message.type === "friendly_vs_capture_enabled" &&
+    typeof message.enabled === "boolean"
+  ) {
+    if (Boolean(controlState.friendlyVsCaptureEnabled) === message.enabled) {
+      return false;
+    }
+    controlState.friendlyVsCaptureEnabled = message.enabled;
+    return true;
+  }
   if (message.type === "selected_mode") {
     const nextMode = normalizeRuntimeMode(message.mode);
     const nextGeneration = Math.max(0, Number(message.generation ?? 0));
@@ -9678,6 +11374,9 @@ export function applyBrowserControlMessage({
     }
     controlState.selectedMode = nextMode;
     controlState.modeGeneration = nextGeneration;
+    if (nextMode !== RUNTIME_MODE_FRIENDLY_VS) {
+      controlState.friendlyVsCaptureEnabled = false;
+    }
     cancelNextGameReacquire(nextGameReacquireState, {
       reason: "mode_changed",
       log
@@ -9730,6 +11429,7 @@ export function applyBrowserControlMessage({
       modeGeneration: Math.max(0, Number(controlState.modeGeneration ?? 0))
     });
   } else {
+    controlState.friendlyVsCaptureEnabled = false;
     cancelNextGameReacquire(nextGameReacquireState, {
       reason: "bot_off",
       log
@@ -10206,8 +11906,11 @@ async function main() {
   let dddWsObserverCleanup = null;
   let vsRoundActive = false;
   let vsRoundId = "";
+  let vsLocalGameId = "";
+  let vsRoundSeed = "";
   const browserControlState = createBrowserControlState();
   const quickPlayDiagnosticState = createQuickPlayDiagnosticState();
+  const friendlyVsPassiveCaptureState = createFriendlyVsPassiveCaptureState();
   const closureCaptureState = createClosureCaptureState();
   const gameStartSignalState = createGameStartSignalState();
   const nextGameReacquireState = createNextGameReacquireState();
@@ -10259,6 +11962,11 @@ async function main() {
     lastReason = "";
     lastReasonAt = 0;
     clearSnapshotFile(snapshotPath);
+    void stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+      reason,
+      log: () => {},
+      writeSnapshotStatus: true
+    }).catch(() => undefined);
     console.log(
       `[mode] runtime state cleared mode=${normalizeRuntimeMode(browserControlState.selectedMode)}`
     );
@@ -10273,10 +11981,17 @@ async function main() {
       onVsRoundStatus: (status) => {
         const nextActive = Boolean(status?.active);
         const nextRoundId = nextActive ? String(status?.roundId ?? "") : "";
+        const nextLocalGameId = nextActive ? String(status?.localGameId ?? "") : "";
+        const nextSeed = nextActive ? String(status?.seed ?? "") : "";
         const changed =
-          nextActive !== vsRoundActive || nextRoundId !== vsRoundId;
+          nextActive !== vsRoundActive ||
+          nextRoundId !== vsRoundId ||
+          nextLocalGameId !== vsLocalGameId ||
+          nextSeed !== vsRoundSeed;
         vsRoundActive = nextActive;
         vsRoundId = nextRoundId;
+        vsLocalGameId = nextLocalGameId;
+        vsRoundSeed = nextSeed;
         if (!changed || !vsWsSimEnabled) {
           return;
         }
@@ -10464,6 +12179,11 @@ async function main() {
             log: (entry) => console.log(entry)
           });
         }
+        void stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+          reason: "mode_changed",
+          log: () => {},
+          writeSnapshotStatus: true
+        }).catch(() => undefined);
         clearModeRuntimeState("mode_change");
       },
       onBotEnabled: () => {
@@ -10484,6 +12204,11 @@ async function main() {
       onBotDisabled: () => {
         notifyObserverModeControl();
         resetZenithBootstrapCheckState(zenithBootstrapCheckState);
+        void stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+          reason: "bot_off",
+          log: () => {},
+          writeSnapshotStatus: true
+        }).catch(() => undefined);
         clearModeRuntimeState("bot_off");
       },
       onQuickPlayDiagnosticStart: () => {
@@ -10512,6 +12237,11 @@ async function main() {
       void releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
         reason: "bot_off",
         log: (entry) => console.log(entry)
+      }).catch(() => undefined);
+      void stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+        reason: "bot_off",
+        log: () => {},
+        writeSnapshotStatus: true
       }).catch(() => undefined);
     }
   });
@@ -10547,6 +12277,11 @@ async function main() {
         log: (message) => console.log(message)
       }).catch(() => undefined);
     }
+    await stopFriendlyVsPassiveCapture(cdp, friendlyVsPassiveCaptureState, {
+      reason: "shutdown",
+      log: () => {},
+      writeSnapshotStatus: true
+    }).catch(() => undefined);
     resetBrowserTargetState();
     clearPendingClosureCaptureArm(closureCaptureState);
     await releaseEndedGameCandidateHandle(cdp, endedGameCandidate, {
@@ -10603,6 +12338,21 @@ async function main() {
           log: (entry) => console.log(entry)
         });
       }
+      await maybeRunFriendlyVsPassiveCapture({
+        cdp,
+        friendlyVsPassiveCaptureState,
+        browserControlState,
+        transientState,
+        targetUrl: target.url ?? "",
+        roundStatus: {
+          active: vsRoundActive,
+          roundId: vsRoundId,
+          localGameId: vsLocalGameId,
+          seed: vsRoundSeed
+        },
+        now: loopNow,
+        log: (entry) => console.log(entry)
+      });
       if (!isSoloModeActive(browserControlState)) {
         const perfUpdate = maybeLogBrowserPerf({
           browserPerfEnabled,
@@ -13790,7 +15540,6 @@ function writeSnapshot(snapshotPath, payload) {
   mkdirSync(directory, { recursive: true });
   const temporaryPath = `${snapshotPath}.tmp`;
   writeFileSync(temporaryPath, JSON.stringify(payload, null, 2));
-  rmSync(snapshotPath, { force: true });
   renameSync(temporaryPath, snapshotPath);
 }
 

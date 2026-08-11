@@ -2,6 +2,7 @@ import { appendFileSync, mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import {
   DEFAULT_BRIDGE_PATH,
+  createVsBridgeAccumulatorState,
   createVsBridgeState,
   ingestVsBridgeSessionSelfIdentity,
   ingestVsBridgeOptionsCandidate,
@@ -9,6 +10,7 @@ import {
   isZenithBagtype,
   isVsWsSimEnabled,
   markVsBridgeInactive,
+  promoteVsBridgeAccumulator,
   resetVsBridgeZenithAccumulator,
   setVsBridgeConfiguredLocalUsername,
 } from "./vs-ws-bridge.mjs";
@@ -320,13 +322,15 @@ export async function installDddWsObserver(
         for (const chunk of split87Frame(payload)) {
           observerState.decodeAttempts += decodeAttemptCount(chunk);
         }
-        recordSelectedModePrebuffer(observerState, {
+        const prebufferEntry = {
           requestId: event?.requestId ?? null,
           urlHost,
           capturedAt: timestamp,
           candidates,
           decodedRoots
-        });
+        };
+        recordSelectedModePrebuffer(observerState, prebufferEntry);
+        updateFriendlyVsBootstrap(observerState, prebufferEntry, logger);
         emitDiagnosticEnvelope(
           onDiagnosticEnvelope,
           buildDiagnosticWsEnvelopeRecord({
@@ -387,13 +391,15 @@ export async function installDddWsObserver(
         const candidates = collectOptionCandidates(decodedRoots);
         const timestamp = Date.now();
         const urlHost = resolveTraceUrlHost(event?.requestId, observerState);
-        recordSelectedModePrebuffer(observerState, {
+        const prebufferEntry = {
           requestId: event?.requestId ?? null,
           urlHost,
           capturedAt: timestamp,
           candidates,
           decodedRoots
-        });
+        };
+        recordSelectedModePrebuffer(observerState, prebufferEntry);
+        updateFriendlyVsBootstrap(observerState, prebufferEntry, logger);
         emitDiagnosticEnvelope(
           onDiagnosticEnvelope,
           buildDiagnosticWsEnvelopeRecord({
@@ -535,6 +541,7 @@ function createModeControllerState() {
     localTetrioUsername: null,
     zenithPrebuffer: [],
     friendlyVsPrebuffer: [],
+    friendlyVsBootstrap: null,
     lastPassiveMode: "",
     lastLoggedActivationKey: ""
   };
@@ -611,6 +618,180 @@ function recordSelectedModePrebuffer(observerState, entry) {
   return pruneModePrebuffer(buffer, Date.now());
 }
 
+function clearFriendlyVsBootstrap(observerState) {
+  if (observerState?.modeController) {
+    observerState.modeController.friendlyVsBootstrap = null;
+  }
+}
+
+function ensureFriendlyVsBootstrap(observerState) {
+  const modeController = observerState?.modeController;
+  if (!modeController) {
+    return null;
+  }
+  if (!modeController.friendlyVsBootstrap) {
+    modeController.friendlyVsBootstrap = {
+      roundKey: "",
+      lastLoggedRoundId: "",
+      accumulator: createVsBridgeAccumulatorState({
+        configuredLocalUsername: modeController.localTetrioUsername
+      })
+    };
+  }
+  setVsBridgeConfiguredLocalUsername(
+    modeController.friendlyVsBootstrap.accumulator,
+    modeController.localTetrioUsername
+  );
+  return modeController.friendlyVsBootstrap;
+}
+
+function stringifyBootstrapScalar(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const normalized = String(value).trim();
+  return normalized ? normalized : null;
+}
+
+function collectFriendlyRoundIdentityTuples(decodedRoots, candidates) {
+  const tuples = [];
+  const seen = new Set();
+  const pushTuple = (identity, gameid, seed) => {
+    const normalizedGameid = stringifyBootstrapScalar(gameid);
+    const normalizedSeed = stringifyBootstrapScalar(seed);
+    if (!normalizedGameid || !normalizedSeed) {
+      return;
+    }
+    const normalizedIdentity =
+      stringifyBootstrapScalar(identity) ?? `gameid:${normalizedGameid}`;
+    const key = `${normalizedIdentity}|${normalizedGameid}|${normalizedSeed}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    tuples.push({
+      identity: normalizedIdentity,
+      gameid: normalizedGameid,
+      seed: normalizedSeed
+    });
+  };
+
+  for (const root of decodedRoots ?? []) {
+    const players = Array.isArray(root?.players) ? root.players : [];
+    for (const player of players) {
+      pushTuple(
+        player?.userid ?? player?._id ?? player?.username ?? player?.name,
+        player?.gameid ?? player?.options?.gameid,
+        player?.options?.seed
+      );
+    }
+  }
+
+  for (const candidate of candidates ?? []) {
+    pushTuple(
+      candidate?.context?.userid ??
+        candidate?.context?.user_id ??
+        candidate?.context?._id ??
+        candidate?.context?.username ??
+        candidate?.context?.name,
+      candidate?.options?.gameid,
+      candidate?.options?.seed
+    );
+  }
+
+  return tuples;
+}
+
+function deriveFriendlyVsRoundKey(decodedRoots, candidates) {
+  const tuples = collectFriendlyRoundIdentityTuples(decodedRoots, candidates);
+  const bySeed = new Map();
+  for (const tuple of tuples) {
+    const group = bySeed.get(tuple.seed) ?? [];
+    group.push(tuple);
+    bySeed.set(tuple.seed, group);
+  }
+  let bestGroup = null;
+  for (const group of bySeed.values()) {
+    const distinctGameIds = new Set(group.map((entry) => entry.gameid));
+    if (distinctGameIds.size < 2) {
+      continue;
+    }
+    if (!bestGroup || group.length > bestGroup.length) {
+      bestGroup = group;
+    }
+  }
+  if (!bestGroup) {
+    return "";
+  }
+  return bestGroup
+    .map((entry) => `${entry.identity}:${entry.gameid}:${entry.seed}`)
+    .sort()
+    .join("|");
+}
+
+function updateFriendlyVsBootstrap(observerState, entry, log) {
+  if (
+    normalizeModeValue(observerState?.modeController?.selectedMode) !==
+    MODE_FRIENDLY_VS
+  ) {
+    return null;
+  }
+  let bootstrap = ensureFriendlyVsBootstrap(observerState);
+  if (!bootstrap) {
+    return null;
+  }
+  const roundKey = deriveFriendlyVsRoundKey(
+    entry?.decodedRoots ?? [],
+    entry?.candidates ?? []
+  );
+  if (roundKey && bootstrap.roundKey && roundKey !== bootstrap.roundKey) {
+    clearFriendlyVsBootstrap(observerState);
+    bootstrap = ensureFriendlyVsBootstrap(observerState);
+  }
+  if (roundKey) {
+    bootstrap.roundKey = roundKey;
+  }
+
+  const requestId = entry?.requestId ?? null;
+  const capturedAt = Math.max(0, Number(entry?.capturedAt ?? Date.now()));
+  const urlHost = String(entry?.urlHost ?? "");
+  for (const candidate of entry?.candidates ?? []) {
+    try {
+      ingestVsBridgeOptionsCandidate(
+        bootstrap.accumulator,
+        {
+          ...candidate,
+          requestId,
+          capturedAt
+        },
+        null
+      );
+    } catch {}
+  }
+  for (const decodedRoot of entry?.decodedRoots ?? []) {
+    try {
+      ingestVsBridgeRoot(
+        bootstrap.accumulator,
+        decodedRoot,
+        { requestId, capturedAt, urlHost, timestamp: capturedAt },
+        null
+      );
+    } catch {}
+  }
+
+  if (!bootstrap.roundKey) {
+    bootstrap.roundKey =
+      String(bootstrap.accumulator?.current?.roundId ?? "") ||
+      String(bootstrap.accumulator?.roundObservationKey ?? "");
+  }
+  const roundId = String(bootstrap.accumulator?.current?.roundId ?? "");
+  if (roundId && bootstrap.lastLoggedRoundId !== roundId) {
+    bootstrap.lastLoggedRoundId = roundId;
+    safeLog(log, `[friendly_vs] bootstrap retained roundId=${roundId}`);
+  }
+  return bootstrap;
+}
+
 function clearVsRuntimeState(observerState, log, onVsRoundStatus) {
   cancelSessionSelfProbeLoop(observerState);
   observerState.sessionSelfProbe.shutdown = false;
@@ -679,6 +860,30 @@ function replayModePrebuffer(observerState, logger, onVsRoundStatus) {
   );
 }
 
+function replayFriendlyVsBootstrap(observerState, logger, onVsRoundStatus) {
+  const bootstrap = observerState?.modeController?.friendlyVsBootstrap;
+  if (!bootstrap?.accumulator) {
+    return null;
+  }
+  const current = promoteVsBridgeAccumulator(
+    observerState?.vsBridge,
+    bootstrap.accumulator,
+    Date.now(),
+    logger
+  );
+  if (!current) {
+    return null;
+  }
+  emitVsRoundStatusIfChanged(observerState, onVsRoundStatus);
+  const playerCount =
+    1 + (Array.isArray(current?.opponents) ? current.opponents.length : 0);
+  safeLog(
+    logger,
+    `[friendly_vs] bootstrap replayed roundId=${current.roundId} players=${playerCount}`
+  );
+  return current;
+}
+
 function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) {
   const modeController = observerState?.modeController;
   if (!modeController) {
@@ -706,6 +911,12 @@ function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) 
     observerState?.vsBridge,
     nextLocalTetrioUsername
   );
+  if (modeController.friendlyVsBootstrap?.accumulator) {
+    setVsBridgeConfiguredLocalUsername(
+      modeController.friendlyVsBootstrap.accumulator,
+      nextLocalTetrioUsername
+    );
+  }
   if (modeController.lastPassiveMode !== nextMode) {
     modeController.lastPassiveMode = nextMode;
     safeLog(log, `[mode] passive websocket listener active mode=${nextMode}`);
@@ -718,6 +929,9 @@ function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) 
   modeController.modeGeneration = nextGeneration;
   if (!modeChanged && !activationChanged && localUsernameChanged) {
     return true;
+  }
+  if (modeChanged || previousGeneration !== nextGeneration) {
+    clearFriendlyVsBootstrap(observerState);
   }
   if (modeChanged) {
     modeController.lastLoggedActivationKey = "";
@@ -748,6 +962,9 @@ function setModeControlState(observerState, control, cdp, log, onVsRoundStatus) 
     resetSessionSelfProbeActivation(observerState, log, "bot_on");
   }
   replayModePrebuffer(observerState, log, onVsRoundStatus);
+  if (nextMode === MODE_FRIENDLY_VS) {
+    replayFriendlyVsBootstrap(observerState, log, onVsRoundStatus);
+  }
   if (nextMode === MODE_ZENITH) {
     notifySessionSelfProbeTrigger(observerState, cdp, log, onVsRoundStatus, {
       reason: "zenith_bot_on"

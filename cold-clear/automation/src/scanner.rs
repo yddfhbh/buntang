@@ -69,6 +69,33 @@ pub struct ZenithPassiveSnapshotEnvelope {
     pub snapshot: Option<ZenithPassivePlannerSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+pub struct FriendlyVsPassivePlannerSnapshot {
+    pub snapshot: GameSnapshot,
+    pub round_id: String,
+    pub userid: Option<String>,
+    pub gameid: String,
+    pub candidate_id: String,
+    pub capture_generation: u64,
+    pub timestamp_ms: u64,
+    pub current_signature: String,
+    pub playing: bool,
+    pub started: bool,
+    pub countdown_started: bool,
+    pub paused: Option<bool>,
+    pub destroyed: bool,
+    pub successful: bool,
+    pub gameoverreason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FriendlyVsPassiveSnapshotEnvelope {
+    pub status: String,
+    pub capture_status: Option<String>,
+    pub semantic_error: Option<String>,
+    pub snapshot: Option<FriendlyVsPassivePlannerSnapshot>,
+}
+
 impl GameSnapshot {
     pub fn field_array(&self) -> Result<[[bool; 10]; 40]> {
         self.field
@@ -292,13 +319,29 @@ struct ZenithPassiveEnvelopeWire {
     snapshot: Option<ZenithPassiveSnapshotWire>,
 }
 
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default)]
+struct FriendlyVsPassiveEnvelopeWire {
+    status: String,
+    capture_status: Option<String>,
+    snapshot: Option<FriendlyVsPassiveSnapshotWire>,
+}
+
+#[derive(Clone, Debug, Deserialize, Default)]
+#[serde(default)]
+struct FriendlyVsPassiveSnapshotWire {
+    round_id: String,
+    #[serde(flatten)]
+    snapshot: ZenithPassiveSnapshotWire,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 struct ZenithPassiveSnapshotWire {
     source: String,
     capture_generation: u64,
     timestamp: u64,
-    userid: String,
+    userid: Option<String>,
     gameid: Value,
     candidate_id: String,
     playing: bool,
@@ -395,6 +438,55 @@ pub fn read_zenith_passive_snapshot_file_with_age(
     };
     Ok(Some((
         ZenithPassiveSnapshotEnvelope {
+            status: envelope_wire.status,
+            capture_status: envelope_wire.capture_status,
+            semantic_error: None,
+            snapshot,
+        },
+        snapshot_age,
+    )))
+}
+
+pub fn read_friendly_vs_passive_snapshot_file_with_age(
+    path: &Path,
+) -> Result<Option<(FriendlyVsPassiveSnapshotEnvelope, Option<Duration>)>> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if is_retryable_snapshot_io_error(&err) => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to read Friendly VS passive snapshot JSON from {}",
+                    path.display()
+                )
+            })
+        }
+    };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let snapshot_age = read_snapshot_age(path)?;
+    let envelope_wire: FriendlyVsPassiveEnvelopeWire = serde_json::from_str(&raw)
+        .context("failed to parse Friendly VS passive snapshot JSON")?;
+    let snapshot = match envelope_wire.snapshot {
+        Some(snapshot_wire) => match snapshot_wire.into_planner_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                return Ok(Some((
+                    FriendlyVsPassiveSnapshotEnvelope {
+                        status: envelope_wire.status,
+                        capture_status: envelope_wire.capture_status,
+                        semantic_error: Some(err.to_string()),
+                        snapshot: None,
+                    },
+                    snapshot_age,
+                )))
+            }
+        },
+        None => None,
+    };
+    Ok(Some((
+        FriendlyVsPassiveSnapshotEnvelope {
             status: envelope_wire.status,
             capture_status: envelope_wire.capture_status,
             semantic_error: None,
@@ -626,7 +718,7 @@ impl Default for ZenithPassiveSnapshotWire {
             source: default_zenith_passive_source(),
             capture_generation: 0,
             timestamp: 0,
-            userid: String::new(),
+            userid: None,
             gameid: Value::Null,
             candidate_id: String::new(),
             playing: false,
@@ -645,10 +737,33 @@ impl Default for ZenithPassiveSnapshotWire {
     }
 }
 
+struct ParsedPassiveSnapshotCore {
+    source: String,
+    token: String,
+    userid: Option<String>,
+    gameid: String,
+    candidate_id: String,
+    capture_generation: u64,
+    timestamp_ms: u64,
+    current_signature: String,
+    playing: bool,
+    started: bool,
+    countdown_started: bool,
+    paused: Option<bool>,
+    destroyed: bool,
+    successful: bool,
+    gameoverreason: Option<String>,
+    field: Vec<[bool; 10]>,
+    queue: Vec<PieceToken>,
+    hold: Option<PieceToken>,
+    active: ActivePieceState,
+    piece_counter: Option<u32>,
+}
+
 impl ZenithPassiveSnapshotWire {
-    fn into_planner_snapshot(self) -> Result<ZenithPassivePlannerSnapshot> {
-        let userid = self.userid.trim().to_owned();
-        if userid.is_empty() {
+    fn into_core(self, require_userid: bool) -> Result<ParsedPassiveSnapshotCore> {
+        let userid = normalize_optional_passive_string(self.userid);
+        if require_userid && userid.is_none() {
             anyhow::bail!("missing userid");
         }
         let gameid = normalized_zenith_gameid(&self.gameid).context("missing gameid")?;
@@ -684,31 +799,13 @@ impl ZenithPassiveSnapshotWire {
         let mut planner_queue = Vec::with_capacity(queue.len() + 1);
         planner_queue.push(current_piece);
         planner_queue.extend(queue.iter().copied());
-        Ok(ZenithPassivePlannerSnapshot {
-            snapshot: GameSnapshot {
-                source: if self.source.trim().is_empty() {
-                    default_zenith_passive_source()
-                } else {
-                    self.source
-                },
-                token,
-                round_id: Some(gameid.clone()),
-                field,
-                queue: planner_queue,
-                hold,
-                combo: 0,
-                b2b: false,
-                incoming: 0,
-                piece_counter: self.piece_counter,
-                lines_cleared: None,
-                playing: self.playing,
-                countdown: self.countdown_started,
-                active: Some(ActivePieceState {
-                    x: current_x,
-                    y: current_y,
-                    rotation: current_rotation,
-                }),
+        Ok(ParsedPassiveSnapshotCore {
+            source: if self.source.trim().is_empty() {
+                default_zenith_passive_source()
+            } else {
+                self.source
             },
+            token,
             userid,
             gameid,
             candidate_id,
@@ -721,16 +818,112 @@ impl ZenithPassiveSnapshotWire {
             paused: self.paused,
             destroyed: self.destroyed,
             successful: self.successful,
-            gameoverreason: self.gameoverreason.and_then(|reason| {
-                let trimmed = reason.trim().to_owned();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            }),
+            gameoverreason: normalize_optional_passive_string(self.gameoverreason),
+            field,
+            queue: planner_queue,
+            hold,
+            active: ActivePieceState {
+                x: current_x,
+                y: current_y,
+                rotation: current_rotation,
+            },
+            piece_counter: self.piece_counter,
         })
     }
+
+    fn into_planner_snapshot(self) -> Result<ZenithPassivePlannerSnapshot> {
+        let core = self.into_core(true)?;
+        let userid = core
+            .userid
+            .clone()
+            .context("missing userid after passive snapshot normalization")?;
+        Ok(ZenithPassivePlannerSnapshot {
+            snapshot: GameSnapshot {
+                source: core.source,
+                token: core.token,
+                round_id: Some(core.gameid.clone()),
+                field: core.field,
+                queue: core.queue,
+                hold: core.hold,
+                combo: 0,
+                b2b: false,
+                incoming: 0,
+                piece_counter: core.piece_counter,
+                lines_cleared: None,
+                playing: core.playing,
+                countdown: core.countdown_started,
+                active: Some(core.active),
+            },
+            userid,
+            gameid: core.gameid,
+            candidate_id: core.candidate_id,
+            capture_generation: core.capture_generation,
+            timestamp_ms: core.timestamp_ms,
+            current_signature: core.current_signature,
+            playing: core.playing,
+            started: core.started,
+            countdown_started: core.countdown_started,
+            paused: core.paused,
+            destroyed: core.destroyed,
+            successful: core.successful,
+            gameoverreason: core.gameoverreason,
+        })
+    }
+}
+
+impl FriendlyVsPassiveSnapshotWire {
+    fn into_planner_snapshot(self) -> Result<FriendlyVsPassivePlannerSnapshot> {
+        let round_id = self.round_id.trim().to_owned();
+        if round_id.is_empty() {
+            anyhow::bail!("missing round_id");
+        }
+        let core = self.snapshot.into_core(false)?;
+        let mut game_snapshot = GameSnapshot {
+            source: core.source,
+            token: core.token,
+            round_id: Some(round_id.clone()),
+            field: core.field,
+            queue: core.queue,
+            hold: core.hold,
+            combo: 0,
+            b2b: false,
+            incoming: 0,
+            piece_counter: core.piece_counter,
+            lines_cleared: None,
+            playing: core.playing,
+            countdown: core.countdown_started,
+            active: Some(core.active),
+        };
+        game_snapshot.round_id = Some(round_id.clone());
+        Ok(FriendlyVsPassivePlannerSnapshot {
+            snapshot: game_snapshot,
+            round_id,
+            userid: core.userid,
+            gameid: core.gameid,
+            candidate_id: core.candidate_id,
+            capture_generation: core.capture_generation,
+            timestamp_ms: core.timestamp_ms,
+            current_signature: core.current_signature,
+            playing: core.playing,
+            started: core.started,
+            countdown_started: core.countdown_started,
+            paused: core.paused,
+            destroyed: core.destroyed,
+            successful: core.successful,
+            gameoverreason: core.gameoverreason,
+        })
+    }
+}
+
+fn normalize_optional_passive_string(value: Option<String>) -> Option<String> {
+    value.and_then(|raw| {
+        let trimmed = raw.trim().to_owned();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
 }
 
 fn parse_zenith_piece_token(value: &str) -> Option<PieceToken> {
@@ -1125,6 +1318,54 @@ mod tests {
 
     fn zenith_empty_board() -> Vec<Vec<serde_json::Value>> {
         vec![vec![serde_json::Value::Bool(false); 10]; 40]
+    }
+
+    fn friendly_ready_snapshot_value(
+        userid: serde_json::Value,
+        round_id: serde_json::Value,
+    ) -> serde_json::Value {
+        json!({
+            "status": "ready",
+            "capture_status": "running",
+            "snapshot": {
+                "source": "friendly_vs_passive",
+                "round_id": round_id,
+                "capture_generation": 7,
+                "timestamp": 1722422401123u64,
+                "userid": userid,
+                "gameid": "4990",
+                "candidate_id": "cand-local",
+                "playing": true,
+                "started": true,
+                "countdown_started": false,
+                "paused": false,
+                "destroyed": false,
+                "successful": false,
+                "gameoverreason": null,
+                "board": zenith_empty_board(),
+                "current": {
+                    "type": "J",
+                    "x": 4,
+                    "y": 19,
+                    "rotation": "north"
+                },
+                "hold": null,
+                "queue": ["O", "T", "L", "S", "Z"],
+                "piece_counter": 27
+            },
+            "last_read_error": {
+                "reason": "bot_off",
+                "field_diagnostics": {
+                    "root": {
+                        "requested_path": [],
+                        "resolved_segments": [],
+                        "failed_segment": null,
+                        "raw_length": null,
+                        "failure_reason": null
+                    }
+                }
+            }
+        })
     }
 
     #[test]
@@ -1573,6 +1814,78 @@ mod tests {
             envelope.semantic_error.as_deref(),
             Some("invalid queue piece at index 1: \"garbage\"")
         );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_friendly_vs_passive_snapshot_allows_null_userid_in_ready_snapshot() {
+        let path = temp_snapshot_path("friendly-passive-null-userid");
+        write_json(&path, &friendly_ready_snapshot_value(json!(null), json!("4990:1744077373")));
+
+        let (envelope, snapshot_age) = read_friendly_vs_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .expect("parsed Friendly VS passive snapshot");
+        let snapshot = envelope.snapshot.expect("planner snapshot");
+
+        assert_eq!(envelope.status, "ready");
+        assert_eq!(envelope.capture_status.as_deref(), Some("running"));
+        assert!(snapshot_age.is_some());
+        assert_eq!(snapshot.round_id, "4990:1744077373");
+        assert_eq!(snapshot.userid, None);
+        assert_eq!(snapshot.gameid, "4990");
+        assert_eq!(snapshot.snapshot.source, "friendly_vs_passive");
+        assert_eq!(snapshot.snapshot.round_id.as_deref(), Some("4990:1744077373"));
+        assert_eq!(
+            snapshot.snapshot.queue,
+            vec![
+                PieceToken::J,
+                PieceToken::O,
+                PieceToken::T,
+                PieceToken::L,
+                PieceToken::S,
+                PieceToken::Z
+            ]
+        );
+        assert_eq!(snapshot.snapshot.hold, None);
+        assert_eq!(snapshot.snapshot.piece_counter, Some(27));
+        assert_eq!(
+            snapshot.snapshot.active,
+            Some(ActivePieceState {
+                x: 4,
+                y: 19,
+                rotation: RotationToken::North,
+            })
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_friendly_vs_passive_snapshot_allows_string_userid_in_ready_snapshot() {
+        let path = temp_snapshot_path("friendly-passive-string-userid");
+        write_json(
+            &path,
+            &friendly_ready_snapshot_value(json!("friendly-user"), json!("4990:1744077373")),
+        );
+
+        let (envelope, _) = read_friendly_vs_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .expect("parsed Friendly VS passive snapshot");
+        let snapshot = envelope.snapshot.expect("planner snapshot");
+
+        assert_eq!(snapshot.userid.as_deref(), Some("friendly-user"));
+        assert_eq!(snapshot.gameid, "4990");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reads_friendly_vs_passive_snapshot_rejects_null_round_id() {
+        let path = temp_snapshot_path("friendly-passive-null-round-id");
+        write_json(&path, &friendly_ready_snapshot_value(json!(null), json!(null)));
+
+        assert!(read_friendly_vs_passive_snapshot_file_with_age(&path).is_err());
 
         let _ = fs::remove_file(path);
     }

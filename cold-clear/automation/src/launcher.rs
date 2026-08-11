@@ -27,10 +27,13 @@ use crate::runner::{
 };
 use crate::runtime::run_automation_with_resources_and_live_pps;
 use crate::scanner::{
-    read_snapshot_file, read_zenith_passive_snapshot_file_with_age, JsonFileScanner,
-    ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
+    read_friendly_vs_passive_snapshot_file_with_age, read_snapshot_file,
+    read_zenith_passive_snapshot_file_with_age, FriendlyVsPassivePlannerSnapshot,
+    JsonFileScanner, ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
 };
 use crate::vs_sim::{read_vs_bridge_observation, vs_bridge_path_for_snapshot};
+
+const FRIENDLY_VS_DRY_RUN_SKIP_LOG_COOLDOWN: Duration = Duration::from_secs(2);
 
 const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Play Style",
@@ -68,6 +71,8 @@ const BOT_UI_HIDDEN_LABELS: &[&str] = &[
     "Planner",
 ];
 const ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH: &str = "automation/quick-play-passive-snapshot.json";
+const FRIENDLY_VS_PASSIVE_SNAPSHOT_RELATIVE_PATH: &str =
+    "automation/friendly-vs-passive-snapshot.json";
 const ZENITH_LIVE_LOCK_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -754,6 +759,8 @@ struct FriendlyVsObserver {
     last_options_signature: Option<String>,
     last_active_signature: Option<String>,
     active_round_id: Option<String>,
+    resolved_userid: Option<String>,
+    resolved_game_id: Option<String>,
 }
 
 impl FriendlyVsObserver {
@@ -868,6 +875,8 @@ impl FriendlyVsObserver {
         self.last_options_signature = None;
         self.last_active_signature = None;
         self.active_round_id = None;
+        self.resolved_userid = None;
+        self.resolved_game_id = None;
     }
 
     fn observation_signature(observation: &crate::vs_sim::VsBridgeObservation) -> String {
@@ -895,6 +904,8 @@ impl FriendlyVsObserver {
             return None;
         }
         self.last_identity_signature = Some(signature);
+        self.resolved_userid = Some(userid.to_owned());
+        self.resolved_game_id = Some(gameid.to_owned());
         self.last_waiting_reason = None;
         Some(format!(
             "[friendly-vs] identity ready userid={userid} gameid={gameid} round_id={round_id}"
@@ -941,6 +952,91 @@ impl FriendlyVsObserver {
         self.active_round_id = None;
         self.last_active_signature = None;
         Some(format!("[friendly-vs] round ended round_id={round_id}"))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FriendlyVsDryRunController {
+    last_round_id: Option<String>,
+    last_game_id: Option<String>,
+    last_capture_generation: Option<u64>,
+    last_candidate_id: Option<String>,
+    last_attempted_file_signature: Option<String>,
+    last_processed_snapshot_token: Option<String>,
+    last_piece_counter: Option<u32>,
+    last_current_signature: Option<String>,
+    active: bool,
+    last_skip_key: Option<String>,
+    last_skip_logged_at: Option<Instant>,
+}
+
+impl FriendlyVsDryRunController {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn reset_processed_state(&mut self) {
+        self.last_round_id = None;
+        self.last_game_id = None;
+        self.last_capture_generation = None;
+        self.last_candidate_id = None;
+        self.last_attempted_file_signature = None;
+        self.last_processed_snapshot_token = None;
+        self.last_piece_counter = None;
+        self.last_current_signature = None;
+        self.active = false;
+    }
+
+    fn clear_skip_reason(&mut self) {
+        self.last_skip_key = None;
+        self.last_skip_logged_at = None;
+    }
+
+    fn record_attempted(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        file_signature: &str,
+    ) {
+        self.last_round_id = Some(snapshot.round_id.clone());
+        self.last_game_id = Some(snapshot.gameid.clone());
+        self.last_capture_generation = Some(snapshot.capture_generation);
+        self.last_candidate_id = Some(snapshot.candidate_id.clone());
+        self.last_attempted_file_signature = Some(file_signature.to_owned());
+        self.last_piece_counter = snapshot.snapshot.piece_counter;
+        self.last_current_signature = Some(snapshot.current_signature.clone());
+        self.active = true;
+        self.clear_skip_reason();
+    }
+
+    fn record_processed(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        file_signature: &str,
+    ) {
+        self.record_attempted(snapshot, file_signature);
+        self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
+    }
+
+    fn is_duplicate_attempt(&self, file_signature: &str) -> bool {
+        self.last_attempted_file_signature.as_deref() == Some(file_signature)
+    }
+
+    fn is_duplicate_processed_piece(&self, snapshot: &FriendlyVsPassivePlannerSnapshot) -> bool {
+        self.last_processed_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
+    }
+
+    fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
+        let now = Instant::now();
+        if self.last_skip_key.as_deref() == Some(key) {
+            if let Some(last_logged_at) = self.last_skip_logged_at {
+                if now.duration_since(last_logged_at) < FRIENDLY_VS_DRY_RUN_SKIP_LOG_COOLDOWN {
+                    return None;
+                }
+            }
+        }
+        self.last_skip_key = Some(key.to_owned());
+        self.last_skip_logged_at = Some(now);
+        Some(line)
     }
 }
 
@@ -1054,6 +1150,15 @@ fn zenith_semantic_skip_key(error: &str) -> String {
         return "semantic_invalid:current.y:out_of_range".to_owned();
     }
     format!("semantic_invalid:{error}")
+}
+
+fn friendly_vs_snapshot_parse_skip_key(error: &str) -> String {
+    let normalized = error
+        .split_once(" at line ")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(error)
+        .trim();
+    format!("semantic_invalid:{normalized}")
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1381,7 +1486,9 @@ pub struct LauncherApp {
     bot_desired_enabled: bool,
     bot_waiting_for_next_game: bool,
     bot_restart_pending: bool,
+    friendly_vs_capture_enabled: bool,
     friendly_vs: FriendlyVsObserver,
+    friendly_vs_dry_run: FriendlyVsDryRunController,
     passive_provider: PassiveProviderController,
     zenith_dry_run: ZenithDryRunController,
     zenith_live: ZenithLiveController,
@@ -1416,7 +1523,9 @@ impl LauncherApp {
             bot_desired_enabled: false,
             bot_waiting_for_next_game: false,
             bot_restart_pending: false,
+            friendly_vs_capture_enabled: false,
             friendly_vs: FriendlyVsObserver::default(),
+            friendly_vs_dry_run: FriendlyVsDryRunController::default(),
             passive_provider: PassiveProviderController::default(),
             zenith_dry_run: ZenithDryRunController::default(),
             zenith_live: ZenithLiveController::default(),
@@ -2023,6 +2132,10 @@ impl LauncherApp {
                 self.push_log("[launcher] bot on");
             }
             self.sync_browser_local_tetrio_username();
+            if self.state.selected_mode == RuntimeMode::FriendlyVs {
+                self.sync_friendly_vs_capture_enabled(false);
+                self.prepare_friendly_vs_observer_arm();
+            }
             if self.state.selected_mode == RuntimeMode::Zenith {
                 self.sync_requested_passive_provider_username_hint();
             }
@@ -2047,6 +2160,12 @@ impl LauncherApp {
                 if self.state.selected_mode == RuntimeMode::Zenith {
                     let _ =
                         self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false);
+                }
+                if self.state.selected_mode == RuntimeMode::FriendlyVs {
+                    self.sync_friendly_vs_capture_enabled(false);
+                    if let Some(line) = self.friendly_vs.note_stopped() {
+                        self.push_log(line);
+                    }
                 }
                 self.bot_status = BotStatus::Error;
                 if mode == BotStartMode::UserInitiated {
@@ -2205,6 +2324,8 @@ impl LauncherApp {
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
         self.cancel_zenith_live_execution("bot_off");
+        self.sync_friendly_vs_capture_enabled(false);
+        self.friendly_vs_dry_run.reset();
         self.zenith_dry_run.reset();
         self.zenith_live.reset();
         let had_runner = self.bot_session.is_some();
@@ -2242,9 +2363,11 @@ impl LauncherApp {
         }
         self.state.selected_mode = next_mode;
         self.state.mode_generation = self.state.mode_generation.saturating_add(1);
+        self.sync_friendly_vs_capture_enabled(false);
         if next_mode != RuntimeMode::Zenith {
             self.clear_passive_provider_owners();
         }
+        self.friendly_vs_dry_run.reset();
         self.zenith_dry_run.reset();
         self.zenith_live.reset();
         self.push_log(format!(
@@ -2286,9 +2409,11 @@ impl LauncherApp {
         self.browser_status = BrowserStatus::Closed;
         self.snapshot_status = SnapshotStatus::Closed;
         self.input_status = InputStatus::Closed;
+        self.friendly_vs_capture_enabled = false;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
         self.passive_provider.reset();
+        self.friendly_vs_dry_run.reset();
         self.zenith_dry_run.reset();
         self.zenith_live.reset();
     }
@@ -2437,12 +2562,14 @@ impl LauncherApp {
         self.browser_status = BrowserStatus::Closed;
         self.snapshot_status = SnapshotStatus::Closed;
         self.input_status = InputStatus::Closed;
+        self.friendly_vs_capture_enabled = false;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
         self.bot_desired_enabled = false;
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
         self.passive_provider.reset();
+        self.friendly_vs_dry_run.reset();
         self.zenith_dry_run.reset();
         self.push_log("[launcher] browser closed");
     }
@@ -2549,6 +2676,11 @@ impl LauncherApp {
             .resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
     }
 
+    fn friendly_vs_passive_snapshot_path(&self) -> std::path::PathBuf {
+        self.paths
+            .resolve_workspace_path(FRIENDLY_VS_PASSIVE_SNAPSHOT_RELATIVE_PATH)
+    }
+
     fn friendly_vs_bridge_path(&self) -> std::path::PathBuf {
         let snapshot_path = self.paths.resolve_workspace_path(&self.state.snapshot_path);
         vs_bridge_path_for_snapshot(&snapshot_path)
@@ -2588,14 +2720,55 @@ impl LauncherApp {
         }
     }
 
+    fn sync_friendly_vs_capture_enabled(&mut self, enabled: bool) -> bool {
+        if self.friendly_vs_capture_enabled == enabled {
+            return true;
+        }
+        let result = if let Some(session) = self.browser_session.as_mut() {
+            session.snapshot_provider.set_friendly_vs_capture_enabled(enabled)
+        } else {
+            Ok(())
+        };
+        match result {
+            Ok(()) => {
+                self.friendly_vs_capture_enabled = enabled;
+                true
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[browser] failed to forward friendly_vs_capture_enabled to snapshot provider: {err:#}"
+                ));
+                false
+            }
+        }
+    }
+
+    fn prepare_friendly_vs_observer_arm(&mut self) {
+        if self.state.selected_mode != RuntimeMode::FriendlyVs || !self.bot_desired_enabled {
+            return;
+        }
+        self.friendly_vs.reset();
+        let baseline = read_vs_bridge_observation(&self.friendly_vs_bridge_path())
+            .ok()
+            .flatten();
+        if let Some(line) = self
+            .friendly_vs
+            .note_armed(self.current_wall_clock_ms(), baseline.as_ref())
+        {
+            self.push_log(line);
+        }
+    }
+
     fn poll_friendly_vs_observer(&mut self) {
         if self.state.selected_mode != RuntimeMode::FriendlyVs || !self.bot_desired_enabled {
+            self.sync_friendly_vs_capture_enabled(false);
             if let Some(line) = self.friendly_vs.note_stopped() {
                 self.push_log(line);
             }
             return;
         }
         if self.bot_status != BotStatus::On || !self.friendly_vs_runtime_ready() {
+            self.sync_friendly_vs_capture_enabled(false);
             if let Some(line) = self.friendly_vs.note_stopped() {
                 self.push_log(line);
             }
@@ -2611,6 +2784,7 @@ impl LauncherApp {
                 {
                     self.push_log(line);
                 }
+                self.sync_friendly_vs_capture_enabled(false);
                 if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
                     self.push_log(line);
                 }
@@ -2623,6 +2797,7 @@ impl LauncherApp {
                 {
                     self.push_log(line);
                 }
+                self.sync_friendly_vs_capture_enabled(false);
                 let error = format!("{err:#}");
                 if let Some(line) = self.friendly_vs.note_bridge_error(&error) {
                     self.push_log(line);
@@ -2637,6 +2812,7 @@ impl LauncherApp {
             self.push_log(line);
         }
         if !self.friendly_vs.is_fresh_bridge(&observation) {
+            self.sync_friendly_vs_capture_enabled(false);
             if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
                 self.push_log(line);
             }
@@ -2651,6 +2827,7 @@ impl LauncherApp {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
+            self.sync_friendly_vs_capture_enabled(false);
             self.friendly_vs.clear_ready_state();
             return;
         };
@@ -2679,8 +2856,289 @@ impl LauncherApp {
             ) {
                 self.push_log(line);
             }
+            self.sync_friendly_vs_capture_enabled(true);
         } else if let Some(line) = self.friendly_vs.note_round_ended(&observation.round_id) {
             self.push_log(line);
+            self.sync_friendly_vs_capture_enabled(false);
+        } else {
+            self.sync_friendly_vs_capture_enabled(false);
+        }
+    }
+
+    fn poll_friendly_vs_dry_run(&mut self) {
+        if self.state.selected_mode != RuntimeMode::FriendlyVs {
+            self.friendly_vs_dry_run.reset();
+            return;
+        }
+        if !self.bot_desired_enabled || self.bot_status != BotStatus::On || !self.friendly_vs_runtime_ready() {
+            self.friendly_vs_dry_run.reset();
+            return;
+        }
+        let Some(active_round_id) = self.friendly_vs.active_round_id.as_deref() else {
+            self.friendly_vs_dry_run.reset();
+            return;
+        };
+        let Some(active_game_id) = self.friendly_vs.resolved_game_id.as_deref() else {
+            self.friendly_vs_dry_run.reset();
+            return;
+        };
+
+        let path = self.friendly_vs_passive_snapshot_path();
+        let file_signature = self.zenith_passive_snapshot_file_signature(&path);
+        let read_result = match read_friendly_vs_passive_snapshot_file_with_age(&path) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                    &format!("snapshot_missing:{file_signature}"),
+                    "[friendly-vs-dry-run] snapshot skipped reason=snapshot_missing".to_owned(),
+                ) {
+                    self.push_log(line);
+                }
+                return;
+            }
+            Err(err) => {
+                let error = format!("{err:#}");
+                if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                    &friendly_vs_snapshot_parse_skip_key(&error),
+                    format!(
+                        "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid error={error}"
+                    ),
+                ) {
+                    self.push_log(line);
+                }
+                self.friendly_vs_dry_run.reset_processed_state();
+                return;
+            }
+        };
+        let (envelope, age) = read_result;
+        let Some(snapshot) = envelope.snapshot.as_ref() else {
+            let skip = if envelope.capture_status.as_deref() == Some("stopped") {
+                (
+                    "capture_stopped".to_owned(),
+                    "[friendly-vs-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
+                )
+            } else if let Some(error) = envelope.semantic_error.as_deref() {
+                (
+                    format!("semantic_invalid:{error}"),
+                    format!(
+                        "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid error={error}"
+                    ),
+                )
+            } else {
+                (
+                    "semantic_invalid".to_owned(),
+                    "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid".to_owned(),
+                )
+            };
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(&skip.0, skip.1) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        };
+
+        if self.friendly_vs_dry_run.last_round_id.as_deref() != Some(snapshot.round_id.as_str())
+            || self.friendly_vs_dry_run.last_game_id.as_deref() != Some(snapshot.gameid.as_str())
+            || self.friendly_vs_dry_run.last_capture_generation != Some(snapshot.capture_generation)
+            || self.friendly_vs_dry_run.last_candidate_id.as_deref()
+                != Some(snapshot.candidate_id.as_str())
+        {
+            self.friendly_vs_dry_run.reset_processed_state();
+        }
+
+        if envelope.status != "ready" {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "semantic_invalid",
+                "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+        if envelope.capture_status.as_deref() != Some("running") {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "capture_stopped",
+                "[friendly-vs-dry-run] snapshot skipped reason=capture_stopped".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if age
+            .map(|value| value.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
+            .unwrap_or(false)
+        {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "stale",
+                "[friendly-vs-dry-run] snapshot skipped reason=stale".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+        if snapshot.round_id != active_round_id {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                &format!("round_id_mismatch:{}:{}", snapshot.round_id, active_round_id),
+                format!(
+                    "[friendly-vs-dry-run] snapshot skipped reason=round_id_mismatch snapshot_round_id={} current_round_id={}",
+                    snapshot.round_id, active_round_id
+                ),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.gameid != active_game_id {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                &format!("gameid_mismatch:{}:{}", snapshot.gameid, active_game_id),
+                format!(
+                    "[friendly-vs-dry-run] snapshot skipped reason=gameid_mismatch snapshot_gameid={} current_gameid={}",
+                    snapshot.gameid, active_game_id
+                ),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if !snapshot.playing || !snapshot.started {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "not_playing",
+                "[friendly-vs-dry-run] snapshot skipped reason=not_playing".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.countdown_started {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "countdown",
+                "[friendly-vs-dry-run] snapshot skipped reason=countdown".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.paused == Some(true) {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "paused",
+                "[friendly-vs-dry-run] snapshot skipped reason=paused".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if snapshot.destroyed || snapshot.successful || snapshot.gameoverreason.is_some() {
+            let end_reason = if snapshot.successful {
+                "successful"
+            } else {
+                "destroyed"
+            };
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                end_reason,
+                format!("[friendly-vs-dry-run] snapshot skipped reason={end_reason}"),
+            ) {
+                self.push_log(line);
+            }
+            self.friendly_vs_dry_run.reset_processed_state();
+            return;
+        }
+        if self.friendly_vs_dry_run.is_duplicate_processed_piece(snapshot) {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "duplicate_piece",
+                "[friendly-vs-dry-run] snapshot skipped reason=duplicate_piece".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+        if self.friendly_vs_dry_run.is_duplicate_attempt(&file_signature) {
+            if let Some(line) = self.friendly_vs_dry_run.note_skip(
+                "duplicate_snapshot",
+                "[friendly-vs-dry-run] snapshot skipped reason=duplicate_snapshot".to_owned(),
+            ) {
+                self.push_log(line);
+            }
+            return;
+        }
+
+        self.friendly_vs_dry_run.clear_skip_reason();
+        self.push_log(format!(
+            "[friendly-vs-dry-run] snapshot ready round_id={} gameid={} generation={} candidate={} piece_counter={} current={}",
+            snapshot.round_id,
+            snapshot.gameid,
+            snapshot.capture_generation,
+            snapshot.candidate_id,
+            snapshot.snapshot.piece_counter.unwrap_or_default(),
+            snapshot
+                .snapshot
+                .queue
+                .first()
+                .copied()
+                .map(|piece| piece.label())
+                .unwrap_or("?")
+        ));
+        let config = self.state.to_automation_config(&self.paths);
+        match prepare_snapshot_execution(&config, &snapshot.snapshot) {
+            Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => {
+                let plan = &prepared.summary;
+                if let Some(fallback_from) = plan.fallback_from {
+                    self.push_log(format!(
+                        "[friendly-vs-dry-run] fallback mode={} from={} reason={}",
+                        movement_mode_label(plan.movement_mode_used),
+                        movement_mode_label(fallback_from),
+                        plan.fallback_reason.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                self.push_log(format!(
+                    "[friendly-vs-dry-run] plan ready piece={} hold_piece={} use_hold={} target_x={} rotation={:?} action_count={} actions={:?} route={} planner={}",
+                    plan.piece.label(),
+                    plan.hold_piece.map(|piece| piece.label()).unwrap_or("-"),
+                    plan.use_hold,
+                    plan.target_x,
+                    plan.target_rotation,
+                    plan.action_count,
+                    plan.actions,
+                    plan.route_kind,
+                    plan.planner
+                ));
+                self.friendly_vs_dry_run
+                    .record_processed(snapshot, &file_signature);
+            }
+            Ok(PreparedSnapshotExecutionResult::Skipped { reason, retryable }) => {
+                self.friendly_vs_dry_run
+                    .record_attempted(snapshot, &file_signature);
+                self.push_log(format!(
+                    "[friendly-vs-dry-run] plan skipped piece={} retryable={} reason={reason}",
+                    snapshot
+                        .snapshot
+                        .queue
+                        .first()
+                        .copied()
+                        .map(|piece| piece.label())
+                        .unwrap_or("?"),
+                    retryable
+                ));
+            }
+            Err(err) => {
+                self.friendly_vs_dry_run
+                    .record_attempted(snapshot, &file_signature);
+                self.push_log(format!(
+                    "[friendly-vs-dry-run] plan skipped piece={} reason={err:#}",
+                    snapshot
+                        .snapshot
+                        .queue
+                        .first()
+                        .copied()
+                        .map(|piece| piece.label())
+                        .unwrap_or("?")
+                ));
+            }
         }
     }
 
@@ -3197,6 +3655,7 @@ impl eframe::App for LauncherApp {
         self.poll_events();
         self.maybe_resume_bot_runner();
         self.poll_friendly_vs_observer();
+        self.poll_friendly_vs_dry_run();
         self.poll_zenith_dry_run();
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(window_level(
             self.state.always_on_top,
@@ -3725,6 +4184,10 @@ mod tests {
         paths.resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
     }
 
+    fn friendly_vs_passive_snapshot_path(paths: &AppPaths) -> std::path::PathBuf {
+        paths.resolve_workspace_path(FRIENDLY_VS_PASSIVE_SNAPSHOT_RELATIVE_PATH)
+    }
+
     fn zenith_spawn_coordinates(piece: Piece) -> (i32, i32) {
         let board = Board::<u16>::new();
         let spawned = SpawnRule::Row19Or20
@@ -3911,6 +4374,92 @@ mod tests {
             json!(null),
             &["O", "T", "L", "S", "Z"],
         );
+    }
+
+    fn write_friendly_vs_passive_snapshot(
+        paths: &AppPaths,
+        round_id: &str,
+        gameid: &str,
+        candidate_id: &str,
+        piece_counter: u32,
+        userid: serde_json::Value,
+        current_piece: &str,
+        queue: &[&str],
+    ) {
+        let path = friendly_vs_passive_snapshot_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let (x, y) = zenith_spawn_coordinates(match current_piece {
+            "I" => Piece::I,
+            "O" => Piece::O,
+            "T" => Piece::T,
+            "L" => Piece::L,
+            "J" => Piece::J,
+            "S" => Piece::S,
+            "Z" => Piece::Z,
+            _ => Piece::J,
+        });
+        let board = vec![vec![serde_json::Value::Bool(false); 10]; 40];
+        let raw = json!({
+            "status": "ready",
+            "capture_status": "running",
+            "snapshot": {
+                "source": "friendly_vs_passive",
+                "round_id": round_id,
+                "capture_generation": 7,
+                "timestamp": 1722422401123u64,
+                "userid": userid,
+                "gameid": gameid,
+                "candidate_id": candidate_id,
+                "playing": true,
+                "started": true,
+                "countdown_started": false,
+                "paused": false,
+                "destroyed": false,
+                "successful": false,
+                "gameoverreason": null,
+                "board": board,
+                "current": {
+                    "type": current_piece,
+                    "x": x,
+                    "y": y,
+                    "rotation": "north"
+                },
+                "hold": null,
+                "queue": queue,
+                "piece_counter": piece_counter
+            }
+        });
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    }
+
+    fn write_friendly_vs_invalid_snapshot_null_round_id(paths: &AppPaths, padding_lines: usize) {
+        let path = friendly_vs_passive_snapshot_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut raw = String::from(
+            "{\n  \"status\": \"ready\",\n  \"capture_status\": \"running\",\n  \"snapshot\": {\n",
+        );
+        for index in 0..padding_lines {
+            raw.push_str(&format!("    \"padding_{index}\": null,\n"));
+        }
+        raw.push_str(
+            "    \"source\": \"friendly_vs_passive\",\n    \"round_id\": null,\n    \"capture_generation\": 7,\n    \"timestamp\": 1722422401123,\n    \"userid\": null,\n    \"gameid\": \"7001\",\n    \"candidate_id\": \"cand-local\",\n    \"playing\": true,\n    \"started\": true,\n    \"countdown_started\": false,\n    \"paused\": false,\n    \"destroyed\": false,\n    \"successful\": false,\n    \"gameoverreason\": null,\n    \"board\": [\n",
+        );
+        for row in 0..40 {
+            raw.push_str("      [false,false,false,false,false,false,false,false,false,false]");
+            if row < 39 {
+                raw.push_str(",\n");
+            } else {
+                raw.push('\n');
+            }
+        }
+        raw.push_str(
+            "    ],\n    \"current\": {\n      \"type\": \"J\",\n      \"x\": 4,\n      \"y\": 19,\n      \"rotation\": \"north\"\n    },\n    \"hold\": null,\n    \"queue\": [\"O\", \"T\", \"L\", \"S\", \"Z\"],\n    \"piece_counter\": 4\n  }\n}\n",
+        );
+        fs::write(path, raw).unwrap();
     }
 
     fn drive_zenith_live_piece_counters(app: &mut LauncherApp, paths: &AppPaths, counters: &[u32]) {
@@ -4114,7 +4663,6 @@ mod tests {
         configure_friendly_vs_runtime_ready(&mut app);
 
         app.start_bot();
-        app.poll_friendly_vs_observer();
 
         assert_eq!(app.bot_status, BotStatus::On);
         assert!(app.bot_desired_enabled);
@@ -4123,6 +4671,7 @@ mod tests {
             .logs
             .iter()
             .any(|line| line == "[friendly-vs] observer armed"));
+        assert!(!app.friendly_vs_capture_enabled);
         assert!(!app
             .logs
             .iter()
@@ -4131,6 +4680,71 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("[zenith-live] input dispatched")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_bot_on_arms_before_bootstrap_bridge_write_and_admits_on_first_poll() {
+        let paths = test_paths("friendly-vs-pre-arm-before-bootstrap");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        write_friendly_vs_bridge(
+            &paths,
+            2,
+            "5449:1744077000",
+            false,
+            now_ms.saturating_sub(10_000),
+            now_ms.saturating_sub(5_000),
+            "local-id",
+            "fixture-user",
+            5449,
+            1744077000,
+            5,
+            &[5450],
+            0,
+        );
+
+        app.start_bot();
+
+        assert!(app.friendly_vs.armed);
+        assert_eq!(app.friendly_vs.baseline_sequence, Some(2));
+        assert_eq!(app.friendly_vs_capture_enabled, false);
+
+        write_friendly_vs_bridge(
+            &paths,
+            3,
+            "4942:461010047",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "6a77d006f9f0612f4cbde602",
+            "guest-2e94ioia_",
+            4942,
+            461010047,
+            5,
+            &[4941],
+            0,
+        );
+
+        app.poll_friendly_vs_observer();
+
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] identity ready userid=6a77d006f9f0612f4cbde602 gameid=4942 round_id=4942:461010047"
+        }));
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] options ready seed=461010047 bagtype=7-bag nextcount=5"
+        }));
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs] round active opponents=1 incoming_garbage=0"
+        }));
+        assert!(!app.logs.iter().any(|line| line.contains("round_id=5449:1744077000")));
+        assert!(app.friendly_vs_capture_enabled);
 
         cleanup_test_paths(&paths);
     }
@@ -4319,6 +4933,7 @@ mod tests {
                 .count(),
             1
         );
+        assert!(!app.friendly_vs_capture_enabled);
         assert!(!app
             .logs
             .iter()
@@ -4331,6 +4946,7 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"));
+        assert!(app.friendly_vs_capture_enabled);
 
         cleanup_test_paths(&paths);
     }
@@ -4592,6 +5208,350 @@ mod tests {
             .iter()
             .any(|line| line == "[friendly-vs] observer stopped"));
         assert!(!app.friendly_vs.armed);
+        assert!(!app.friendly_vs_capture_enabled);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_bot_off_disables_capture_gate_immediately() {
+        let paths = test_paths("friendly-vs-bot-off-disables-capture");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.bot_desired_enabled = true;
+        app.bot_status = BotStatus::On;
+        app.friendly_vs_capture_enabled = true;
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert!(!app.friendly_vs_capture_enabled);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_dry_run_plans_once_per_piece_without_dispatch() {
+        let paths = test_paths("friendly-vs-dry-run-once");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.start_bot();
+        app.logs.clear();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        app.poll_friendly_vs_observer();
+        write_friendly_vs_bridge(
+            &paths,
+            1,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "guest-local",
+            7001,
+            1_744_077_373,
+            5,
+            &[7002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] snapshot ready"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line == &&"[friendly-vs-dry-run] snapshot skipped reason=duplicate_piece"
+                        .to_owned()
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.bot_session.is_none());
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_dry_run_gameid_mismatch_does_not_stall_retry() {
+        let paths = test_paths("friendly-vs-dry-run-retry");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.start_bot();
+        app.logs.clear();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        app.poll_friendly_vs_observer();
+        write_friendly_vs_bridge(
+            &paths,
+            1,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "guest-local",
+            7001,
+            1_744_077_373,
+            5,
+            &[7002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7999",
+            "cand-opponent",
+            3,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert!(app.logs.iter().any(|line| line.contains(
+            "[friendly-vs-dry-run] snapshot skipped reason=gameid_mismatch"
+        )));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-dry-run] plan ready")));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7001",
+            "cand-local",
+            3,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_dry_run_ready_snapshot_with_null_userid_reaches_planner() {
+        let paths = test_paths("friendly-vs-dry-run-null-userid");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.start_bot();
+        app.logs.clear();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        app.poll_friendly_vs_observer();
+        write_friendly_vs_bridge(
+            &paths,
+            1,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "guest-local",
+            7001,
+            1_744_077_373,
+            5,
+            &[7002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7001",
+            "cand-local",
+            4,
+            json!(null),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] snapshot ready"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.bot_session.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_dry_run_parse_error_logging_is_bounded_across_line_drift() {
+        let paths = test_paths("friendly-vs-dry-run-parse-dedupe");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.start_bot();
+        app.logs.clear();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        app.poll_friendly_vs_observer();
+        write_friendly_vs_bridge(
+            &paths,
+            1,
+            "7001:1744077373",
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "guest-local",
+            7001,
+            1_744_077_373,
+            5,
+            &[7002],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+
+        write_friendly_vs_invalid_snapshot_null_round_id(&paths, 0);
+        for _ in 0..50 {
+            app.poll_friendly_vs_dry_run();
+        }
+
+        write_friendly_vs_invalid_snapshot_null_round_id(&paths, 6);
+        for _ in 0..50 {
+            app.poll_friendly_vs_dry_run();
+        }
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid error=failed to parse Friendly VS passive snapshot JSON: invalid type: null, expected a string"
+                    )
+                })
+                .count(),
+            1
+        );
+
+        app.friendly_vs_dry_run.last_skip_logged_at = Some(
+            Instant::now() - FRIENDLY_VS_DRY_RUN_SKIP_LOG_COOLDOWN - Duration::from_millis(10),
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "[friendly-vs-dry-run] snapshot skipped reason=semantic_invalid error=failed to parse Friendly VS passive snapshot JSON: invalid type: null, expected a string"
+                    )
+                })
+                .count(),
+            2
+        );
 
         cleanup_test_paths(&paths);
     }

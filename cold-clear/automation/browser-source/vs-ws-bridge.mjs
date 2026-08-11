@@ -61,8 +61,79 @@ export function createVsBridgeState(
   bridgeFilePath = DEFAULT_BRIDGE_PATH,
   log = null
 ) {
-  const state = {
+  const state = createVsBridgeCoreState({
     bridgeFilePath: path.resolve(bridgeFilePath),
+    log,
+    writeEnabled: true
+  });
+
+  log?.(`[vs-bridge] producer enabled path=${buildLogPath(state.bridgeFilePath)}`);
+  return state;
+}
+
+export function createVsBridgeAccumulatorState({
+  configuredLocalUsername = null,
+  log = null
+} = {}) {
+  return createVsBridgeCoreState({
+    bridgeFilePath: null,
+    log,
+    configuredLocalUsername,
+    writeEnabled: false
+  });
+}
+
+export function promoteVsBridgeAccumulator(
+  state,
+  accumulator,
+  capturedAt = Date.now(),
+  log = state?.log ?? null
+) {
+  if (!state || !accumulator) {
+    return null;
+  }
+
+  state.sessionSelfIdentity =
+    cloneBridgeValue(accumulator.sessionSelfIdentity) ??
+    createEmptySessionSelfIdentity();
+  state.participantIdentities = cloneBridgeValue(accumulator.participantIdentities);
+  state.requestIdentityState = cloneBridgeValue(accumulator.requestIdentityState);
+  state.pendingRequestSelfCandidates = cloneBridgeValue(
+    accumulator.pendingRequestSelfCandidates
+  );
+  state.roomUsers = cloneBridgeValue(accumulator.roomUsers);
+  state.roundPlayers = cloneBridgeValue(accumulator.roundPlayers);
+  state.zenithPlayersByGameId = cloneBridgeValue(accumulator.zenithPlayersByGameId);
+  state.zenithPlayersByUserId = cloneBridgeValue(accumulator.zenithPlayersByUserId);
+  state.roomOptions = cloneBridgeValue(accumulator.roomOptions) ?? {};
+  state.zenithSession = cloneBridgeValue(accumulator.zenithSession) ?? null;
+  state.roundObservedAt = normalizeTimestamp(
+    accumulator.roundObservedAt ?? capturedAt
+  );
+  state.roundObservationKey = String(accumulator.roundObservationKey ?? "");
+  state.identityCandidateKeys = cloneBridgeValue(accumulator.identityCandidateKeys);
+  state.configuredLocalUsername = sanitizeConfiguredLocalUsername(
+    accumulator.configuredLocalUsername
+  );
+  state.lastWaitingReason = "";
+  state.lastLocalPlayerSignature = "";
+
+  const built = tryBuildBridge(state, normalizeTimestamp(capturedAt), log);
+  if (built) {
+    maybeLogResolvedLocalPlayer(state, built, log);
+  }
+  return built;
+}
+
+function createVsBridgeCoreState({
+  bridgeFilePath = DEFAULT_BRIDGE_PATH,
+  log = null,
+  configuredLocalUsername = null,
+  writeEnabled = true
+} = {}) {
+  const state = {
+    bridgeFilePath,
+    writeEnabled,
     sequence: 0,
     current: null,
     currentSignature: "",
@@ -81,7 +152,9 @@ export function createVsBridgeState(
     roundPlayers: new Map(),
     zenithPlayersByGameId: new Map(),
     zenithPlayersByUserId: new Map(),
-    configuredLocalUsername: null,
+    configuredLocalUsername: sanitizeConfiguredLocalUsername(
+      configuredLocalUsername
+    ),
     roomOptions: {},
     zenithSession: null,
     roundObservedAt: 0,
@@ -92,8 +165,6 @@ export function createVsBridgeState(
       return ingestVsBridgeRoot(state, root, context, state.log);
     }
   };
-
-  log?.(`[vs-bridge] producer enabled path=${buildLogPath(state.bridgeFilePath)}`);
   return state;
 }
 
@@ -1092,6 +1163,9 @@ function clearWaitingReason(state) {
 }
 
 function safeWriteBridgeFile(state, log) {
+  if (state?.writeEnabled === false || !state?.bridgeFilePath) {
+    return false;
+  }
   try {
     writeVsBridgeFile(state.bridgeFilePath, state.current);
     return true;
@@ -1099,6 +1173,30 @@ function safeWriteBridgeFile(state, log) {
     log?.(`[vs-bridge] write failed: ${error?.message ?? String(error)}`);
     return false;
   }
+}
+
+function cloneBridgeValue(value) {
+  if (value instanceof Map) {
+    const clone = new Map();
+    for (const [key, entry] of value.entries()) {
+      clone.set(key, cloneBridgeValue(entry));
+    }
+    return clone;
+  }
+  if (value instanceof Set) {
+    return new Set([...value].map((entry) => cloneBridgeValue(entry)));
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => cloneBridgeValue(entry));
+  }
+  if (value && typeof value === "object") {
+    const clone = {};
+    for (const [key, entry] of Object.entries(value)) {
+      clone[key] = cloneBridgeValue(entry);
+    }
+    return clone;
+  }
+  return value;
 }
 
 function displayPath(filePath) {

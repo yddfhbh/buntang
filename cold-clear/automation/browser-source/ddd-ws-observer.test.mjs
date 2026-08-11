@@ -198,6 +198,90 @@ function vsRoundPayload({
   };
 }
 
+function friendlyVsRoundPayload({
+  localUserId = "local-id",
+  localUsername = "guest-2e94ioia_",
+  localGameId = 6994,
+  opponentUserId = "opponent-id",
+  opponentUsername = "hebi_",
+  opponentGameId = 6995,
+  seed = 960646853
+} = {}) {
+  return {
+    user: {
+      _id: "observer-id",
+      username: "observer"
+    },
+    players: [
+      {
+        userid: localUserId,
+        _id: localUserId,
+        username: localUsername,
+        gameid: localGameId,
+        options: {
+          gameid: localGameId,
+          seed,
+          bagtype: "7-bag",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      },
+      {
+        userid: opponentUserId,
+        _id: opponentUserId,
+        username: opponentUsername,
+        gameid: opponentGameId,
+        options: {
+          gameid: opponentGameId,
+          seed,
+          bagtype: "7-bag",
+          nextcount: 5,
+          boardwidth: 10,
+          boardheight: 20
+        }
+      }
+    ],
+    options: {
+      seed,
+      precountdown: 5000,
+      countdown_count: 3,
+      countdown_interval: 1000,
+      garbagemultiplier: 0
+    }
+  };
+}
+
+function friendlyVsRootsOnlyPayload({
+  localUserId = "local-id",
+  localUsername = "guest-2e94ioia_",
+  localGameId = 6994,
+  opponentUserId = "opponent-id",
+  opponentUsername = "hebi_",
+  opponentGameId = 6995
+} = {}) {
+  return {
+    user: {
+      _id: "observer-id",
+      username: "observer"
+    },
+    players: [
+      {
+        userid: localUserId,
+        _id: localUserId,
+        username: localUsername,
+        gameid: localGameId
+      },
+      {
+        userid: opponentUserId,
+        _id: opponentUserId,
+        username: opponentUsername,
+        gameid: opponentGameId
+      }
+    ]
+  };
+}
+
 async function withTraceEnv(value, run) {
   const previous = process.env.FUSION_DDD_WS_TRACE;
   if (value === undefined) {
@@ -214,6 +298,24 @@ async function withTraceEnv(value, run) {
     } else {
       process.env.FUSION_DDD_WS_TRACE = previous;
     }
+  }
+}
+
+async function withMockedDateNow(initialNow, run) {
+  const originalNow = Date.now;
+  let currentNow = initialNow;
+  Date.now = () => currentNow;
+  try {
+    await run({
+      set(now) {
+        currentNow = now;
+      },
+      advance(ms) {
+        currentNow += ms;
+      }
+    });
+  } finally {
+    Date.now = originalNow;
   }
 }
 
@@ -1151,6 +1253,224 @@ test("bot off keeps passive listener attached but does not start page probes or 
       false
     );
     assert.equal(existsSync(filePath), false);
+    cleanup();
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("friendly vs bootstrap survives target reset and replays the live round on bot on", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: true,
+      vsBridgePath: filePath
+    });
+    setObserverMode(cleanup, "friendly_vs", 11, false, "GUEST-2E94IOIA_");
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-friendly-prebuffer",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(
+          friendlyVsRoundPayload({
+            localUserId: "B",
+            localUsername: "guest-2e94ioia_",
+            localGameId: 5609,
+            opponentUserId: "A",
+            opponentUsername: "hebi_",
+            opponentGameId: 5610,
+            seed: 119970584
+          })
+        )
+      }
+    });
+    await flushObserverWork();
+
+    assert.equal(existsSync(filePath), false);
+    assert.ok(logs.includes("[ws-observer] game options captured"));
+    assert.ok(
+      logs.includes("[friendly_vs] bootstrap retained roundId=5609:119970584")
+    );
+
+    cleanup.notifyTargetReset("execution_context_reset");
+    setObserverMode(cleanup, "friendly_vs", 11, true, "GUEST-2E94IOIA_");
+    await flushObserverWork();
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.roundId, "5609:119970584");
+    assert.equal(bridge.local.username, "guest-2e94ioia_");
+    assert.equal(bridge.local.gameid, 5609);
+    assert.ok(logs.includes("[friendly_vs] activation started"));
+    assert.ok(logs.includes("[friendly_vs] prebuffer replayed candidates=0"));
+    assert.ok(
+      logs.includes("[friendly_vs] bootstrap replayed roundId=5609:119970584 players=2")
+    );
+    assert.ok(logs.includes("[vs-bridge] written roundId=5609:119970584"));
+
+    cleanup();
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("friendly vs bootstrap survives rolling prebuffer age prune before bot on", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    await withMockedDateNow(1_000, async (clock) => {
+      const cleanup = await installDddWsObserver(cdp, {
+        unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+        log: (line) => logs.push(line),
+        vsSimEnabled: true,
+        vsBridgePath: filePath
+      });
+      setObserverMode(cleanup, "friendly_vs", 11, false, "guest-2e94ioia_");
+
+      cdp.emit("Network.webSocketFrameReceived", {
+        requestId: "req-round-options",
+        response: {
+          opcode: 1,
+          payloadData: JSON.stringify(friendlyVsRoundPayload())
+        }
+      });
+      await flushObserverWork();
+
+      clock.advance(11_001);
+      for (let index = 0; index < 3; index += 1) {
+        cdp.emit("Network.webSocketFrameReceived", {
+          requestId: `req-roots-only-${index}`,
+          response: {
+            opcode: 1,
+            payloadData: JSON.stringify(friendlyVsRootsOnlyPayload())
+          }
+        });
+        await flushObserverWork();
+        clock.advance(4_000);
+      }
+
+      setObserverMode(cleanup, "friendly_vs", 11, true, "guest-2e94ioia_");
+      await flushObserverWork();
+
+      const bridge = readJson(filePath);
+      assert.equal(bridge.roundId, "6994:960646853");
+      assert.equal(bridge.local.username, "guest-2e94ioia_");
+      assert.equal(bridge.local.gameid, 6994);
+      assert.ok(logs.includes("[friendly_vs] prebuffer replayed candidates=0"));
+      assert.ok(
+        logs.includes("[friendly_vs] bootstrap replayed roundId=6994:960646853 players=2")
+      );
+      cleanup();
+    });
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("friendly vs bootstrap replaces the previous round before bot on", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: true,
+      vsBridgePath: filePath
+    });
+    setObserverMode(cleanup, "friendly_vs", 11, false, "guest-2e94ioia_");
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-round-old",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(
+          friendlyVsRoundPayload({
+            localGameId: 6994,
+            opponentGameId: 6995,
+            seed: 960646853
+          })
+        )
+      }
+    });
+    await flushObserverWork();
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-round-new",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(
+          friendlyVsRoundPayload({
+            localGameId: 7000,
+            opponentGameId: 7001,
+            seed: 236198275
+          })
+        )
+      }
+    });
+    await flushObserverWork();
+
+    setObserverMode(cleanup, "friendly_vs", 11, true, "guest-2e94ioia_");
+    await flushObserverWork();
+
+    const bridge = readJson(filePath);
+    assert.equal(bridge.roundId, "7000:236198275");
+    assert.equal(bridge.local.gameid, 7000);
+    assert.ok(
+      logs.includes("[friendly_vs] bootstrap replayed roundId=7000:236198275 players=2")
+    );
+    assert.equal(
+      logs.some((line) => line.includes("bootstrap replayed roundId=6994:960646853")),
+      false
+    );
+
+    cleanup();
+  } finally {
+    cleanupTempDir(dir);
+  }
+});
+
+test("friendly vs bootstrap clears when leaving and re-entering the mode", async () => {
+  const cdp = new FakeCdp();
+  const logs = [];
+  const { dir, filePath } = makeTempTraceFile("vs-ws-bridge.json");
+
+  try {
+    const cleanup = await installDddWsObserver(cdp, {
+      unpack: (buffer) => JSON.parse(buffer.toString("utf8")),
+      log: (line) => logs.push(line),
+      vsSimEnabled: true,
+      vsBridgePath: filePath
+    });
+    setObserverMode(cleanup, "friendly_vs", 11, false, "guest-2e94ioia_");
+
+    cdp.emit("Network.webSocketFrameReceived", {
+      requestId: "req-round-before-leave",
+      response: {
+        opcode: 1,
+        payloadData: JSON.stringify(friendlyVsRoundPayload())
+      }
+    });
+    await flushObserverWork();
+
+    setObserverMode(cleanup, "solo", 12, false);
+    setObserverMode(cleanup, "friendly_vs", 13, true, "guest-2e94ioia_");
+    await flushObserverWork();
+
+    assert.equal(existsSync(filePath), false);
+    assert.equal(
+      logs.some((line) => line.includes("bootstrap replayed roundId=6994:960646853")),
+      false
+    );
+
     cleanup();
   } finally {
     cleanupTempDir(dir);

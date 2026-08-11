@@ -45,6 +45,90 @@ const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Bot OFF",
 ];
 const ZENITH_LIVE_MAX_PIECE_OPTIONS: &[u32] = &[1, 5, 20];
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum FriendlyVsLiveLimit {
+    Twenty,
+    Unlimited,
+}
+
+impl Default for FriendlyVsLiveLimit {
+    fn default() -> Self {
+        Self::Twenty
+    }
+}
+
+impl FriendlyVsLiveLimit {
+    fn normalized(self) -> Self {
+        match self {
+            Self::Twenty | Self::Unlimited => self,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Twenty => "20 placements",
+            Self::Unlimited => "Unlimited",
+        }
+    }
+
+    fn count_suffix(self) -> &'static str {
+        match self {
+            Self::Twenty => "20",
+            Self::Unlimited => "Unlimited",
+        }
+    }
+
+    fn bounded_value(self) -> Option<u32> {
+        match self {
+            Self::Twenty => Some(FRIENDLY_VS_LIVE_MAX_PLACEMENTS),
+            Self::Unlimited => None,
+        }
+    }
+
+    fn is_reached(self, executed_placements: u32) -> bool {
+        match self.bounded_value() {
+            Some(limit) => executed_placements >= limit,
+            None => false,
+        }
+    }
+}
+
+impl Serialize for FriendlyVsLiveLimit {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Twenty => serializer.serialize_u32(FRIENDLY_VS_LIVE_MAX_PLACEMENTS),
+            Self::Unlimited => serializer.serialize_str("unlimited"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FriendlyVsLiveLimit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let parsed = match value {
+            serde_json::Value::Number(number) => number
+                .as_u64()
+                .filter(|value| *value == u64::from(FRIENDLY_VS_LIVE_MAX_PLACEMENTS))
+                .map(|_| Self::Twenty)
+                .unwrap_or_default(),
+            serde_json::Value::String(value)
+                if value.eq_ignore_ascii_case("unlimited") =>
+            {
+                Self::Unlimited
+            }
+            _ => Self::default(),
+        };
+        Ok(parsed.normalized())
+    }
+}
+
 const BOT_UI_HIDDEN_LABELS: &[&str] = &[
     "Dry run",
     "Use hold",
@@ -286,6 +370,7 @@ struct LauncherState {
     browser: BrowserCdpConfig,
     always_on_top: bool,
     friendly_vs_live_input_enabled: bool,
+    friendly_vs_live_limit: FriendlyVsLiveLimit,
     zenith_live_input_enabled: bool,
     zenith_live_max_pieces: ZenithLivePieceLimit,
     dry_run: bool,
@@ -324,6 +409,7 @@ impl Default for LauncherState {
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
             friendly_vs_live_input_enabled: false,
+            friendly_vs_live_limit: FriendlyVsLiveLimit::default(),
             zenith_live_input_enabled: false,
             zenith_live_max_pieces: ZenithLivePieceLimit::default(),
             dry_run: true,
@@ -552,6 +638,7 @@ impl LauncherState {
     }
 
     fn normalize_pps_state(&mut self) {
+        self.friendly_vs_live_limit = self.friendly_vs_live_limit.normalized();
         self.target_pps = normalize_target_pps_value(self.target_pps);
         self.zenith_live_max_pieces = self.zenith_live_max_pieces.normalized();
     }
@@ -566,6 +653,10 @@ impl LauncherState {
 
     fn effective_zenith_live_max_pieces(&self) -> ZenithLivePieceLimit {
         self.zenith_live_max_pieces.normalized()
+    }
+
+    fn effective_friendly_vs_live_limit(&self) -> FriendlyVsLiveLimit {
+        self.friendly_vs_live_limit.normalized()
     }
 }
 
@@ -1073,8 +1164,8 @@ impl FriendlyVsLiveController {
         self.last_skip_key = None;
     }
 
-    fn limit_reached(&self) -> bool {
-        self.executed_placements >= FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+    fn limit_reached(&self, limit: FriendlyVsLiveLimit) -> bool {
+        limit.is_reached(self.executed_placements)
     }
 
     fn clear_skip_reason(&mut self) {
@@ -1094,19 +1185,16 @@ impl FriendlyVsLiveController {
         self.clear_skip_reason();
     }
 
-    fn note_limit_locked(&mut self) -> Option<String> {
-        if !self.limit_reached() || self.limit_logged {
+    fn note_limit_locked(&mut self, limit: FriendlyVsLiveLimit) -> Option<String> {
+        if !self.limit_reached(limit) || self.limit_logged {
             return None;
         }
         self.limit_logged = true;
         Some("[friendly-vs-live] input locked reason=placement_limit".to_owned())
     }
 
-    fn count_label(&self) -> String {
-        format!(
-            "{}/{}",
-            self.executed_placements, FRIENDLY_VS_LIVE_MAX_PLACEMENTS
-        )
+    fn count_label(&self, limit: FriendlyVsLiveLimit) -> String {
+        format!("{}/{}", self.executed_placements, limit.count_suffix())
     }
 }
 
@@ -1837,13 +1925,21 @@ impl LauncherApp {
         self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
     }
 
+    fn friendly_vs_live_limit(&self) -> FriendlyVsLiveLimit {
+        self.state.effective_friendly_vs_live_limit()
+    }
+
     fn friendly_vs_live_input_allowed(&self) -> bool {
         self.state.selected_mode == RuntimeMode::FriendlyVs
             && self.state.friendly_vs_live_input_enabled
     }
 
+    fn friendly_vs_live_limit_selector_locked(&self) -> bool {
+        self.local_tetrio_username_locked()
+    }
+
     fn friendly_vs_live_count_label(&self) -> String {
-        self.friendly_vs_live.count_label()
+        self.friendly_vs_live.count_label(self.friendly_vs_live_limit())
     }
 
     fn friendly_vs_live_status_label(&self) -> String {
@@ -1871,12 +1967,22 @@ impl LauncherApp {
         let count = self.friendly_vs_live_count_label();
         if enabled {
             self.push_log(format!("[friendly-vs-live] enabled count={count}"));
-            if let Some(line) = self.friendly_vs_live.note_limit_locked() {
+            if let Some(line) = self
+                .friendly_vs_live
+                .note_limit_locked(self.friendly_vs_live_limit())
+            {
                 self.push_log(line);
             }
         } else {
             self.push_log(format!("[friendly-vs-live] disabled count={count}"));
         }
+    }
+
+    fn friendly_vs_live_session_armed_log(&self) -> String {
+        format!(
+            "[friendly-vs-live] session armed limit={}",
+            self.friendly_vs_live_limit().count_suffix()
+        )
     }
 
     fn zenith_live_limit_reached(&self) -> bool {
@@ -2111,7 +2217,10 @@ impl LauncherApp {
         if !self.friendly_vs_live_input_allowed() {
             return;
         }
-        if self.friendly_vs_live.limit_reached() {
+        if self
+            .friendly_vs_live
+            .limit_reached(self.friendly_vs_live_limit())
+        {
             self.suppress_friendly_vs_live_input("placement_limit", planned_snapshot);
             return;
         }
@@ -2170,7 +2279,10 @@ impl LauncherApp {
             self.suppress_friendly_vs_live_input("gameid_mismatch", planned_snapshot);
             return;
         }
-        if self.friendly_vs_live.limit_reached() {
+        if self
+            .friendly_vs_live
+            .limit_reached(self.friendly_vs_live_limit())
+        {
             self.suppress_friendly_vs_live_input("placement_limit", planned_snapshot);
             return;
         }
@@ -2241,10 +2353,13 @@ impl LauncherApp {
             Ok(()) => {
                 self.friendly_vs_live.record_execution();
                 self.push_log(format!(
-                    "[friendly-vs-live] placement executed count={}/{}",
-                    self.friendly_vs_live.executed_placements, FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    "[friendly-vs-live] placement executed count={}",
+                    self.friendly_vs_live_count_label()
                 ));
-                if let Some(line) = self.friendly_vs_live.note_limit_locked() {
+                if let Some(line) = self
+                    .friendly_vs_live
+                    .note_limit_locked(self.friendly_vs_live_limit())
+                {
                     self.push_log(line);
                 }
             }
@@ -2581,10 +2696,7 @@ impl LauncherApp {
             ));
             if self.state.selected_mode == RuntimeMode::FriendlyVs {
                 if self.state.friendly_vs_live_input_enabled {
-                    self.push_log(format!(
-                        "[friendly-vs-live] session armed max_placements={}",
-                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
-                    ));
+                    self.push_log(self.friendly_vs_live_session_armed_log());
                 } else {
                     self.push_log("[friendly-vs-live] input disabled mode=dry_run".to_owned());
                 }
@@ -4304,14 +4416,24 @@ impl eframe::App for LauncherApp {
             if self.state.selected_mode == RuntimeMode::FriendlyVs {
                 ui.small("Live input only changes dispatch permission. Capture and dry-run stay active.");
                 ui.horizontal(|ui| {
+                    ui.label("Live limit:");
+                    ui.add_enabled_ui(!self.friendly_vs_live_limit_selector_locked(), |ui| {
+                        ui.radio_value(
+                            &mut self.state.friendly_vs_live_limit,
+                            FriendlyVsLiveLimit::Twenty,
+                            FriendlyVsLiveLimit::Twenty.label(),
+                        );
+                        ui.radio_value(
+                            &mut self.state.friendly_vs_live_limit,
+                            FriendlyVsLiveLimit::Unlimited,
+                            FriendlyVsLiveLimit::Unlimited.label(),
+                        );
+                    });
+                });
+                ui.horizontal(|ui| {
                     let mut friendly_vs_live_input_enabled = self.state.friendly_vs_live_input_enabled;
-                    let response = ui.checkbox(
-                        &mut friendly_vs_live_input_enabled,
-                        format!(
-                            "Live input (max {} placements)",
-                            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
-                        ),
-                    );
+                    let response =
+                        ui.checkbox(&mut friendly_vs_live_input_enabled, "Live input");
                     if response.changed() {
                         self.set_friendly_vs_live_input_enabled(friendly_vs_live_input_enabled);
                     }
@@ -4642,19 +4764,32 @@ mod tests {
         app.poll_friendly_vs_observer();
     }
 
-    fn setup_friendly_vs_live_app_with_enabled(
+    fn setup_friendly_vs_live_app_with_options(
         test_name: &str,
         live_input_enabled: bool,
+        live_limit: FriendlyVsLiveLimit,
     ) -> (AppPaths, LauncherApp, String) {
         let paths = test_paths(test_name);
         let mut app = LauncherApp::new(paths.clone());
         configure_friendly_vs_runtime_ready(&mut app);
         app.state.friendly_vs_live_input_enabled = live_input_enabled;
+        app.state.friendly_vs_live_limit = live_limit;
         app.start_bot();
         app.logs.clear();
         let round_id = "7001:1744077373".to_owned();
         arm_friendly_vs_round(&mut app, &paths, &round_id, 7001);
         (paths, app, round_id)
+    }
+
+    fn setup_friendly_vs_live_app_with_enabled(
+        test_name: &str,
+        live_input_enabled: bool,
+    ) -> (AppPaths, LauncherApp, String) {
+        setup_friendly_vs_live_app_with_options(
+            test_name,
+            live_input_enabled,
+            FriendlyVsLiveLimit::Twenty,
+        )
     }
 
     fn setup_friendly_vs_live_app(test_name: &str) -> (AppPaths, LauncherApp, String) {
@@ -5256,16 +5391,74 @@ mod tests {
     fn friendly_vs_live_input_defaults_to_false() {
         let state = LauncherState::default();
         assert!(!state.friendly_vs_live_input_enabled);
+        assert_eq!(state.effective_friendly_vs_live_limit(), FriendlyVsLiveLimit::Twenty);
 
         let paths = test_paths("friendly-vs-live-default-false");
         let app = LauncherApp::new(paths.clone());
         assert!(!app.state.friendly_vs_live_input_enabled);
+        assert_eq!(
+            app.state.effective_friendly_vs_live_limit(),
+            FriendlyVsLiveLimit::Twenty
+        );
         cleanup_test_paths(&paths);
     }
 
     #[test]
-    fn friendly_vs_live_status_label_shows_n_of_twenty() {
-        let paths = test_paths("friendly-vs-live-status-label");
+    fn friendly_vs_live_limit_missing_field_defaults_to_twenty() {
+        let state: LauncherState =
+            serde_json::from_value(json!({ "friendly_vs_live_input_enabled": true })).unwrap();
+        assert_eq!(
+            state.effective_friendly_vs_live_limit(),
+            FriendlyVsLiveLimit::Twenty
+        );
+    }
+
+    #[test]
+    fn friendly_vs_live_limit_accepts_unlimited_value() {
+        let state: LauncherState =
+            serde_json::from_value(json!({ "friendly_vs_live_limit": "unlimited" })).unwrap();
+        assert_eq!(
+            state.effective_friendly_vs_live_limit(),
+            FriendlyVsLiveLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn friendly_vs_live_limit_serializes_with_twenty_or_unlimited() {
+        let mut state = LauncherState::default();
+        let serialized = serde_json::to_value(&state).unwrap();
+        assert_eq!(
+            serialized.get("friendly_vs_live_limit"),
+            Some(&serde_json::Value::Number(FRIENDLY_VS_LIVE_MAX_PLACEMENTS.into()))
+        );
+
+        state.friendly_vs_live_limit = FriendlyVsLiveLimit::Unlimited;
+        let serialized = serde_json::to_value(state).unwrap();
+        assert_eq!(
+            serialized.get("friendly_vs_live_limit"),
+            Some(&serde_json::Value::String("unlimited".to_owned()))
+        );
+    }
+
+    #[test]
+    fn friendly_vs_live_limit_invalid_values_fall_back_to_twenty() {
+        for raw in [
+            json!({ "friendly_vs_live_limit": 0 }),
+            json!({ "friendly_vs_live_limit": 21 }),
+            json!({ "friendly_vs_live_limit": null }),
+            json!({ "friendly_vs_live_limit": "20" }),
+        ] {
+            let state: LauncherState = serde_json::from_value(raw).unwrap();
+            assert_eq!(
+                state.effective_friendly_vs_live_limit(),
+                FriendlyVsLiveLimit::Twenty
+            );
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_status_label_shows_active_limit_mode() {
+        let paths = test_paths("friendly-vs-live-status-labels");
         let mut app = LauncherApp::new(paths.clone());
         app.state.friendly_vs_live_input_enabled = true;
         app.friendly_vs_live.executed_placements = 7;
@@ -5274,6 +5467,27 @@ mod tests {
             app.friendly_vs_live_status_label(),
             "Friendly VS: Live (7/20)"
         );
+
+        app.state.friendly_vs_live_limit = FriendlyVsLiveLimit::Unlimited;
+        assert_eq!(
+            app.friendly_vs_live_status_label(),
+            "Friendly VS: Live (7/Unlimited)"
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_limit_selector_lock_tracks_bot_state() {
+        let paths = test_paths("friendly-vs-live-limit-selector-lock");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.selected_mode = RuntimeMode::FriendlyVs;
+        assert!(!app.friendly_vs_live_limit_selector_locked());
+
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.start_bot();
+
+        assert!(app.friendly_vs_live_limit_selector_locked());
 
         cleanup_test_paths(&paths);
     }
@@ -6326,6 +6540,50 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_unlimited_dispatches_fifty_times_without_limit_lock() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+            "friendly-vs-live-unlimited-fifty",
+            true,
+            FriendlyVsLiveLimit::Unlimited,
+        );
+        let reread_count = Arc::new(AtomicU32::new(0));
+        app.logs.clear();
+
+        for offset in 0..50u32 {
+            let reread_count = reread_count.clone();
+            app.friendly_vs_live_before_reread = Some(Box::new(move |_| {
+                reread_count.fetch_add(1, Ordering::Relaxed);
+            }));
+            poll_friendly_vs_live_test_piece(
+                &mut app,
+                &paths,
+                &round_id,
+                4 + offset,
+                offset as usize,
+            );
+        }
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            50
+        );
+        assert_eq!(app.friendly_vs_live.executed_placements, 50);
+        assert_eq!(reread_count.load(Ordering::Relaxed), 50);
+        assert_eq!(app.friendly_vs_live_status_label(), "Friendly VS: Live (50/Unlimited)");
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs-live] placement executed count=50/Unlimited"
+        }));
+        assert!(!app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input locked reason=placement_limit")
+                || line.contains("[friendly-vs-live] input suppressed reason=placement_limit")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_live_toggle_on_waits_for_next_fresh_piece_without_restarting_capture() {
         let (paths, mut app, round_id) =
             setup_friendly_vs_live_app_with_enabled("friendly-vs-live-toggle-on", false);
@@ -6485,6 +6743,78 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_unlimited_toggle_off_then_on_same_round_keeps_count_and_dry_run() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+            "friendly-vs-live-unlimited-toggle-off-on",
+            true,
+            FriendlyVsLiveLimit::Unlimited,
+        );
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.set_friendly_vs_live_input_enabled(false);
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] disabled count=1/Unlimited"));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-dry-run] plan ready")));
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+
+        app.set_friendly_vs_live_input_enabled(true);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] enabled count=1/Unlimited"));
+
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 6, 2);
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(app.friendly_vs_live.executed_placements, 2);
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs-live] placement executed count=2/Unlimited"
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_live_flag_is_ignored_outside_friendly_mode() {
         for (name, mode) in [
             ("friendly-vs-live-ignored-solo", RuntimeMode::Solo),
@@ -6494,6 +6824,7 @@ mod tests {
             let mut app = LauncherApp::new(paths.clone());
             app.state.selected_mode = mode;
             app.state.friendly_vs_live_input_enabled = true;
+            app.state.friendly_vs_live_limit = FriendlyVsLiveLimit::Unlimited;
             app.bot_desired_enabled = true;
             app.bot_status = BotStatus::On;
             app.browser_status = BrowserStatus::Ready;
@@ -6609,6 +6940,90 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_unlimited_duplicate_same_piece_dispatches_once() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+            "friendly-vs-live-unlimited-duplicate-piece",
+            true,
+            FriendlyVsLiveLimit::Unlimited,
+        );
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_unlimited_stale_then_fresher_piece_progresses_normally() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+            "friendly-vs-live-unlimited-stale-then-fresh",
+            true,
+            FriendlyVsLiveLimit::Unlimited,
+        );
+        let planned = friendly_vs_ready_snapshot_value(
+            &round_id,
+            "7001",
+            "cand-local",
+            7,
+            4,
+            json!("friendly-user"),
+            "J",
+            None,
+            &["O", "T", "L", "S", "Z"],
+        );
+        write_friendly_vs_passive_snapshot_value(&paths, &planned);
+        let mut refreshed = planned.clone();
+        refreshed["snapshot"]["current"]["type"] = json!("T");
+        refreshed["snapshot"]["queue"] = json!(["I", "O", "L", "S", "Z"]);
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+        }));
+
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(app.friendly_vs_live.executed_placements, 0);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line == "[friendly-vs-live] placement executed count=1/Unlimited"
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_live_piece_counter_change_suppresses_input() {
         let (paths, mut app, round_id) =
             setup_friendly_vs_live_app("friendly-vs-live-stale-piece-counter");
@@ -6697,6 +7112,74 @@ mod tests {
             ),
         ] {
             let (paths, mut app, round_id) = setup_friendly_vs_live_app(name);
+            let planned = friendly_vs_ready_snapshot_value(
+                &round_id,
+                "7001",
+                "cand-local",
+                7,
+                4,
+                json!("friendly-user"),
+                "J",
+                None,
+                &["O", "T", "L", "S", "Z"],
+            );
+            write_friendly_vs_passive_snapshot_value(&paths, &planned);
+            let mut refreshed = planned.clone();
+            match mutate {
+                "round" => refreshed["snapshot"]["round_id"] = json!("7999:1744077999"),
+                "gameid" => {
+                    refreshed["snapshot"]["gameid"] = json!("7999");
+                    refreshed["snapshot"]["candidate_id"] = json!("cand-opponent");
+                }
+                "generation" => refreshed["snapshot"]["capture_generation"] = json!(8),
+                _ => unreachable!(),
+            }
+            app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+                write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+            }));
+
+            app.poll_friendly_vs_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(app.logs.iter().any(|line| {
+                line.contains(&format!(
+                    "[friendly-vs-live] input suppressed reason={expected_reason}"
+                ))
+            }));
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_unlimited_round_gameid_and_generation_mismatches_suppress_input() {
+        for (name, mutate, expected_reason) in [
+            (
+                "friendly-vs-live-unlimited-round-mismatch",
+                "round",
+                "round_mismatch",
+            ),
+            (
+                "friendly-vs-live-unlimited-gameid-mismatch",
+                "gameid",
+                "gameid_mismatch",
+            ),
+            (
+                "friendly-vs-live-unlimited-generation-mismatch",
+                "generation",
+                "generation_mismatch",
+            ),
+        ] {
+            let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+                name,
+                true,
+                FriendlyVsLiveLimit::Unlimited,
+            );
             let planned = friendly_vs_ready_snapshot_value(
                 &round_id,
                 "7001",

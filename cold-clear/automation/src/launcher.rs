@@ -34,7 +34,7 @@ use crate::scanner::{
 use crate::vs_sim::{read_vs_bridge_observation, vs_bridge_path_for_snapshot};
 
 const FRIENDLY_VS_DRY_RUN_SKIP_LOG_COOLDOWN: Duration = Duration::from_secs(2);
-const FRIENDLY_VS_LIVE_MAX_PLACEMENTS: u32 = 5;
+const FRIENDLY_VS_LIVE_MAX_PLACEMENTS: u32 = 20;
 
 const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Play Style",
@@ -4661,6 +4661,54 @@ mod tests {
         setup_friendly_vs_live_app_with_enabled(test_name, true)
     }
 
+    fn poll_friendly_vs_live_test_piece(
+        app: &mut LauncherApp,
+        paths: &AppPaths,
+        round_id: &str,
+        piece_counter: u32,
+        sequence_index: usize,
+    ) {
+        let patterns = [
+            ("J", ["O", "T", "L", "S", "Z"]),
+            ("T", ["I", "O", "L", "S", "Z"]),
+            ("L", ["I", "O", "T", "S", "Z"]),
+            ("S", ["I", "O", "T", "L", "Z"]),
+            ("Z", ["I", "O", "T", "L", "S"]),
+            ("I", ["O", "T", "L", "S", "Z"]),
+        ];
+        let (current_piece, queue) = patterns[sequence_index % patterns.len()];
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            paths,
+            round_id,
+            "7001",
+            "cand-local",
+            piece_counter,
+            json!("friendly-user"),
+            current_piece,
+            &queue,
+        );
+        app.poll_friendly_vs_dry_run();
+    }
+
+    fn poll_friendly_vs_live_test_sequence(
+        app: &mut LauncherApp,
+        paths: &AppPaths,
+        round_id: &str,
+        first_piece_counter: u32,
+        piece_count: u32,
+    ) {
+        for offset in 0..piece_count {
+            poll_friendly_vs_live_test_piece(
+                app,
+                paths,
+                round_id,
+                first_piece_counter + offset,
+                offset as usize,
+            );
+        }
+    }
+
     fn tapped_actions(app: &LauncherApp) -> Vec<GameAction> {
         app.zenith_live_test_hook
             .tapped_actions
@@ -5212,6 +5260,21 @@ mod tests {
         let paths = test_paths("friendly-vs-live-default-false");
         let app = LauncherApp::new(paths.clone());
         assert!(!app.state.friendly_vs_live_input_enabled);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_status_label_shows_n_of_twenty() {
+        let paths = test_paths("friendly-vs-live-status-label");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.friendly_vs_live_input_enabled = true;
+        app.friendly_vs_live.executed_placements = 7;
+
+        assert_eq!(
+            app.friendly_vs_live_status_label(),
+            "Friendly VS: Live (7/20)"
+        );
+
         cleanup_test_paths(&paths);
     }
 
@@ -6211,30 +6274,16 @@ mod tests {
     }
 
     #[test]
-    fn friendly_vs_live_dispatches_five_times_then_locks_same_round() {
-        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-five");
-
-        for (piece_counter, current_piece, queue) in [
-            (4, "J", vec!["O", "T", "L", "S", "Z"]),
-            (5, "T", vec!["I", "O", "L", "S", "Z"]),
-            (6, "L", vec!["I", "O", "T", "S", "Z"]),
-            (7, "S", vec!["I", "O", "T", "L", "Z"]),
-            (8, "Z", vec!["I", "O", "T", "L", "S"]),
-            (9, "I", vec!["O", "T", "L", "S", "Z"]),
-        ] {
-            std::thread::sleep(Duration::from_millis(20));
-            write_friendly_vs_passive_snapshot(
-                &paths,
-                &round_id,
-                "7001",
-                "cand-local",
-                piece_counter,
-                json!("friendly-user"),
-                current_piece,
-                &queue,
-            );
-            app.poll_friendly_vs_dry_run();
-        }
+    fn friendly_vs_live_dispatches_twenty_times_then_locks_same_round() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-twenty");
+        app.logs.clear();
+        poll_friendly_vs_live_test_sequence(
+            &mut app,
+            &paths,
+            &round_id,
+            4,
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS + 1,
+        );
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -6254,14 +6303,17 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("[friendly-vs-live] input dispatch actions=")));
-        for count in 1..=FRIENDLY_VS_LIVE_MAX_PLACEMENTS {
-            assert!(app.logs.iter().any(|line| {
-                line == &format!(
-                    "[friendly-vs-live] placement executed count={count}/{}",
-                    FRIENDLY_VS_LIVE_MAX_PLACEMENTS
-                )
-            }));
-        }
+        assert_eq!(
+            app.friendly_vs_live.executed_placements,
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        );
+        assert!(app.logs.iter().any(|line| {
+            line == &format!(
+                "[friendly-vs-live] placement executed count={}/{}",
+                FRIENDLY_VS_LIVE_MAX_PLACEMENTS,
+                FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+            )
+        }));
         assert!(app
             .logs
             .iter()
@@ -6310,7 +6362,7 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| line == "[friendly-vs-live] enabled count=0/5"));
+            .any(|line| line == &format!("[friendly-vs-live] enabled count=0/20")));
         assert!(!app.logs[log_count_before_toggle..].iter().any(|line| {
             line.contains("[friendly-vs] observer armed")
                 || line.contains("[friendly-vs] identity ready")
@@ -6323,18 +6375,7 @@ mod tests {
             0
         );
 
-        std::thread::sleep(Duration::from_millis(20));
-        write_friendly_vs_passive_snapshot(
-            &paths,
-            &round_id,
-            "7001",
-            "cand-local",
-            5,
-            json!("friendly-user"),
-            "T",
-            &["I", "O", "L", "S", "Z"],
-        );
-        app.poll_friendly_vs_dry_run();
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -6345,7 +6386,13 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| { line == "[friendly-vs-live] placement executed count=1/5" }));
+            .any(|line| {
+                line
+                    == &format!(
+                        "[friendly-vs-live] placement executed count=1/{}",
+                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    )
+            }));
 
         cleanup_test_paths(&paths);
     }
@@ -6390,7 +6437,13 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| line == "[friendly-vs-live] disabled count=1/5"));
+            .any(|line| {
+                line
+                    == &format!(
+                        "[friendly-vs-live] disabled count=1/{}",
+                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    )
+            }));
         assert!(app
             .logs
             .iter()
@@ -6401,20 +6454,15 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| line == "[friendly-vs-live] enabled count=1/5"));
+            .any(|line| {
+                line
+                    == &format!(
+                        "[friendly-vs-live] enabled count=1/{}",
+                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    )
+            }));
 
-        std::thread::sleep(Duration::from_millis(20));
-        write_friendly_vs_passive_snapshot(
-            &paths,
-            &round_id,
-            "7001",
-            "cand-local",
-            6,
-            json!("friendly-user"),
-            "L",
-            &["I", "O", "T", "S", "Z"],
-        );
-        app.poll_friendly_vs_dry_run();
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 6, 2);
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -6425,7 +6473,13 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| { line == "[friendly-vs-live] placement executed count=2/5" }));
+            .any(|line| {
+                line
+                    == &format!(
+                        "[friendly-vs-live] placement executed count=2/{}",
+                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    )
+            }));
 
         cleanup_test_paths(&paths);
     }
@@ -6507,6 +6561,49 @@ mod tests {
         assert!(app.logs.iter().any(|line| {
             line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
         }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_stale_then_fresher_piece_progresses_normally() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-stale-then-fresh");
+        let planned = friendly_vs_ready_snapshot_value(
+            &round_id,
+            "7001",
+            "cand-local",
+            7,
+            4,
+            json!("friendly-user"),
+            "J",
+            None,
+            &["O", "T", "L", "S", "Z"],
+        );
+        write_friendly_vs_passive_snapshot_value(&paths, &planned);
+        let mut refreshed = planned.clone();
+        refreshed["snapshot"]["current"]["type"] = json!("T");
+        refreshed["snapshot"]["queue"] = json!(["I", "O", "L", "S", "Z"]);
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+        }));
+
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(app.friendly_vs_live.executed_placements, 0);
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+        }));
+
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -6699,43 +6796,25 @@ mod tests {
     fn friendly_vs_live_bot_off_then_on_same_round_does_not_bypass_cap() {
         let (paths, mut app, round_id) =
             setup_friendly_vs_live_app("friendly-vs-live-cap-persists");
-
-        for (piece_counter, current_piece, queue) in [
-            (4, "J", vec!["O", "T", "L", "S", "Z"]),
-            (5, "T", vec!["I", "O", "L", "S", "Z"]),
-            (6, "L", vec!["I", "O", "T", "S", "Z"]),
-            (7, "S", vec!["I", "O", "T", "L", "Z"]),
-            (8, "Z", vec!["I", "O", "T", "L", "S"]),
-        ] {
-            std::thread::sleep(Duration::from_millis(20));
-            write_friendly_vs_passive_snapshot(
-                &paths,
-                &round_id,
-                "7001",
-                "cand-local",
-                piece_counter,
-                json!("friendly-user"),
-                current_piece,
-                &queue,
-            );
-            app.poll_friendly_vs_dry_run();
-        }
+        poll_friendly_vs_live_test_sequence(
+            &mut app,
+            &paths,
+            &round_id,
+            4,
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS,
+        );
         app.stop_bot_with_browser_hint(false);
 
         app.start_bot();
         app.logs.clear();
         arm_friendly_vs_round(&mut app, &paths, &round_id, 7001);
-        write_friendly_vs_passive_snapshot(
+        poll_friendly_vs_live_test_piece(
+            &mut app,
             &paths,
             &round_id,
-            "7001",
-            "cand-local",
-            5,
-            json!("friendly-user"),
-            "T",
-            &["I", "O", "L", "S", "Z"],
+            4 + FRIENDLY_VS_LIVE_MAX_PLACEMENTS,
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS as usize,
         );
-        app.poll_friendly_vs_dry_run();
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -6755,29 +6834,18 @@ mod tests {
         let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-reread-each");
         let reread_count = Arc::new(AtomicU32::new(0));
 
-        for (piece_counter, current_piece, queue) in [
-            (4, "J", vec!["O", "T", "L", "S", "Z"]),
-            (5, "T", vec!["I", "O", "L", "S", "Z"]),
-            (6, "L", vec!["I", "O", "T", "S", "Z"]),
-            (7, "S", vec!["I", "O", "T", "L", "Z"]),
-            (8, "Z", vec!["I", "O", "T", "L", "S"]),
-        ] {
+        for offset in 0..FRIENDLY_VS_LIVE_MAX_PLACEMENTS {
             let reread_count = reread_count.clone();
             app.friendly_vs_live_before_reread = Some(Box::new(move |_| {
                 reread_count.fetch_add(1, Ordering::Relaxed);
             }));
-            std::thread::sleep(Duration::from_millis(20));
-            write_friendly_vs_passive_snapshot(
+            poll_friendly_vs_live_test_piece(
+                &mut app,
                 &paths,
                 &round_id,
-                "7001",
-                "cand-local",
-                piece_counter,
-                json!("friendly-user"),
-                current_piece,
-                &queue,
+                4 + offset,
+                offset as usize,
             );
-            app.poll_friendly_vs_dry_run();
         }
 
         assert_eq!(
@@ -6836,6 +6904,67 @@ mod tests {
         assert_eq!(
             tapped_actions(&app),
             vec![GameAction::Hold, GameAction::Left, GameAction::HardDrop]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_rotation_route_uses_existing_executor_sequence() {
+        let paths = test_paths("friendly-vs-live-rotation-sequence");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        clear_tapped_actions(&app);
+        let config = app.state.to_automation_config(&app.paths);
+        let prepared = PreparedSnapshotExecution {
+            summary: DryRunPlanSummary {
+                token: "friendly-rotation".to_owned(),
+                piece: PieceToken::T,
+                hold_piece: None,
+                use_hold: false,
+                target_x: 7,
+                target_rotation: RotationToken::East,
+                movement_mode_used: MovementModeConfig::ZeroGSafe,
+                fallback_from: None,
+                fallback_reason: None,
+                action_count: 4,
+                actions: vec![
+                    GameAction::RotateCw,
+                    GameAction::Right,
+                    GameAction::Right,
+                    GameAction::HardDrop,
+                ],
+                route_kind: "test".to_owned(),
+                planner: "test".to_owned(),
+            },
+            execution_plan: ExecutionPlan {
+                hold: false,
+                movement_actions: vec![
+                    GameAction::RotateCw,
+                    GameAction::Right,
+                    GameAction::Right,
+                ],
+                hard_drop: true,
+            },
+        };
+
+        app.execute_friendly_vs_live_plan(&config, &prepared)
+            .unwrap();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            tapped_actions(&app),
+            vec![
+                GameAction::RotateCw,
+                GameAction::Right,
+                GameAction::Right,
+                GameAction::HardDrop,
+            ]
         );
 
         cleanup_test_paths(&paths);

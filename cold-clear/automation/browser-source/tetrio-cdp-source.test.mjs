@@ -5,6 +5,7 @@ import {
   writeFileSync,
   existsSync,
   readFileSync,
+  renameSync,
   rmSync
 } from "node:fs";
 import os from "node:os";
@@ -54,6 +55,7 @@ import {
   isBootstrapReadyForClosureCapture,
   isClosureCaptureArmed,
   isGameplayExpectedForClosureCapture,
+  isTransientSnapshotPublishError,
   isZenithGameplayOptions,
   isTransientRuntimeError,
   isVsWsSimEnvEnabled,
@@ -108,7 +110,8 @@ import {
   startNextGameReacquire,
   tetrioStateExpression,
   updateQuickPlayPendingIdentity,
-  updateBootstrapDocumentState
+  updateBootstrapDocumentState,
+  writeSnapshot
 } from "./tetrio-cdp-source.mjs";
 
 test("connect-only snapshot helper never claims Chromium ownership", () => {
@@ -8164,6 +8167,8 @@ test("resetSnapshotTracking clears stable signature state", () => {
   tracking.pendingPieceKey = "1:0";
   tracking.pendingPieceDetectedAt = 123;
   tracking.lastPerfLoggedPieceKey = "1:0";
+  tracking.lastPublishDeferredSignature = "rename_busy:EPERM";
+  tracking.lastPublishDeferredAt = 456;
 
   resetSnapshotTracking(tracking);
 
@@ -8174,7 +8179,9 @@ test("resetSnapshotTracking clears stable signature state", () => {
     lastLoggedToken: "",
     pendingPieceKey: "",
     pendingPieceDetectedAt: 0,
-    lastPerfLoggedPieceKey: ""
+    lastPerfLoggedPieceKey: "",
+    lastPublishDeferredSignature: "",
+    lastPublishDeferredAt: 0
   });
 });
 
@@ -13232,10 +13239,118 @@ test("writeSnapshot replaces snapshot atomically without deleting the live file 
   );
   assert.match(
     source,
-    /function writeSnapshot\(snapshotPath, payload\) \{[\s\S]*writeFileSync\(temporaryPath, JSON\.stringify\(payload, null, 2\)\);[\s\S]*renameSync\(temporaryPath, snapshotPath\);[\s\S]*\}/
+    /export function writeSnapshot\([\s\S]*writeFile\(temporaryPath, JSON\.stringify\(payload, null, 2\)\);[\s\S]*rename\(temporaryPath, snapshotPath\);[\s\S]*\}/
   );
   assert.doesNotMatch(
     source,
-    /function writeSnapshot\(snapshotPath, payload\) \{[\s\S]*rmSync\(snapshotPath, \{ force: true \}\);[\s\S]*renameSync\(temporaryPath, snapshotPath\);[\s\S]*\}/
+    /export function writeSnapshot\([\s\S]*rmSync\(snapshotPath, \{ force: true \}\);[\s\S]*rename\(temporaryPath, snapshotPath\);[\s\S]*\}/
   );
+});
+
+test("transient snapshot publish errors are retried by code", () => {
+  assert.equal(isTransientSnapshotPublishError({ code: "EPERM" }), true);
+  assert.equal(isTransientSnapshotPublishError({ code: "EBUSY" }), true);
+  assert.equal(isTransientSnapshotPublishError({ code: "EACCES" }), true);
+  assert.equal(isTransientSnapshotPublishError({ code: "ENOENT" }), false);
+});
+
+test("writeSnapshot retries a transient rename failure and eventually publishes", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "snapshot-publish-retry-"));
+  const snapshotPath = path.join(dir, "friendly-vs-passive-snapshot.json");
+  let renameAttempts = 0;
+  const publishResult = writeSnapshot(snapshotPath, { status: "ready", gameid: 4990 }, {
+    retryDelaysMs: [0, 0, 0],
+    rename(temporaryPath, destinationPath) {
+      renameAttempts += 1;
+      if (renameAttempts === 1) {
+        const error = new Error("file is locked");
+        error.code = "EPERM";
+        throw error;
+      }
+      renameSync(temporaryPath, destinationPath);
+    }
+  });
+  assert.equal(publishResult.published, true);
+  assert.equal(renameAttempts, 2);
+  assert.deepEqual(JSON.parse(readFileSync(snapshotPath, "utf8")), {
+    status: "ready",
+    gameid: 4990
+  });
+  assert.equal(existsSync(`${snapshotPath}.tmp`), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("writeSnapshot keeps the old live snapshot when transient rename retries are exhausted", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "snapshot-publish-deferred-"));
+  const snapshotPath = path.join(dir, "friendly-vs-passive-snapshot.json");
+  writeFileSync(snapshotPath, JSON.stringify({ status: "ready", gameid: 4888 }, null, 2));
+  let cleanupAttempts = 0;
+  const publishResult = writeSnapshot(snapshotPath, { status: "ready", gameid: 4990 }, {
+    retryDelaysMs: [0, 0, 0],
+    rename() {
+      const error = new Error("destination busy");
+      error.code = "EPERM";
+      throw error;
+    },
+    cleanupTemp(temporaryPath) {
+      cleanupAttempts += 1;
+      rmSync(temporaryPath, { force: true });
+    }
+  });
+  assert.deepEqual(publishResult, {
+    published: false,
+    deferred: true,
+    reason: "rename_busy",
+    code: "EPERM",
+    attempts: 4,
+    temporaryPath: `${snapshotPath}.tmp`
+  });
+  assert.equal(cleanupAttempts, 1);
+  assert.deepEqual(JSON.parse(readFileSync(snapshotPath, "utf8")), {
+    status: "ready",
+    gameid: 4888
+  });
+  assert.equal(existsSync(`${snapshotPath}.tmp`), false);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("writeSnapshot cleanup failure after transient rename exhaustion is non-fatal", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "snapshot-publish-cleanup-"));
+  const snapshotPath = path.join(dir, "friendly-vs-passive-snapshot.json");
+  writeFileSync(snapshotPath, JSON.stringify({ status: "ready", gameid: 4888 }, null, 2));
+  const publishResult = writeSnapshot(snapshotPath, { status: "ready", gameid: 4990 }, {
+    retryDelaysMs: [],
+    rename() {
+      const error = new Error("destination busy");
+      error.code = "EACCES";
+      throw error;
+    },
+    cleanupTemp() {
+      throw new Error("cleanup failed");
+    }
+  });
+  assert.equal(publishResult.published, false);
+  assert.equal(publishResult.deferred, true);
+  assert.deepEqual(JSON.parse(readFileSync(snapshotPath, "utf8")), {
+    status: "ready",
+    gameid: 4888
+  });
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("writeSnapshot preserves non-transient rename failures", () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "snapshot-publish-nontransient-"));
+  const snapshotPath = path.join(dir, "friendly-vs-passive-snapshot.json");
+  assert.throws(
+    () =>
+      writeSnapshot(snapshotPath, { status: "ready" }, {
+        rename() {
+          const error = new Error("missing target");
+          error.code = "ENOENT";
+          throw error;
+        }
+      }),
+    /missing target/
+  );
+  rmSync(dir, { recursive: true, force: true });
 });

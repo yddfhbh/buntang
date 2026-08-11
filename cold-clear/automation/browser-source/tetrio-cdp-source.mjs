@@ -68,6 +68,9 @@ const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS = 150;
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS = [80, 160, 280, 450, 700, 1000];
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_JITTER_MS = 30;
 const DEFAULT_ZENITH_STARTUP_CLOSURE_BURST_DELAYS_MS = [50, 75, 100, 125, 150, 200];
+const SNAPSHOT_PUBLISH_RETRY_DELAYS_MS = [15, 35, 60];
+const SNAPSHOT_PUBLISH_DEFER_LOG_INTERVAL_MS = 2500;
+const TRANSIENT_SNAPSHOT_PUBLISH_ERROR_CODES = new Set(["EPERM", "EBUSY", "EACCES"]);
 const DEFAULT_QUICK_PLAY_REPORT_PATH = path.join(
   "automation",
   "quick-play-runtime-report.json"
@@ -120,7 +123,9 @@ export function createSnapshotTracking() {
     lastLoggedToken: "",
     pendingPieceKey: "",
     pendingPieceDetectedAt: 0,
-    lastPerfLoggedPieceKey: ""
+    lastPerfLoggedPieceKey: "",
+    lastPublishDeferredSignature: "",
+    lastPublishDeferredAt: 0
   };
 }
 
@@ -132,6 +137,8 @@ export function resetSnapshotTracking(tracking) {
   tracking.pendingPieceKey = "";
   tracking.pendingPieceDetectedAt = 0;
   tracking.lastPerfLoggedPieceKey = "";
+  tracking.lastPublishDeferredSignature = "";
+  tracking.lastPublishDeferredAt = 0;
   return tracking;
 }
 
@@ -1393,6 +1400,8 @@ export function createQuickPlayDiagnosticState() {
     lastPassiveSnapshotError: null,
     lastPassiveSnapshotLogSignature: "",
     lastPassiveSnapshotLogAt: 0,
+    lastPassiveSnapshotPublishDeferredSignature: "",
+    lastPassiveSnapshotPublishDeferredAt: 0,
     lastPassiveRootProbeSignature: "",
     lastPassiveSnapshotFailureLogReason: "",
     friendlyVsBindFailureCount: 0,
@@ -4562,7 +4571,15 @@ function writeQuickPlayPassiveSnapshotState(
   if (!filePath) {
     return false;
   }
-  writeSnapshot(filePath, payload);
+  const publishResult = writeSnapshot(filePath, payload);
+  if (publishResult.published) {
+    if (quickPlayDiagnosticState) {
+      quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredSignature = "";
+      quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredAt = 0;
+    }
+  } else {
+    maybeLogPassiveSnapshotPublishDeferred(quickPlayDiagnosticState, publishResult);
+  }
   return true;
 }
 
@@ -4700,6 +4717,8 @@ export function startFriendlyVsPassiveCapture(
   friendlyVsPassiveCaptureState.lastPassiveSnapshotError = null;
   friendlyVsPassiveCaptureState.lastPassiveSnapshotLogSignature = "";
   friendlyVsPassiveCaptureState.lastPassiveSnapshotLogAt = 0;
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotPublishDeferredSignature = "";
+  friendlyVsPassiveCaptureState.lastPassiveSnapshotPublishDeferredAt = 0;
   friendlyVsPassiveCaptureState.lastPassiveRootProbeSignature = "";
   friendlyVsPassiveCaptureState.lastPassiveSnapshotFailureLogReason = "";
   friendlyVsPassiveCaptureState.friendlyVsBindFailureCount = 0;
@@ -11803,6 +11822,13 @@ export function isTransientRuntimeError(error) {
   );
 }
 
+export function isTransientSnapshotPublishError(error) {
+  const code = String(error?.code ?? "")
+    .trim()
+    .toUpperCase();
+  return TRANSIENT_SNAPSHOT_PUBLISH_ERROR_CODES.has(code);
+}
+
 function maybeLogTransientRuntimeError(error, transientState, log = console.log) {
   const message = String(error?.message ?? error ?? "");
   if (!transientState || transientState.lastRuntimeError === message) {
@@ -11810,6 +11836,85 @@ function maybeLogTransientRuntimeError(error, transientState, log = console.log)
   }
   transientState.lastRuntimeError = message;
   log(`[browser] transient Runtime.evaluate failure: ${message}; retrying`);
+}
+
+function sleepSyncMs(ms) {
+  const durationMs = Math.max(0, Math.round(Number(ms ?? 0)));
+  if (durationMs <= 0) {
+    return;
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
+}
+
+function passiveSnapshotLogPrefix(quickPlayDiagnosticState) {
+  if (
+    String(quickPlayDiagnosticState?.passiveSnapshotPath ?? "").trim() ===
+    DEFAULT_FRIENDLY_VS_PASSIVE_SNAPSHOT_PATH
+  ) {
+    return "[friendly-vs-capture]";
+  }
+  return "[quick-play]";
+}
+
+function maybeLogPassiveSnapshotPublishDeferred(
+  quickPlayDiagnosticState,
+  publishResult,
+  { now = Date.now(), log = console.log } = {}
+) {
+  if (
+    typeof log !== "function" ||
+    !quickPlayDiagnosticState ||
+    publishResult?.published !== false ||
+    publishResult?.deferred !== true
+  ) {
+    return false;
+  }
+  const signature = `${publishResult.reason ?? "publish_deferred"}:${publishResult.code ?? ""}`;
+  const currentNow = Math.max(0, Number(now ?? Date.now()));
+  if (
+    quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredSignature === signature &&
+    currentNow -
+      Math.max(0, Number(quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredAt ?? 0)) <
+      SNAPSHOT_PUBLISH_DEFER_LOG_INTERVAL_MS
+  ) {
+    return false;
+  }
+  quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredSignature = signature;
+  quickPlayDiagnosticState.lastPassiveSnapshotPublishDeferredAt = currentNow;
+  log(
+    `${passiveSnapshotLogPrefix(quickPlayDiagnosticState)} snapshot publish deferred reason=${publishResult.reason} code=${publishResult.code} attempts=${publishResult.attempts}`
+  );
+  return true;
+}
+
+function maybeLogSnapshotPublishDeferred(
+  snapshotTracking,
+  publishResult,
+  { now = Date.now(), log = console.log } = {}
+) {
+  if (
+    typeof log !== "function" ||
+    !snapshotTracking ||
+    publishResult?.published !== false ||
+    publishResult?.deferred !== true
+  ) {
+    return false;
+  }
+  const signature = `${publishResult.reason ?? "publish_deferred"}:${publishResult.code ?? ""}`;
+  const currentNow = Math.max(0, Number(now ?? Date.now()));
+  if (
+    snapshotTracking.lastPublishDeferredSignature === signature &&
+    currentNow - Math.max(0, Number(snapshotTracking.lastPublishDeferredAt ?? 0)) <
+      SNAPSHOT_PUBLISH_DEFER_LOG_INTERVAL_MS
+  ) {
+    return false;
+  }
+  snapshotTracking.lastPublishDeferredSignature = signature;
+  snapshotTracking.lastPublishDeferredAt = currentNow;
+  log(
+    `[browser] snapshot publish deferred reason=${publishResult.reason} code=${publishResult.code} attempts=${publishResult.attempts}`
+  );
+  return true;
 }
 
 export function shouldLogStateReason({
@@ -12693,8 +12798,14 @@ async function main() {
       };
 
       if (signature !== snapshotTracking.lastWrittenSignature) {
-        writeSnapshot(snapshotPath, snapshot);
+        const publishResult = writeSnapshot(snapshotPath, snapshot);
+        if (!publishResult.published) {
+          maybeLogSnapshotPublishDeferred(snapshotTracking, publishResult);
+          continue;
+        }
         snapshotTracking.lastWrittenSignature = signature;
+        snapshotTracking.lastPublishDeferredSignature = "";
+        snapshotTracking.lastPublishDeferredAt = 0;
         if (
           pieceKey === snapshotTracking.pendingPieceKey &&
           pieceKey !== snapshotTracking.lastPerfLoggedPieceKey
@@ -15535,12 +15646,53 @@ export function tetrioStateExpression() {
   })()`;
 }
 
-function writeSnapshot(snapshotPath, payload) {
+export function writeSnapshot(
+  snapshotPath,
+  payload,
+  {
+    retryDelaysMs = SNAPSHOT_PUBLISH_RETRY_DELAYS_MS,
+    writeFile = writeFileSync,
+    rename = renameSync,
+    cleanupTemp = temporaryPath => rmSync(temporaryPath, { force: true }),
+    sleepSync = sleepSyncMs
+  } = {}
+) {
   const directory = path.dirname(snapshotPath);
   mkdirSync(directory, { recursive: true });
   const temporaryPath = `${snapshotPath}.tmp`;
-  writeFileSync(temporaryPath, JSON.stringify(payload, null, 2));
-  renameSync(temporaryPath, snapshotPath);
+  writeFile(temporaryPath, JSON.stringify(payload, null, 2));
+  let attempts = 1;
+  for (;;) {
+    try {
+      rename(temporaryPath, snapshotPath);
+      return {
+        published: true,
+        deferred: false,
+        attempts,
+        temporaryPath
+      };
+    } catch (error) {
+      if (!isTransientSnapshotPublishError(error)) {
+        throw error;
+      }
+      const delayMs = retryDelaysMs[attempts - 1];
+      if (!Number.isFinite(Number(delayMs))) {
+        try {
+          cleanupTemp(temporaryPath);
+        } catch {}
+        return {
+          published: false,
+          deferred: true,
+          reason: "rename_busy",
+          code: String(error?.code ?? "").trim().toUpperCase() || "UNKNOWN",
+          attempts,
+          temporaryPath
+        };
+      }
+      sleepSync(Number(delayMs));
+      attempts += 1;
+    }
+  }
 }
 
 function sleep(ms) {

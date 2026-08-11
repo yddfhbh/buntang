@@ -28,12 +28,13 @@ use crate::runner::{
 use crate::runtime::run_automation_with_resources_and_live_pps;
 use crate::scanner::{
     read_friendly_vs_passive_snapshot_file_with_age, read_snapshot_file,
-    read_zenith_passive_snapshot_file_with_age, FriendlyVsPassivePlannerSnapshot,
-    JsonFileScanner, ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
+    read_zenith_passive_snapshot_file_with_age, FriendlyVsPassivePlannerSnapshot, JsonFileScanner,
+    ZenithPassivePlannerSnapshot, MAX_SNAPSHOT_AGE_MS,
 };
 use crate::vs_sim::{read_vs_bridge_observation, vs_bridge_path_for_snapshot};
 
 const FRIENDLY_VS_DRY_RUN_SKIP_LOG_COOLDOWN: Duration = Duration::from_secs(2);
+const FRIENDLY_VS_LIVE_MAX_PLACEMENTS: u32 = 5;
 
 const BOT_UI_VISIBLE_LABELS: &[&str] = &[
     "Play Style",
@@ -284,6 +285,7 @@ struct LauncherState {
     python_command: String,
     browser: BrowserCdpConfig,
     always_on_top: bool,
+    friendly_vs_live_input_enabled: bool,
     zenith_live_input_enabled: bool,
     zenith_live_max_pieces: ZenithLivePieceLimit,
     dry_run: bool,
@@ -321,6 +323,7 @@ impl Default for LauncherState {
             python_command: "python".to_owned(),
             browser: BrowserCdpConfig::default(),
             always_on_top: false,
+            friendly_vs_live_input_enabled: false,
             zenith_live_input_enabled: false,
             zenith_live_max_pieces: ZenithLivePieceLimit::default(),
             dry_run: true,
@@ -1041,6 +1044,73 @@ impl FriendlyVsDryRunController {
 }
 
 #[derive(Clone, Debug, Default)]
+struct FriendlyVsLiveController {
+    session_round_id: Option<String>,
+    session_game_id: Option<String>,
+    session_capture_generation: Option<u64>,
+    executed_placements: u32,
+    limit_logged: bool,
+    last_skip_key: Option<String>,
+}
+
+impl FriendlyVsLiveController {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn sync_session(&mut self, round_id: &str, gameid: &str, capture_generation: u64) {
+        if self.session_round_id.as_deref() == Some(round_id)
+            && self.session_game_id.as_deref() == Some(gameid)
+            && self.session_capture_generation == Some(capture_generation)
+        {
+            return;
+        }
+        self.session_round_id = Some(round_id.to_owned());
+        self.session_game_id = Some(gameid.to_owned());
+        self.session_capture_generation = Some(capture_generation);
+        self.executed_placements = 0;
+        self.limit_logged = false;
+        self.last_skip_key = None;
+    }
+
+    fn limit_reached(&self) -> bool {
+        self.executed_placements >= FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+    }
+
+    fn clear_skip_reason(&mut self) {
+        self.last_skip_key = None;
+    }
+
+    fn note_skip(&mut self, key: &str, line: String) -> Option<String> {
+        if self.last_skip_key.as_deref() == Some(key) {
+            return None;
+        }
+        self.last_skip_key = Some(key.to_owned());
+        Some(line)
+    }
+
+    fn record_execution(&mut self) {
+        self.executed_placements = self.executed_placements.saturating_add(1);
+        self.clear_skip_reason();
+    }
+
+    fn note_limit_locked(&mut self) -> Option<String> {
+        if !self.limit_reached() || self.limit_logged {
+            return None;
+        }
+        self.limit_logged = true;
+        Some("[friendly-vs-live] input locked reason=placement_limit".to_owned())
+    }
+
+    fn count_label(&self) -> String {
+        format!(
+            "{}/{}",
+            self.executed_placements, FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct ZenithDryRunController {
     last_game_id: Option<String>,
     last_capture_generation: Option<u64>,
@@ -1449,6 +1519,8 @@ struct ZenithLiveTestHook {
     dispatch_count: Arc<AtomicU32>,
     release_count: Arc<AtomicU32>,
     started_at: Arc<Mutex<Vec<Instant>>>,
+    tapped_actions: Arc<Mutex<Vec<crate::driver::GameAction>>>,
+    fail_after_taps: Arc<AtomicU32>,
 }
 
 #[cfg(test)]
@@ -1458,7 +1530,22 @@ struct ZenithLiveTestBackend {
 
 #[cfg(test)]
 impl InputBackend for ZenithLiveTestBackend {
-    fn tap(&mut self, _action: crate::driver::GameAction, _duration: Duration) -> Result<()> {
+    fn tap(&mut self, action: crate::driver::GameAction, _duration: Duration) -> Result<()> {
+        if let Ok(mut actions) = self.hook.tapped_actions.lock() {
+            actions.push(action);
+        }
+        let fail_after = self.hook.fail_after_taps.load(Ordering::Relaxed);
+        if fail_after > 0 {
+            let tapped = self
+                .hook
+                .tapped_actions
+                .lock()
+                .map(|actions| actions.len() as u32)
+                .unwrap_or(0);
+            if tapped >= fail_after {
+                anyhow::bail!("test forced tap failure after {fail_after} actions");
+            }
+        }
         Ok(())
     }
 
@@ -1489,6 +1576,7 @@ pub struct LauncherApp {
     friendly_vs_capture_enabled: bool,
     friendly_vs: FriendlyVsObserver,
     friendly_vs_dry_run: FriendlyVsDryRunController,
+    friendly_vs_live: FriendlyVsLiveController,
     passive_provider: PassiveProviderController,
     zenith_dry_run: ZenithDryRunController,
     zenith_live: ZenithLiveController,
@@ -1496,6 +1584,8 @@ pub struct LauncherApp {
     zenith_live_test_hook: ZenithLiveTestHook,
     #[cfg(test)]
     test_now: Option<Instant>,
+    #[cfg(test)]
+    friendly_vs_live_before_reread: Option<Box<dyn FnOnce(&mut LauncherApp)>>,
 }
 
 impl LauncherApp {
@@ -1526,6 +1616,7 @@ impl LauncherApp {
             friendly_vs_capture_enabled: false,
             friendly_vs: FriendlyVsObserver::default(),
             friendly_vs_dry_run: FriendlyVsDryRunController::default(),
+            friendly_vs_live: FriendlyVsLiveController::default(),
             passive_provider: PassiveProviderController::default(),
             zenith_dry_run: ZenithDryRunController::default(),
             zenith_live: ZenithLiveController::default(),
@@ -1533,6 +1624,8 @@ impl LauncherApp {
             zenith_live_test_hook: ZenithLiveTestHook::default(),
             #[cfg(test)]
             test_now: None,
+            #[cfg(test)]
+            friendly_vs_live_before_reread: None,
         }
     }
 
@@ -1744,6 +1837,48 @@ impl LauncherApp {
         self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
     }
 
+    fn friendly_vs_live_input_allowed(&self) -> bool {
+        self.state.selected_mode == RuntimeMode::FriendlyVs
+            && self.state.friendly_vs_live_input_enabled
+    }
+
+    fn friendly_vs_live_count_label(&self) -> String {
+        self.friendly_vs_live.count_label()
+    }
+
+    fn friendly_vs_live_status_label(&self) -> String {
+        if self.state.friendly_vs_live_input_enabled {
+            format!(
+                "Friendly VS: Live ({})",
+                self.friendly_vs_live_count_label()
+            )
+        } else {
+            "Friendly VS: Dry Run".to_owned()
+        }
+    }
+
+    fn set_friendly_vs_live_input_enabled(&mut self, enabled: bool) {
+        if self.state.friendly_vs_live_input_enabled == enabled {
+            return;
+        }
+        self.state.friendly_vs_live_input_enabled = enabled;
+        self.save_state();
+
+        if self.state.selected_mode != RuntimeMode::FriendlyVs {
+            return;
+        }
+
+        let count = self.friendly_vs_live_count_label();
+        if enabled {
+            self.push_log(format!("[friendly-vs-live] enabled count={count}"));
+            if let Some(line) = self.friendly_vs_live.note_limit_locked() {
+                self.push_log(line);
+            }
+        } else {
+            self.push_log(format!("[friendly-vs-live] disabled count={count}"));
+        }
+    }
+
     fn zenith_live_limit_reached(&self) -> bool {
         self.zenith_live_piece_limit()
             .is_reached(self.zenith_live.executed_pieces)
@@ -1810,7 +1945,7 @@ impl LauncherApp {
         }
     }
 
-    fn execute_zenith_live_plan(
+    fn execute_live_plan_with_existing_executor(
         &mut self,
         config: &AutomationConfig,
         prepared: &PreparedSnapshotExecution,
@@ -1838,7 +1973,7 @@ impl LauncherApp {
             .browser_session
             .as_ref()
             .map(|session| session.input_backend.clone())
-            .context("browser input backend missing for zenith live execution")?;
+            .context("browser input backend missing for live execution")?;
         let mut backend = BrowserCdpInputBackend::from_shared(shared);
         execute_plan(
             &mut backend,
@@ -1847,6 +1982,22 @@ impl LauncherApp {
             timings,
             |line| self.push_log(line),
         )
+    }
+
+    fn execute_zenith_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        prepared: &PreparedSnapshotExecution,
+    ) -> Result<()> {
+        self.execute_live_plan_with_existing_executor(config, prepared)
+    }
+
+    fn execute_friendly_vs_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        prepared: &PreparedSnapshotExecution,
+    ) -> Result<()> {
+        self.execute_live_plan_with_existing_executor(config, prepared)
     }
 
     fn release_live_input_now(&mut self) -> Result<()> {
@@ -1865,6 +2016,244 @@ impl LauncherApp {
         match self.release_live_input_now() {
             Ok(()) => self.push_log("[input] released all keys"),
             Err(err) => self.push_log(format!("[input] failed to release all keys: {err:#}")),
+        }
+    }
+
+    fn suppress_friendly_vs_live_input(
+        &mut self,
+        reason: &str,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+    ) {
+        let skip_key = if reason == "placement_limit" {
+            format!(
+                "{reason}:{}:{}:{}",
+                snapshot.round_id, snapshot.gameid, snapshot.capture_generation
+            )
+        } else {
+            format!(
+                "{reason}:{}:{}:{}:{}",
+                snapshot.round_id,
+                snapshot.gameid,
+                snapshot.capture_generation,
+                piece_counter_label(snapshot.snapshot.piece_counter)
+            )
+        };
+        if let Some(line) = self.friendly_vs_live.note_skip(
+            &skip_key,
+            format!(
+                "[friendly-vs-live] input suppressed reason={reason} round_id={} gameid={} piece_counter={}",
+                snapshot.round_id,
+                snapshot.gameid,
+                piece_counter_label(snapshot.snapshot.piece_counter)
+            ),
+        ) {
+            self.push_log(line);
+        }
+    }
+
+    fn friendly_vs_live_reread_matches_plan(
+        &mut self,
+        path: &std::path::Path,
+        planned_snapshot: &FriendlyVsPassivePlannerSnapshot,
+        active_round_id: &str,
+        active_game_id: &str,
+    ) -> Result<Option<FriendlyVsPassivePlannerSnapshot>> {
+        let read_result = read_friendly_vs_passive_snapshot_file_with_age(path)?;
+        let Some((envelope, age)) = read_result else {
+            return Ok(None);
+        };
+        let Some(snapshot) = envelope.snapshot else {
+            return Ok(None);
+        };
+        if envelope.status != "ready" || envelope.capture_status.as_deref() != Some("running") {
+            return Ok(None);
+        }
+        if age
+            .map(|value| value.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        if snapshot.round_id != active_round_id
+            || snapshot.gameid != active_game_id
+            || snapshot.capture_generation != planned_snapshot.capture_generation
+            || !snapshot.playing
+            || !snapshot.started
+            || snapshot.countdown_started
+            || snapshot.paused == Some(true)
+            || snapshot.destroyed
+            || snapshot.successful
+            || snapshot.gameoverreason.is_some()
+        {
+            return Ok(Some(snapshot));
+        }
+        if snapshot.candidate_id != planned_snapshot.candidate_id
+            || snapshot.current_signature != planned_snapshot.current_signature
+            || snapshot.snapshot.piece_counter != planned_snapshot.snapshot.piece_counter
+        {
+            return Ok(Some(snapshot));
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn try_dispatch_friendly_vs_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        path: &std::path::Path,
+        planned_snapshot: &FriendlyVsPassivePlannerSnapshot,
+        prepared: &PreparedSnapshotExecution,
+    ) {
+        self.friendly_vs_live.sync_session(
+            &planned_snapshot.round_id,
+            &planned_snapshot.gameid,
+            planned_snapshot.capture_generation,
+        );
+        if !self.friendly_vs_live_input_allowed() {
+            return;
+        }
+        if self.friendly_vs_live.limit_reached() {
+            self.suppress_friendly_vs_live_input("placement_limit", planned_snapshot);
+            return;
+        }
+
+        self.push_log(format!(
+            "[friendly-vs-live] plan accepted round_id={} gameid={} generation={} piece_counter={} current={} use_hold={}",
+            planned_snapshot.round_id,
+            planned_snapshot.gameid,
+            planned_snapshot.capture_generation,
+            piece_counter_label(planned_snapshot.snapshot.piece_counter),
+            planned_snapshot
+                .snapshot
+                .queue
+                .first()
+                .copied()
+                .map(|piece| piece.label())
+                .unwrap_or("?"),
+            prepared.summary.use_hold
+        ));
+
+        #[cfg(test)]
+        if let Some(callback) = self.friendly_vs_live_before_reread.take() {
+            callback(self);
+        }
+
+        if self.state.selected_mode != RuntimeMode::FriendlyVs {
+            self.suppress_friendly_vs_live_input("mode_changed", planned_snapshot);
+            return;
+        }
+        if !self.bot_desired_enabled || self.bot_status != BotStatus::On {
+            self.suppress_friendly_vs_live_input("bot_off", planned_snapshot);
+            return;
+        }
+        if !self.friendly_vs_live_input_allowed()
+            || !self.friendly_vs_runtime_ready()
+            || !self.friendly_vs_capture_enabled
+        {
+            self.suppress_friendly_vs_live_input("stale_snapshot", planned_snapshot);
+            return;
+        }
+        let Some(active_round_id) = self.friendly_vs.active_round_id.as_deref() else {
+            self.suppress_friendly_vs_live_input("round_mismatch", planned_snapshot);
+            return;
+        };
+        let Some(active_game_id) = self.friendly_vs.resolved_game_id.as_deref() else {
+            self.suppress_friendly_vs_live_input("gameid_mismatch", planned_snapshot);
+            return;
+        };
+        let active_round_id = active_round_id.to_owned();
+        let active_game_id = active_game_id.to_owned();
+        if active_round_id != planned_snapshot.round_id {
+            self.suppress_friendly_vs_live_input("round_mismatch", planned_snapshot);
+            return;
+        }
+        if active_game_id != planned_snapshot.gameid {
+            self.suppress_friendly_vs_live_input("gameid_mismatch", planned_snapshot);
+            return;
+        }
+        if self.friendly_vs_live.limit_reached() {
+            self.suppress_friendly_vs_live_input("placement_limit", planned_snapshot);
+            return;
+        }
+
+        let fresh_snapshot = match self.friendly_vs_live_reread_matches_plan(
+            path,
+            planned_snapshot,
+            &active_round_id,
+            &active_game_id,
+        ) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.suppress_friendly_vs_live_input("stale_snapshot", planned_snapshot);
+                return;
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[friendly-vs-live] input suppressed reason=stale_snapshot error={err:#}"
+                ));
+                return;
+            }
+        };
+
+        if fresh_snapshot.round_id != active_round_id {
+            self.suppress_friendly_vs_live_input("round_mismatch", &fresh_snapshot);
+            return;
+        }
+        if fresh_snapshot.gameid != active_game_id {
+            self.suppress_friendly_vs_live_input("gameid_mismatch", &fresh_snapshot);
+            return;
+        }
+        if fresh_snapshot.capture_generation != planned_snapshot.capture_generation {
+            self.suppress_friendly_vs_live_input("generation_mismatch", &fresh_snapshot);
+            return;
+        }
+        if !fresh_snapshot.playing
+            || !fresh_snapshot.started
+            || fresh_snapshot.countdown_started
+            || fresh_snapshot.paused == Some(true)
+            || fresh_snapshot.destroyed
+            || fresh_snapshot.successful
+            || fresh_snapshot.gameoverreason.is_some()
+        {
+            self.suppress_friendly_vs_live_input("not_playing", &fresh_snapshot);
+            return;
+        }
+        if fresh_snapshot.candidate_id != planned_snapshot.candidate_id
+            || fresh_snapshot.current_signature != planned_snapshot.current_signature
+            || fresh_snapshot.snapshot.piece_counter != planned_snapshot.snapshot.piece_counter
+        {
+            self.suppress_friendly_vs_live_input("stale_snapshot", &fresh_snapshot);
+            return;
+        }
+
+        self.friendly_vs_live.clear_skip_reason();
+        self.push_log(format!(
+            "[friendly-vs-live] freshness confirmed round_id={} gameid={} generation={} piece_counter={}",
+            fresh_snapshot.round_id,
+            fresh_snapshot.gameid,
+            fresh_snapshot.capture_generation,
+            piece_counter_label(fresh_snapshot.snapshot.piece_counter)
+        ));
+        self.push_log(format!(
+            "[friendly-vs-live] input dispatch actions={:?}",
+            prepared.summary.actions
+        ));
+        match self.execute_friendly_vs_live_plan(config, prepared) {
+            Ok(()) => {
+                self.friendly_vs_live.record_execution();
+                self.push_log(format!(
+                    "[friendly-vs-live] placement executed count={}/{}",
+                    self.friendly_vs_live.executed_placements, FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                ));
+                if let Some(line) = self.friendly_vs_live.note_limit_locked() {
+                    self.push_log(line);
+                }
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[friendly-vs-live] dispatch error piece_counter={} error={err:#}",
+                    piece_counter_label(planned_snapshot.snapshot.piece_counter)
+                ));
+            }
         }
     }
 
@@ -2062,8 +2451,8 @@ impl LauncherApp {
                 "[browser] failed to forward selected mode to snapshot provider: {err:#}"
             ));
         }
-        if let Err(err) =
-            snapshot_provider.set_local_tetrio_username(self.local_tetrio_username_hint().as_deref())
+        if let Err(err) = snapshot_provider
+            .set_local_tetrio_username(self.local_tetrio_username_hint().as_deref())
         {
             self.push_log(format!(
                 "[browser] failed to forward local_tetrio_username to snapshot provider: {err:#}"
@@ -2190,6 +2579,16 @@ impl LauncherApp {
                 self.state.selected_mode.control_value(),
                 self.state.mode_generation
             ));
+            if self.state.selected_mode == RuntimeMode::FriendlyVs {
+                if self.state.friendly_vs_live_input_enabled {
+                    self.push_log(format!(
+                        "[friendly-vs-live] session armed max_placements={}",
+                        FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                    ));
+                } else {
+                    self.push_log("[friendly-vs-live] input disabled mode=dry_run".to_owned());
+                }
+            }
             if self.state.selected_mode == RuntimeMode::Zenith {
                 self.push_log("[zenith-dry-run] controller armed");
             }
@@ -2414,6 +2813,7 @@ impl LauncherApp {
         self.latest_snapshot_age_ms = None;
         self.passive_provider.reset();
         self.friendly_vs_dry_run.reset();
+        self.friendly_vs_live.reset();
         self.zenith_dry_run.reset();
         self.zenith_live.reset();
     }
@@ -2570,6 +2970,7 @@ impl LauncherApp {
         self.bot_restart_pending = false;
         self.passive_provider.reset();
         self.friendly_vs_dry_run.reset();
+        self.friendly_vs_live.reset();
         self.zenith_dry_run.reset();
         self.push_log("[launcher] browser closed");
     }
@@ -2720,12 +3121,33 @@ impl LauncherApp {
         }
     }
 
+    fn note_snapshot_provider_control_failure(&mut self, control_name: &str, err: &anyhow::Error) {
+        if self.snapshot_status == SnapshotStatus::Error
+            && self.browser_status == BrowserStatus::Error
+        {
+            return;
+        }
+        self.snapshot_status = SnapshotStatus::Error;
+        self.browser_status = BrowserStatus::Error;
+        self.friendly_vs_capture_enabled = false;
+        self.push_log(format!(
+            "[browser] failed to forward {control_name} to snapshot provider: {err:#}"
+        ));
+    }
+
     fn sync_friendly_vs_capture_enabled(&mut self, enabled: bool) -> bool {
+        if self.snapshot_status == SnapshotStatus::Error
+            || self.browser_status == BrowserStatus::Error
+        {
+            return false;
+        }
         if self.friendly_vs_capture_enabled == enabled {
             return true;
         }
         let result = if let Some(session) = self.browser_session.as_mut() {
-            session.snapshot_provider.set_friendly_vs_capture_enabled(enabled)
+            session
+                .snapshot_provider
+                .set_friendly_vs_capture_enabled(enabled)
         } else {
             Ok(())
         };
@@ -2735,9 +3157,7 @@ impl LauncherApp {
                 true
             }
             Err(err) => {
-                self.push_log(format!(
-                    "[browser] failed to forward friendly_vs_capture_enabled to snapshot provider: {err:#}"
-                ));
+                self.note_snapshot_provider_control_failure("friendly_vs_capture_enabled", &err);
                 false
             }
         }
@@ -2870,7 +3290,10 @@ impl LauncherApp {
             self.friendly_vs_dry_run.reset();
             return;
         }
-        if !self.bot_desired_enabled || self.bot_status != BotStatus::On || !self.friendly_vs_runtime_ready() {
+        if !self.bot_desired_enabled
+            || self.bot_status != BotStatus::On
+            || !self.friendly_vs_runtime_ready()
+        {
             self.friendly_vs_dry_run.reset();
             return;
         }
@@ -2945,6 +3368,11 @@ impl LauncherApp {
         {
             self.friendly_vs_dry_run.reset_processed_state();
         }
+        self.friendly_vs_live.sync_session(
+            &snapshot.round_id,
+            &snapshot.gameid,
+            snapshot.capture_generation,
+        );
 
         if envelope.status != "ready" {
             if let Some(line) = self.friendly_vs_dry_run.note_skip(
@@ -3048,7 +3476,10 @@ impl LauncherApp {
             self.friendly_vs_dry_run.reset_processed_state();
             return;
         }
-        if self.friendly_vs_dry_run.is_duplicate_processed_piece(snapshot) {
+        if self
+            .friendly_vs_dry_run
+            .is_duplicate_processed_piece(snapshot)
+        {
             if let Some(line) = self.friendly_vs_dry_run.note_skip(
                 "duplicate_piece",
                 "[friendly-vs-dry-run] snapshot skipped reason=duplicate_piece".to_owned(),
@@ -3057,7 +3488,10 @@ impl LauncherApp {
             }
             return;
         }
-        if self.friendly_vs_dry_run.is_duplicate_attempt(&file_signature) {
+        if self
+            .friendly_vs_dry_run
+            .is_duplicate_attempt(&file_signature)
+        {
             if let Some(line) = self.friendly_vs_dry_run.note_skip(
                 "duplicate_snapshot",
                 "[friendly-vs-dry-run] snapshot skipped reason=duplicate_snapshot".to_owned(),
@@ -3109,6 +3543,7 @@ impl LauncherApp {
                 ));
                 self.friendly_vs_dry_run
                     .record_processed(snapshot, &file_signature);
+                self.try_dispatch_friendly_vs_live_plan(&config, &path, snapshot, &prepared);
             }
             Ok(PreparedSnapshotExecutionResult::Skipped { reason, retryable }) => {
                 self.friendly_vs_dry_run
@@ -3768,7 +4203,7 @@ impl eframe::App for LauncherApp {
                 }
             });
             if self.state.selected_mode == RuntimeMode::FriendlyVs {
-                ui.small("Friendly VS: Passive");
+                ui.small(self.friendly_vs_live_status_label());
             }
             ui.horizontal(|ui| {
                 ui.label(BOT_UI_VISIBLE_LABELS[0]);
@@ -3865,6 +4300,26 @@ impl eframe::App for LauncherApp {
                     "기본값은 OFF이며, 현재 단계에서는 Bot ON마다 최대 1피스만 실제 입력합니다.",
                 );
             }
+
+            if self.state.selected_mode == RuntimeMode::FriendlyVs {
+                ui.small("Live input only changes dispatch permission. Capture and dry-run stay active.");
+                ui.horizontal(|ui| {
+                    let mut friendly_vs_live_input_enabled = self.state.friendly_vs_live_input_enabled;
+                    let response = ui.checkbox(
+                        &mut friendly_vs_live_input_enabled,
+                        format!(
+                            "Live input (max {} placements)",
+                            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                        ),
+                    );
+                    if response.changed() {
+                        self.set_friendly_vs_live_input_enabled(friendly_vs_live_input_enabled);
+                    }
+                    ui.label(format!("Count: {}", self.friendly_vs_live_count_label()));
+                });
+                ui.small("Turning this ON or OFF does not restart capture, bridge, observer, or session state.");
+            }
+
 
             ui.separator();
             ui.heading("Settings");
@@ -4045,6 +4500,9 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::driver::{ExecutionPlan, GameAction};
+    use crate::runner::DryRunPlanSummary;
+    use crate::scanner::{PieceToken, RotationToken};
     use libtetris::{Board, Piece, SpawnRule};
     use serde_json::json;
 
@@ -4153,6 +4611,68 @@ mod tests {
             "incomingGarbage": incoming_garbage
         });
         fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    }
+
+    fn arm_friendly_vs_round(
+        app: &mut LauncherApp,
+        paths: &AppPaths,
+        round_id: &str,
+        local_gameid: i64,
+    ) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        app.poll_friendly_vs_observer();
+        write_friendly_vs_bridge(
+            paths,
+            1,
+            round_id,
+            true,
+            now_ms.saturating_add(1_000),
+            now_ms.saturating_sub(1),
+            "local-id",
+            "guest-local",
+            local_gameid,
+            1_744_077_373,
+            5,
+            &[local_gameid.saturating_add(1)],
+            0,
+        );
+        app.poll_friendly_vs_observer();
+    }
+
+    fn setup_friendly_vs_live_app_with_enabled(
+        test_name: &str,
+        live_input_enabled: bool,
+    ) -> (AppPaths, LauncherApp, String) {
+        let paths = test_paths(test_name);
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = live_input_enabled;
+        app.start_bot();
+        app.logs.clear();
+        let round_id = "7001:1744077373".to_owned();
+        arm_friendly_vs_round(&mut app, &paths, &round_id, 7001);
+        (paths, app, round_id)
+    }
+
+    fn setup_friendly_vs_live_app(test_name: &str) -> (AppPaths, LauncherApp, String) {
+        setup_friendly_vs_live_app_with_enabled(test_name, true)
+    }
+
+    fn tapped_actions(app: &LauncherApp) -> Vec<GameAction> {
+        app.zenith_live_test_hook
+            .tapped_actions
+            .lock()
+            .map(|actions| actions.clone())
+            .unwrap_or_default()
+    }
+
+    fn clear_tapped_actions(app: &LauncherApp) {
+        if let Ok(mut actions) = app.zenith_live_test_hook.tapped_actions.lock() {
+            actions.clear();
+        }
     }
 
     fn configure_zenith_runtime_ready(app: &mut LauncherApp) {
@@ -4386,10 +4906,31 @@ mod tests {
         current_piece: &str,
         queue: &[&str],
     ) {
-        let path = friendly_vs_passive_snapshot_path(paths);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
+        let raw = friendly_vs_ready_snapshot_value(
+            round_id,
+            gameid,
+            candidate_id,
+            7,
+            piece_counter,
+            userid,
+            current_piece,
+            None,
+            queue,
+        );
+        write_friendly_vs_passive_snapshot_value(paths, &raw);
+    }
+
+    fn friendly_vs_ready_snapshot_value(
+        round_id: &str,
+        gameid: &str,
+        candidate_id: &str,
+        capture_generation: u64,
+        piece_counter: u32,
+        userid: serde_json::Value,
+        current_piece: &str,
+        hold_piece: Option<&str>,
+        queue: &[&str],
+    ) -> serde_json::Value {
         let (x, y) = zenith_spawn_coordinates(match current_piece {
             "I" => Piece::I,
             "O" => Piece::O,
@@ -4401,13 +4942,13 @@ mod tests {
             _ => Piece::J,
         });
         let board = vec![vec![serde_json::Value::Bool(false); 10]; 40];
-        let raw = json!({
+        json!({
             "status": "ready",
             "capture_status": "running",
             "snapshot": {
                 "source": "friendly_vs_passive",
                 "round_id": round_id,
-                "capture_generation": 7,
+                "capture_generation": capture_generation,
                 "timestamp": 1722422401123u64,
                 "userid": userid,
                 "gameid": gameid,
@@ -4426,12 +4967,19 @@ mod tests {
                     "y": y,
                     "rotation": "north"
                 },
-                "hold": null,
+                "hold": hold_piece,
                 "queue": queue,
                 "piece_counter": piece_counter
             }
-        });
-        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        })
+    }
+
+    fn write_friendly_vs_passive_snapshot_value(paths: &AppPaths, raw: &serde_json::Value) {
+        let path = friendly_vs_passive_snapshot_path(paths);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_vec(raw).unwrap()).unwrap();
     }
 
     fn write_friendly_vs_invalid_snapshot_null_round_id(paths: &AppPaths, padding_lines: usize) {
@@ -4657,6 +5205,64 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_input_defaults_to_false() {
+        let state = LauncherState::default();
+        assert!(!state.friendly_vs_live_input_enabled);
+
+        let paths = test_paths("friendly-vs-live-default-false");
+        let app = LauncherApp::new(paths.clone());
+        assert!(!app.state.friendly_vs_live_input_enabled);
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn snapshot_provider_control_failure_marks_provider_unavailable_once() {
+        let paths = test_paths("snapshot-provider-control-failure");
+        let mut app = LauncherApp::new(paths.clone());
+
+        app.note_snapshot_provider_control_failure(
+            "friendly_vs_capture_enabled",
+            &anyhow::anyhow!("broken pipe (os error 232)"),
+        );
+        app.note_snapshot_provider_control_failure(
+            "friendly_vs_capture_enabled",
+            &anyhow::anyhow!("broken pipe (os error 232)"),
+        );
+
+        assert_eq!(app.snapshot_status, SnapshotStatus::Error);
+        assert_eq!(app.browser_status, BrowserStatus::Error);
+        assert!(!app.friendly_vs_capture_enabled);
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "failed to forward friendly_vs_capture_enabled to snapshot provider",
+                    )
+                })
+                .count(),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_capture_sync_stays_bounded_after_provider_error() {
+        let paths = test_paths("friendly-vs-capture-sync-bounded");
+        let mut app = LauncherApp::new(paths.clone());
+        app.snapshot_status = SnapshotStatus::Error;
+        app.browser_status = BrowserStatus::Error;
+        let initial_log_count = app.logs.len();
+
+        assert!(!app.sync_friendly_vs_capture_enabled(true));
+        assert_eq!(app.logs.len(), initial_log_count);
+        assert!(!app.friendly_vs_capture_enabled);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_bot_on_arms_passive_observer_without_runner() {
         let paths = test_paths("friendly-vs-observer-only");
         let mut app = LauncherApp::new(paths.clone());
@@ -4740,10 +5346,14 @@ mod tests {
         assert!(app.logs.iter().any(|line| {
             line == "[friendly-vs] options ready seed=461010047 bagtype=7-bag nextcount=5"
         }));
-        assert!(app.logs.iter().any(|line| {
-            line == "[friendly-vs] round active opponents=1 incoming_garbage=0"
-        }));
-        assert!(!app.logs.iter().any(|line| line.contains("round_id=5449:1744077000")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs] round active opponents=1 incoming_garbage=0" }));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("round_id=5449:1744077000")));
         assert!(app.friendly_vs_capture_enabled);
 
         cleanup_test_paths(&paths);
@@ -4934,18 +5544,16 @@ mod tests {
             1
         );
         assert!(!app.friendly_vs_capture_enabled);
-        assert!(!app
-            .logs
-            .iter()
-            .any(|line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"));
+        assert!(!app.logs.iter().any(
+            |line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"
+        ));
 
         std::thread::sleep(Duration::from_millis(300));
         app.poll_friendly_vs_observer();
 
-        assert!(app
-            .logs
-            .iter()
-            .any(|line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"));
+        assert!(app.logs.iter().any(
+            |line| line.as_str() == "[friendly-vs] round active opponents=1 incoming_garbage=2"
+        ));
         assert!(app.friendly_vs_capture_enabled);
 
         cleanup_test_paths(&paths);
@@ -5336,6 +5944,50 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_off_keeps_dry_run_only() {
+        let paths = test_paths("friendly-vs-live-off");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        assert!(!app.state.friendly_vs_live_input_enabled);
+        app.start_bot();
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] input disabled mode=dry_run"));
+        app.logs.clear();
+        arm_friendly_vs_round(&mut app, &paths, "7001:1744077373", 7001);
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            "7001:1744077373",
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-dry-run] plan ready")));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-live] input dispatch")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_dry_run_gameid_mismatch_does_not_stall_retry() {
         let paths = test_paths("friendly-vs-dry-run-retry");
         let mut app = LauncherApp::new(paths.clone());
@@ -5377,9 +6029,11 @@ mod tests {
         );
         app.poll_friendly_vs_dry_run();
 
-        assert!(app.logs.iter().any(|line| line.contains(
-            "[friendly-vs-dry-run] snapshot skipped reason=gameid_mismatch"
-        )));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line
+                .contains("[friendly-vs-dry-run] snapshot skipped reason=gameid_mismatch")));
         assert!(!app
             .logs
             .iter()
@@ -5552,6 +6206,674 @@ mod tests {
                 .count(),
             2
         );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_dispatches_five_times_then_locks_same_round() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-five");
+
+        for (piece_counter, current_piece, queue) in [
+            (4, "J", vec!["O", "T", "L", "S", "Z"]),
+            (5, "T", vec!["I", "O", "L", "S", "Z"]),
+            (6, "L", vec!["I", "O", "T", "S", "Z"]),
+            (7, "S", vec!["I", "O", "T", "L", "Z"]),
+            (8, "Z", vec!["I", "O", "T", "L", "S"]),
+            (9, "I", vec!["O", "T", "L", "S", "Z"]),
+        ] {
+            std::thread::sleep(Duration::from_millis(20));
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                piece_counter,
+                json!("friendly-user"),
+                current_piece,
+                &queue,
+            );
+            app.poll_friendly_vs_dry_run();
+        }
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-live] plan accepted")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-live] freshness confirmed")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-live] input dispatch actions=")));
+        for count in 1..=FRIENDLY_VS_LIVE_MAX_PLACEMENTS {
+            assert!(app.logs.iter().any(|line| {
+                line == &format!(
+                    "[friendly-vs-live] placement executed count={count}/{}",
+                    FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+                )
+            }));
+        }
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs-live] input locked reason=placement_limit" }));
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=placement_limit")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_toggle_on_waits_for_next_fresh_piece_without_restarting_capture() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app_with_enabled("friendly-vs-live-toggle-on", false);
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        let active_round_before = app.friendly_vs.active_round_id.clone();
+        let active_game_before = app.friendly_vs.resolved_game_id.clone();
+        let capture_enabled_before = app.friendly_vs_capture_enabled;
+        let log_count_before_toggle = app.logs.len();
+
+        app.set_friendly_vs_live_input_enabled(true);
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(app.friendly_vs.active_round_id, active_round_before);
+        assert_eq!(app.friendly_vs.resolved_game_id, active_game_before);
+        assert_eq!(app.friendly_vs_capture_enabled, capture_enabled_before);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] enabled count=0/5"));
+        assert!(!app.logs[log_count_before_toggle..].iter().any(|line| {
+            line.contains("[friendly-vs] observer armed")
+                || line.contains("[friendly-vs] identity ready")
+                || line.contains("[friendly-vs] round active")
+        }));
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs-live] placement executed count=1/5" }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_toggle_off_then_on_same_round_keeps_count_and_dry_run() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-toggle-off-on");
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.set_friendly_vs_live_input_enabled(false);
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] disabled count=1/5"));
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-dry-run] plan ready")));
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+
+        app.set_friendly_vs_live_input_enabled(true);
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line == "[friendly-vs-live] enabled count=1/5"));
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            6,
+            json!("friendly-user"),
+            "L",
+            &["I", "O", "T", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line == "[friendly-vs-live] placement executed count=2/5" }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_flag_is_ignored_outside_friendly_mode() {
+        for (name, mode) in [
+            ("friendly-vs-live-ignored-solo", RuntimeMode::Solo),
+            ("friendly-vs-live-ignored-zenith", RuntimeMode::Zenith),
+        ] {
+            let paths = test_paths(name);
+            let mut app = LauncherApp::new(paths.clone());
+            app.state.selected_mode = mode;
+            app.state.friendly_vs_live_input_enabled = true;
+            app.bot_desired_enabled = true;
+            app.bot_status = BotStatus::On;
+            app.browser_status = BrowserStatus::Ready;
+            app.input_status = InputStatus::Ready;
+            app.snapshot_status = SnapshotStatus::Ready;
+            app.logs.clear();
+
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                "7001:1744077373",
+                "7001",
+                "cand-local",
+                4,
+                json!("friendly-user"),
+                "J",
+                &["O", "T", "L", "S", "Z"],
+            );
+            app.poll_friendly_vs_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(!app
+                .logs
+                .iter()
+                .any(|line| line.contains("[friendly-vs-live] input dispatch")));
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_stale_current_piece_suppresses_input() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-stale-piece");
+        let planned = friendly_vs_ready_snapshot_value(
+            &round_id,
+            "7001",
+            "cand-local",
+            7,
+            4,
+            json!("friendly-user"),
+            "J",
+            None,
+            &["O", "T", "L", "S", "Z"],
+        );
+        write_friendly_vs_passive_snapshot_value(&paths, &planned);
+        let mut refreshed = planned.clone();
+        refreshed["snapshot"]["current"]["type"] = json!("T");
+        refreshed["snapshot"]["queue"] = json!(["I", "O", "L", "S", "Z"]);
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+        }));
+
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_piece_counter_change_suppresses_input() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-stale-piece-counter");
+        let planned = friendly_vs_ready_snapshot_value(
+            &round_id,
+            "7001",
+            "cand-local",
+            7,
+            4,
+            json!("friendly-user"),
+            "J",
+            None,
+            &["O", "T", "L", "S", "Z"],
+        );
+        write_friendly_vs_passive_snapshot_value(&paths, &planned);
+        let mut refreshed = planned.clone();
+        refreshed["snapshot"]["piece_counter"] = json!(5);
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+        }));
+
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_board_fingerprint_change_suppresses_input() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-stale-board");
+        let planned = friendly_vs_ready_snapshot_value(
+            &round_id,
+            "7001",
+            "cand-local",
+            7,
+            4,
+            json!("friendly-user"),
+            "J",
+            None,
+            &["O", "T", "L", "S", "Z"],
+        );
+        write_friendly_vs_passive_snapshot_value(&paths, &planned);
+        let mut refreshed = planned.clone();
+        refreshed["snapshot"]["board"][39][0] = json!(true);
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+        }));
+
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_round_gameid_and_generation_mismatches_suppress_input() {
+        for (name, mutate, expected_reason) in [
+            ("friendly-vs-live-round-mismatch", "round", "round_mismatch"),
+            (
+                "friendly-vs-live-gameid-mismatch",
+                "gameid",
+                "gameid_mismatch",
+            ),
+            (
+                "friendly-vs-live-generation-mismatch",
+                "generation",
+                "generation_mismatch",
+            ),
+        ] {
+            let (paths, mut app, round_id) = setup_friendly_vs_live_app(name);
+            let planned = friendly_vs_ready_snapshot_value(
+                &round_id,
+                "7001",
+                "cand-local",
+                7,
+                4,
+                json!("friendly-user"),
+                "J",
+                None,
+                &["O", "T", "L", "S", "Z"],
+            );
+            write_friendly_vs_passive_snapshot_value(&paths, &planned);
+            let mut refreshed = planned.clone();
+            match mutate {
+                "round" => refreshed["snapshot"]["round_id"] = json!("7999:1744077999"),
+                "gameid" => {
+                    refreshed["snapshot"]["gameid"] = json!("7999");
+                    refreshed["snapshot"]["candidate_id"] = json!("cand-opponent");
+                }
+                "generation" => refreshed["snapshot"]["capture_generation"] = json!(8),
+                _ => unreachable!(),
+            }
+            app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+                write_friendly_vs_passive_snapshot_value(&app.paths, &refreshed);
+            }));
+
+            app.poll_friendly_vs_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(app.logs.iter().any(|line| {
+                line.contains(&format!(
+                    "[friendly-vs-live] input suppressed reason={expected_reason}"
+                ))
+            }));
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_bot_off_mode_change_and_round_inactive_suppress_input() {
+        for (name, trigger, expected_reason) in [
+            ("friendly-vs-live-bot-off", "bot_off", "bot_off"),
+            (
+                "friendly-vs-live-mode-change",
+                "mode_changed",
+                "mode_changed",
+            ),
+            (
+                "friendly-vs-live-round-inactive",
+                "round_inactive",
+                "round_mismatch",
+            ),
+        ] {
+            let (paths, mut app, round_id) = setup_friendly_vs_live_app(name);
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                4,
+                json!("friendly-user"),
+                "J",
+                &["O", "T", "L", "S", "Z"],
+            );
+            app.friendly_vs_live_before_reread = Some(Box::new(move |app| match trigger {
+                "bot_off" => app.stop_bot_with_browser_hint(false),
+                "mode_changed" => app.state.selected_mode = RuntimeMode::Solo,
+                "round_inactive" => app.friendly_vs.active_round_id = None,
+                _ => unreachable!(),
+            }));
+
+            app.poll_friendly_vs_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(app.logs.iter().any(|line| {
+                line.contains(&format!(
+                    "[friendly-vs-live] input suppressed reason={expected_reason}"
+                ))
+            }));
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_bot_off_then_on_same_round_does_not_bypass_cap() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-cap-persists");
+
+        for (piece_counter, current_piece, queue) in [
+            (4, "J", vec!["O", "T", "L", "S", "Z"]),
+            (5, "T", vec!["I", "O", "L", "S", "Z"]),
+            (6, "L", vec!["I", "O", "T", "S", "Z"]),
+            (7, "S", vec!["I", "O", "T", "L", "Z"]),
+            (8, "Z", vec!["I", "O", "T", "L", "S"]),
+        ] {
+            std::thread::sleep(Duration::from_millis(20));
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                piece_counter,
+                json!("friendly-user"),
+                current_piece,
+                &queue,
+            );
+            app.poll_friendly_vs_dry_run();
+        }
+        app.stop_bot_with_browser_hint(false);
+
+        app.start_bot();
+        app.logs.clear();
+        arm_friendly_vs_round(&mut app, &paths, &round_id, 7001);
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input suppressed reason=placement_limit")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_rereads_fresh_snapshot_for_each_placement() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app("friendly-vs-live-reread-each");
+        let reread_count = Arc::new(AtomicU32::new(0));
+
+        for (piece_counter, current_piece, queue) in [
+            (4, "J", vec!["O", "T", "L", "S", "Z"]),
+            (5, "T", vec!["I", "O", "L", "S", "Z"]),
+            (6, "L", vec!["I", "O", "T", "S", "Z"]),
+            (7, "S", vec!["I", "O", "T", "L", "Z"]),
+            (8, "Z", vec!["I", "O", "T", "L", "S"]),
+        ] {
+            let reread_count = reread_count.clone();
+            app.friendly_vs_live_before_reread = Some(Box::new(move |_| {
+                reread_count.fetch_add(1, Ordering::Relaxed);
+            }));
+            std::thread::sleep(Duration::from_millis(20));
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                piece_counter,
+                json!("friendly-user"),
+                current_piece,
+                &queue,
+            );
+            app.poll_friendly_vs_dry_run();
+        }
+
+        assert_eq!(
+            reread_count.load(Ordering::Relaxed),
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            FRIENDLY_VS_LIVE_MAX_PLACEMENTS
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_hold_plan_uses_existing_executor_sequence() {
+        let paths = test_paths("friendly-vs-live-hold-sequence");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        clear_tapped_actions(&app);
+        let config = app.state.to_automation_config(&app.paths);
+        let prepared = PreparedSnapshotExecution {
+            summary: DryRunPlanSummary {
+                token: "friendly-hold".to_owned(),
+                piece: PieceToken::J,
+                hold_piece: None,
+                use_hold: true,
+                target_x: 3,
+                target_rotation: RotationToken::North,
+                movement_mode_used: MovementModeConfig::ZeroGSafe,
+                fallback_from: None,
+                fallback_reason: None,
+                action_count: 3,
+                actions: vec![GameAction::Hold, GameAction::Left, GameAction::HardDrop],
+                route_kind: "test".to_owned(),
+                planner: "test".to_owned(),
+            },
+            execution_plan: ExecutionPlan {
+                hold: true,
+                movement_actions: vec![GameAction::Left],
+                hard_drop: true,
+            },
+        };
+
+        app.execute_friendly_vs_live_plan(&config, &prepared)
+            .unwrap();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            tapped_actions(&app),
+            vec![GameAction::Hold, GameAction::Left, GameAction::HardDrop]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_dispatch_failure_does_not_retry_same_piece() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-dispatch-failure");
+        app.zenith_live_test_hook
+            .fail_after_taps
+            .store(1, Ordering::Relaxed);
+        clear_tapped_actions(&app);
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| { line.contains("[friendly-vs-live] dispatch error piece_counter=4") }));
+        assert_eq!(tapped_actions(&app).len(), 1);
 
         cleanup_test_paths(&paths);
     }

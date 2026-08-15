@@ -155,10 +155,17 @@ impl ProviderProcess {
         self.send_control_payload(&serialized, "local_tetrio_username")
     }
 
-    pub fn set_friendly_vs_capture_enabled(&mut self, enabled: bool) -> Result<()> {
+    pub fn set_friendly_vs_capture_enabled(
+        &mut self,
+        enabled: bool,
+        round_id: Option<&str>,
+        local_gameid: Option<&str>,
+    ) -> Result<()> {
         let payload = serde_json::json!({
             "type": "friendly_vs_capture_enabled",
-            "enabled": enabled
+            "enabled": enabled,
+            "round_id": round_id.unwrap_or(""),
+            "local_gameid": local_gameid.unwrap_or("")
         });
         let serialized = serde_json::to_vec(&payload).context(
             "failed to encode browser provider friendly_vs_capture_enabled control message",

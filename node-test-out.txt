@@ -1,0 +1,93 @@
+[quick-play] closure target selected attempt=1 function=_tick frame=13 scope=4 scope_type=closure bindings=at,bc,bs,Jl,Qi
+[quick-play] closure inspection started attempt=1 function=_tick frame=13 scope=4 scope_object_id_present=true
+[quick-play] closure candidate emitted function=_tick frame=13 scope=4 binding=at full_path=frame[13].scope[4].at.ejectState.game.board
+[quick-play] closure candidate emitted function=_tick frame=13 scope=4 binding=bc full_path=frame[13].scope[4].bc
+[quick-play] closure candidate emitted function=_tick frame=13 scope=4 binding=bs full_path=frame[13].scope[4].bs.state.board
+✔ connect-only snapshot helper never claims Chromium ownership (2.4451ms)
+✔ snapshot helper owns Chromium only when it launched the browser (0.2196ms)
+✔ raw pause null produces paused=false (6.1917ms)
+✔ raw pause active representation produces paused=true (4.5965ms)
+✔ paused output is always boolean (7.3947ms)
+✔ passive snapshot canonicalizes current hold and queue piece casing (4.8625ms)
+✔ passive snapshot preserves null hold (3.6938ms)
+✔ passive snapshot rejects unknown queue piece semantically (4.0151ms)
+✔ raw pause normalization keeps board current hold and queue unchanged (7.7856ms)
+✔ diagnostic capture works only in Zenith mode and does not change bot state (6.9612ms)
+✔ local_tetrio_username control stores the configured username (0.1864ms)
+✔ local_tetrio_username control clears the configured username on blank input (0.0876ms)
+✔ friendly_vs_capture_enabled control updates the browser gate (0.0659ms)
+✔ zenith passive owner starts while bot is enabled and avoids manual artifacts (2.3032ms)
+✔ zenith passive owner stores shared local username hint (2.2396ms)
+✔ active zenith passive owner refreshes shared local username hint (2.3037ms)
+✔ wrong mode still rejects zenith passive owner with actual mode in logs (0.8763ms)
+✔ selected_mode control message delivers zenith mode before automatic owner start (2.3162ms)
+✔ manual owner can join and leave zenith passive provider without stopping capture (7.6886ms)
+✔ session candidate and participant candidate remain distinct (2.0361ms)
+✔ generic [data-username] cannot resolve self and incorrect DOM username remains unresolved (2.1224ms)
+✔ storage identity probe records only whitelisted fields and IndexedDB names (1.3378ms)
+✔ diagnostic username exact profile match returns userid (1.4246ms)
+✔ userid must uniquely map to gameid and ambiguous profile remains unresolved (1.1642ms)
+✔ closure candidates receive stable diagnostic ids (3.2145ms)
+✔ no forced match without common evidence and high-confidence match requires stable shared identifiers (1.6763ms)
+✔ capture stops after bounded time and packet count (12.32ms)
+✔ diagnostic start schedules session scan and creates empty closure and callframe files (4.9542ms)
+✔ automatic zenith provider does not stop at manual packet limit (2.4573ms)
+✔ first Zenith options rearms closure acquisition (2.9066ms)
+✔ diagnostic_start in lobby does not consume productive scan budget (5.0303ms)
+✔ duplicate retry and first-options schedules coalesce (2.4326ms)
+✔ pause request failure is recorded with explicit reason (5.729ms)
+✔ missing paused event is not reported as a successful empty scan (4.6489ms)
+✔ callframes_empty is recorded without consuming productive scan budget (5.9359ms)
+✔ acquired frames are written even without a matching _tick frame (5.2557ms)
+✔ stale generation cannot write inventory (5.1936ms)
+✔ Debugger.resume runs on successful closure acquisition (14.1926ms)
+✔ Debugger.resume runs when paused callframe inspection throws (5.1517ms)
+✔ Runtime.evaluate exception is recorded for closure diagnostics (6.1492ms)
+✔ raw candidates retain rejection reasons and strict filter is applied after raw candidate recording (3.9809ms)
+✔ successful Solo capture emits a read-only fingerprint (5.2704ms)
+✔ fingerprint frame matching does not require binding name Ai and minified bindings are inspected (20.1396ms)
+✔ targeted scope handoff mismatch is reported when inventory bindings disappear at inspection time (8.2184ms)
+✔ _tick scope4 primary falls back to scope3 in the same frame when scope4 has no accepted candidates (14.2587ms)
+✔ friendly structural fallback activates for closure_other frames and bounds enumeration to closure-rich tops (4.9636ms)
+✔ preferred eligible _tick frame keeps the existing path even when structural fallback is allowed (3.5053ms)
+✔ no closure scopes means friendly structural fallback does not run (3.5087ms)
+✔ shared collector can surface a gameplay state nested under a depth1 wrapper root (6.2464ms)
+✔ shared collector can surface a gameplay state nested under a depth2 wrapper root (5.2532ms)
+✔ cyclic wrapper roots stay bounded and complete without infinite traversal (4.4137ms)
+✔ self remains unresolved without explicit evidence and known userid is never hardcoded (0.8967ms)
+✔ resolved self requires non-empty userid and gameid even when evidence count is high (1.4468ms)
+✔ resolved self without closure match reports identity resolved but closure unresolved (2.3799ms)
+✔ unique accepted _tick closure binds resolved self identity and writes passive snapshot (10.9558ms)
+✔ multiple accepted candidates remain unresolved and passive snapshot stays unavailable (6.5892ms)
+✔ multiple accepted candidates retain exactly one authoritative semantic candidate (14.8968ms)
+✔ friendly vs mismatch diagnostic summarizes accepted opponent gameids only (0.7266ms)
+✔ friendly vs mismatch diagnostic exposes ancestor topology when candidate gameid is missing (0.3055ms)
+✔ friendly vs mismatch diagnostic is skipped when accepted candidates already include the expected local gameid (0.1155ms)
+✔ friendly vs survey empty diagnostic summarizes zero-accepted topology (0.8019ms)
+✔ friendly vs acquisition diagnostic summarizes observed pause and closure scopes (0.2115ms)
+✔ friendly vs acquisition diagnostic distinguishes zero closure scopes from zero raw roots (0.1106ms)
+✔ friendly vs survey empty diagnostic aggregates reject counts and excludes sensitive handles (0.2408ms)
+✔ friendly vs survey empty diagnostic reports bounded descendant topology without sensitive handles (0.3213ms)
+✔ friendly vs mismatch diagnostic output excludes sensitive CDP handles (0.1706ms)
+✔ friendly vs passive capture binds only the local gameid candidate (11.1493ms)
+✔ friendly vs passive capture waits for a preferred gameplay frame before running heavy survey (6.4204ms)
+✔ friendly preferred gameplay frame still selects the local gameid when candidate order changes (5.0362ms)
+✔ friendly fast path continues past an opponent-only primary scope to bind the local secondary scope (5.8275ms)
+✔ friendly vs passive capture rearms on round change after a mismatch (11.1112ms)
+✔ friendly vs passive capture logs survey timing once per round (7.3864ms)
+✔ friendly vs passive capture bounds preferred-frame probes per round and rearms on bot off on (9.2269ms)
+✖ automation\browser-source\tetrio-cdp-source.test.mjs (135775.9278ms)
+ℹ tests 74
+ℹ suites 0
+ℹ pass 73
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 135785.2892
+
+✖ failing tests:
+
+test at automation\browser-source\tetrio-cdp-source.test.mjs:1:1
+✖ automation\browser-source\tetrio-cdp-source.test.mjs (135775.9278ms)
+  'test failed'

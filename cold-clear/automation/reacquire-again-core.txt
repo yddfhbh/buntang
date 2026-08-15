@@ -1,0 +1,112 @@
+﻿=== ORDER ===
+
+Event            FirstLine Count
+-----            --------- -----
+Waiting               3561     1
+RearmRequested        3562     1
+RearmActive           3576     1
+CaptureResumed        3577     1
+DiscoveryStarted      3565     1
+BootstrapReady        3571     1
+ScanScheduled         3578    12
+ScanStarted           3582    12
+TimingMiss            3877     7
+CandidateRetain                0
+Bound                          0
+PollingStarted                 0
+SnapshotReady                  0
+ExecutionStarted               0
+InputDispatched                0
+ProviderStopped       4399     1
+
+
+
+=== SUMMARY ===
+
+
+MaxScanAttempt          : 12
+NewLocalIdentityMatches : 15
+CandidateNotReadyLogs   : 15
+CandidateRetained       : 0
+Bound                   : 0
+PollingStarted          : 0
+SnapshotReady           : 0
+ExecutionsAfterWaiting  : 0
+InputsAfterWaiting      : 0
+
+
+
+
+=== CORE EVENTS ===
+3561:[zenith-reacquire] waiting previous_gameid=3757 executed=48 limit=unlimited
+3562:[zenith-reacquire] rearm requested generation=2
+3565:[browser] [zenith-reacquire] page session discovery started generation=5
+3567:[browser] [zenith-reacquire] self restored source=root.user
+3569:[browser] [zenith-reacquire] self restored source=fresh_ws
+3571:[browser] [zenith] bootstrap ready generation=8
+3576:[browser] [zenith-reacquire] rearm active generation=8
+3577:[browser] [zenith-reacquire] closure capture resumed generation=8
+3578:[browser] [quick-play] closure scan scheduled generation=8 reason=bootstrap_ready attempt=1
+3582:[browser] [quick-play] closure scan started attempt=1 target_generation=8
+3646:[browser] [quick-play] closure scan evaluated result_type=completed_not_found exception=false raw_candidates=46
+3647:[browser] [quick-play] closure reject summary attempt=1 raw=46 accepted=0 rejected=46 reasons={"board_missing":39,"current_missing":39,"no_game_shape":37,"queue_missing":39,"skipped_object":7}
+3649:[browser] [quick-play] closure scan scheduled generation=8 reason=retry attempt=2
+3651:[browser] [quick-play] passive bind reconcile reason=identity_resolved candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+3652:[browser] [quick-play] closure scan started attempt=2 target_generation=8
+3708:[browser] [quick-play] closure scan evaluated result_type=completed_not_found exception=false raw_candidates=46
+3709:[browser] [quick-play] closure reject summary attempt=2 raw=46 accepted=0 rejected=46 reasons={"board_missing":39,"current_missing":39,"no_game_shape":37,"queue_missing":39,"skipped_object":7}
+3711:[browser] [quick-play] closure scan scheduled generation=8 reason=retry attempt=3
+3713:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+3714:[browser] [quick-play] closure scan started attempt=3 target_generation=8
+3781:[browser] [quick-play] closure scan evaluated result_type=completed_not_found exception=false raw_candidates=46
+3782:[browser] [quick-play] closure reject summary attempt=3 raw=46 accepted=0 rejected=46 reasons={"board_missing":39,"current_missing":39,"no_game_shape":37,"queue_missing":39,"skipped_object":7}
+3784:[browser] [quick-play] closure scan scheduled generation=8 reason=retry attempt=4
+3796:[browser] [quick-play] closure scan started attempt=4 target_generation=8
+3875:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+3877:[browser] [quick-play] closure timing miss attempt=4 reason=matching_frame_missing callframes=10 top_functions=Find,Refresh,_Refresh retry_in_ms=50
+3878:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=5
+3881:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+3882:[browser] [quick-play] closure scan started attempt=5 target_generation=8
+3887:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+3889:[browser] [quick-play] closure timing miss attempt=5 reason=matching_frame_missing callframes=1 top_functions=sentryWrapped retry_in_ms=50
+3890:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=6
+3893:[browser] [quick-play] closure scan started attempt=6 target_generation=8
+3898:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+3900:[browser] [quick-play] closure timing miss attempt=6 reason=matching_frame_missing callframes=1 top_functions=sentryWrapped retry_in_ms=50
+3901:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=7
+3904:[browser] [quick-play] closure scan started attempt=7 target_generation=8
+3907:[browser] [quick-play] closure scan evaluated result_type=pause_timeout exception=false raw_candidates=0
+3909:[browser] [quick-play] closure timing miss attempt=7 reason=pause_timeout callframes=0 top_functions= retry_in_ms=50
+3910:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=8
+3943:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+3944:[browser] [quick-play] closure scan started attempt=8 target_generation=8
+3949:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+3951:[browser] [quick-play] closure timing miss attempt=8 reason=matching_frame_missing callframes=1 top_functions=sentryWrapped retry_in_ms=50
+3952:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=9
+3955:[browser] [quick-play] closure scan started attempt=9 target_generation=8
+4008:[browser] [quick-play] closure scan evaluated result_type=completed_not_found exception=false raw_candidates=46
+4009:[browser] [quick-play] closure reject summary attempt=9 raw=46 accepted=0 rejected=46 reasons={"board_missing":39,"current_missing":39,"no_game_shape":37,"queue_missing":39,"skipped_object":7}
+4011:[browser] [quick-play] closure scan scheduled generation=8 reason=retry attempt=10
+4013:[browser] [quick-play] closure scan started attempt=10 target_generation=8
+4028:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+4030:[browser] [quick-play] closure timing miss attempt=10 reason=matching_frame_missing callframes=1 top_functions=sentryWrapped retry_in_ms=50
+4031:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=11
+4034:[browser] [quick-play] closure scan started attempt=11 target_generation=8
+4039:[browser] [quick-play] closure scan evaluated result_type=matching_frame_missing exception=false raw_candidates=0
+4041:[browser] [quick-play] closure timing miss attempt=11 reason=matching_frame_missing callframes=1 top_functions=sentryWrapped retry_in_ms=50
+4042:[browser] [quick-play] closure scan scheduled generation=8 reason=timing_miss attempt=12
+4045:[browser] [quick-play] closure scan started attempt=12 target_generation=8
+4108:[browser] [quick-play] closure scan evaluated result_type=completed_not_found exception=false raw_candidates=46
+4109:[browser] [quick-play] closure reject summary attempt=12 raw=46 accepted=0 rejected=46 reasons={"board_missing":39,"current_missing":39,"no_game_shape":37,"queue_missing":39,"skipped_object":7}
+4131:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4185:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4202:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4221:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4236:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4246:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4257:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4268:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4277:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4303:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4368:[browser] [quick-play] passive bind reconcile reason=identity_updated candidate_ready=false identity_ready=true generation_match=not_applicable target_match=not_applicable result=deferred identity_source=fresh_ws identity_gameid_present=true identity_game_relation=new local_roster_match=true deferred_reason=candidate_not_ready
+4399:[zenith-dry-run] passive provider stopped owner=zenith_dry_run generation=2

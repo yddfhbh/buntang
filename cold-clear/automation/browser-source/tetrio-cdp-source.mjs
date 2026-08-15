@@ -63,7 +63,7 @@ const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_TIMEOUT_MS = 700;
 const DEFAULT_QUICK_PLAY_CLOSURE_SCAN_PAUSE_BUDGET_MS = 250;
 const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_INTERVAL_MS = 200;
 const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_MAX_ATTEMPTS = 10;
-const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS = 2200;
+const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS = 3500;
 const DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS = 150;
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_BACKOFF_MS = [80, 160, 280, 450, 700, 1000];
 const DEFAULT_QUICK_PLAY_CLOSURE_RETRY_JITTER_MS = 30;
@@ -1340,7 +1340,9 @@ export function createBrowserControlState() {
     selectedMode: RUNTIME_MODE_SOLO,
     modeGeneration: 0,
     localTetrioUsername: null,
-    friendlyVsCaptureEnabled: false
+    friendlyVsCaptureEnabled: false,
+    friendlyVsCaptureRoundId: "",
+    friendlyVsCaptureLocalGameId: null
   };
 }
 
@@ -4665,6 +4667,7 @@ export function startFriendlyVsPassiveCapture(
   {
     roundId,
     localGameId,
+    roundSeed = "",
     targetUrl = "",
     now = Date.now(),
     log = console.log
@@ -4698,6 +4701,9 @@ export function startFriendlyVsPassiveCapture(
   friendlyVsPassiveCaptureState.currentTargetUrl = String(targetUrl ?? "");
   friendlyVsPassiveCaptureState.roundId = normalizedRoundId;
   friendlyVsPassiveCaptureState.localGameId = normalizedLocalGameId;
+  friendlyVsPassiveCaptureState.roundSeed = String(roundSeed ?? "");
+  friendlyVsPassiveCaptureState.gameplayReadyAt = 0;
+  friendlyVsPassiveCaptureState.gameplayReadyAtGeneration = 0;
   friendlyVsPassiveCaptureState.nextClosureSurveyAt =
     Math.max(0, Number(now ?? Date.now()));
   friendlyVsPassiveCaptureState.nextPassiveSnapshotAt = 0;
@@ -4748,6 +4754,9 @@ export async function stopFriendlyVsPassiveCapture(
   friendlyVsPassiveCaptureState.active = false;
   friendlyVsPassiveCaptureState.roundId = "";
   friendlyVsPassiveCaptureState.localGameId = "";
+  friendlyVsPassiveCaptureState.roundSeed = "";
+  friendlyVsPassiveCaptureState.gameplayReadyAt = 0;
+  friendlyVsPassiveCaptureState.gameplayReadyAtGeneration = 0;
   friendlyVsPassiveCaptureState.currentTargetUrl = "";
   friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
   friendlyVsPassiveCaptureState.nextPassiveSnapshotAt = 0;
@@ -4763,12 +4772,59 @@ export async function stopFriendlyVsPassiveCapture(
   return true;
 }
 
+export function updateFriendlyVsGameplayReadyAt(
+  friendlyVsPassiveCaptureState,
+  {
+    roundId,
+    localGameId,
+    roundSeed = "",
+    gameplayReadyAt = 0
+  } = {}
+) {
+  if (!friendlyVsPassiveCaptureState) {
+    return false;
+  }
+  const normalizedRoundId = String(roundId ?? "").trim();
+  const normalizedLocalGameId = normalizedScalar(localGameId);
+  const normalizedRoundSeed = String(roundSeed ?? "");
+  const normalizedReadyAt = Math.max(0, Number(gameplayReadyAt ?? 0));
+  if (!normalizedRoundId || normalizedLocalGameId === null || normalizedReadyAt <= 0) {
+    return false;
+  }
+  if (friendlyVsPassiveCaptureState.roundId !== normalizedRoundId) {
+    return false;
+  }
+  if (!valuesEqual(friendlyVsPassiveCaptureState.localGameId, normalizedLocalGameId)) {
+    return false;
+  }
+  const currentSeed = String(friendlyVsPassiveCaptureState.roundSeed ?? "");
+  if (currentSeed && normalizedRoundSeed && currentSeed !== normalizedRoundSeed) {
+    return false;
+  }
+  const currentGeneration = Math.max(
+    0,
+    Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)
+  );
+  const readyAtGeneration = Math.max(
+    0,
+    Number(friendlyVsPassiveCaptureState.gameplayReadyAtGeneration ?? 0)
+  );
+  if (readyAtGeneration > 0 && readyAtGeneration !== currentGeneration) {
+    return false;
+  }
+  friendlyVsPassiveCaptureState.roundSeed = normalizedRoundSeed || currentSeed;
+  friendlyVsPassiveCaptureState.gameplayReadyAt = normalizedReadyAt;
+  friendlyVsPassiveCaptureState.gameplayReadyAtGeneration = currentGeneration;
+  return true;
+}
+
 async function scanFriendlyVsClosureCandidates(
   cdp,
   transientState,
   friendlyVsPassiveCaptureState,
   {
     now = Date.now(),
+    gameplayReadyAt = 0,
     log = console.log
   } = {}
 ) {
@@ -4870,29 +4926,63 @@ async function scanFriendlyVsClosureCandidates(
             ? acquisition.preferredFrames
             : [];
           if (preferredFrames.length === 0) {
+            const currentNow = Math.max(0, Number(Date.now()));
+            const measuredNow = Math.max(0, Number(now ?? currentNow));
+            const armedAtMs = Math.max(
+              0,
+              Number(friendlyVsPassiveCaptureState.startedAt ?? measuredNow)
+            );
+            const readyAtMs = Math.max(0, Number(gameplayReadyAt ?? 0));
+            const budgetStartedAtMs = readyAtMs > armedAtMs ? readyAtMs : armedAtMs;
+            const armedElapsedMs = Math.max(0, measuredNow - armedAtMs);
             const acquisitionElapsedMs =
-              Math.max(0, Number(now ?? Date.now())) -
-              Math.max(0, Number(friendlyVsPassiveCaptureState.startedAt ?? now));
-            const acquisitionTimedOut =
-              attempt >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_MAX_ATTEMPTS ||
+              measuredNow <= budgetStartedAtMs
+                ? 0
+                : Math.max(0, measuredNow - budgetStartedAtMs);
+            const probeElapsedMs =
+              probeStartedAt > 0 ? Math.max(0, currentNow - probeStartedAt) : 0;
+            const budgetPendingMs =
+              measuredNow < budgetStartedAtMs
+                ? Math.max(0, budgetStartedAtMs - measuredNow)
+                : 0;
+            const remainingMs = Math.max(
+              0,
+              DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS - acquisitionElapsedMs
+            );
+            const acquisitionDeadlineReached =
               acquisitionElapsedMs >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS;
+            const nextRetryMs = acquisitionDeadlineReached
+              ? 0
+              : Math.max(
+                  0,
+                  Math.min(
+                    DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_INTERVAL_MS,
+                    budgetPendingMs > 0 ? budgetPendingMs : remainingMs
+                  )
+                );
             if (attempt === 1) {
               log?.("[friendly-vs-capture] acquisition waiting");
-              log?.(`attempt=${attempt}`);
-              log?.("preferred_frames=0");
             }
-            if (acquisitionTimedOut) {
+            if (budgetPendingMs > 0) {
+              log?.(
+                `[friendly-vs-capture] acquisition budget pending attempt=${attempt} armed_at_ms=${armedAtMs} ready_at_ms=${readyAtMs} budget_started_at_ms=${budgetStartedAtMs} wait_ms=${budgetPendingMs}`
+              );
+            }
+            log?.(
+              `[friendly-vs-capture] acquisition probe attempt=${attempt} preferred_frames=0 wall_elapsed_ms=${acquisitionElapsedMs} armed_elapsed_ms=${armedElapsedMs} probe_elapsed_ms=${probeElapsedMs} remaining_ms=${remainingMs} next_retry_ms=${nextRetryMs} budget_started_at_ms=${budgetStartedAtMs} ready_at_ms=${readyAtMs}`
+            );
+            if (acquisitionDeadlineReached) {
               friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
               markQuickPlayPassiveSnapshotUnavailable(
                 friendlyVsPassiveCaptureState,
-                "awaiting_gameplay_frame"
+                "capture_timed_out"
               );
-              log?.("[friendly-vs-capture] gameplay frame acquisition timed out");
-              log?.(`attempts=${attempt}`);
+              log?.(
+                `[friendly-vs-capture] gameplay frame acquisition timed out attempts=${attempt} wall_elapsed_ms=${acquisitionElapsedMs} armed_elapsed_ms=${armedElapsedMs} probe_elapsed_ms=${probeElapsedMs} budget_ms=${DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_WINDOW_MS} max_attempts=${DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_MAX_ATTEMPTS} budget_started_at_ms=${budgetStartedAtMs} ready_at_ms=${readyAtMs}`
+              );
             } else {
               friendlyVsPassiveCaptureState.nextClosureSurveyAt =
-                Math.max(0, Number(now ?? Date.now())) +
-                DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_INTERVAL_MS;
+                Math.max(0, Number(now ?? Date.now())) + nextRetryMs;
             }
             scan = {
               ...createQuickPlayClosureSkipResult("awaiting_gameplay_frame", {
@@ -4903,11 +4993,24 @@ async function scanFriendlyVsClosureCandidates(
                 matchingScopesSeen: 0
               }),
               heavySurveyRan: false,
-              consumeSurveyAttempt: acquisitionTimedOut
+              consumeSurveyAttempt: acquisitionDeadlineReached
             };
           } else {
-            log?.("[friendly-vs-capture] gameplay frame acquired");
-            log?.(`attempt=${attempt}`);
+            const measuredNow = Math.max(0, Number(now ?? Date.now()));
+            const armedAtMs = Math.max(
+              0,
+              Number(friendlyVsPassiveCaptureState.startedAt ?? measuredNow)
+            );
+            const readyAtMs = Math.max(0, Number(gameplayReadyAt ?? 0));
+            const budgetStartedAtMs = readyAtMs > armedAtMs ? readyAtMs : armedAtMs;
+            const armedElapsedMs = Math.max(0, measuredNow - armedAtMs);
+            const acquisitionElapsedMs =
+              measuredNow <= budgetStartedAtMs
+                ? 0
+                : Math.max(0, measuredNow - budgetStartedAtMs);
+            log?.(
+              `[friendly-vs-capture] gameplay frame acquired attempt=${attempt} preferred_frames=${preferredFrames.length} wall_elapsed_ms=${acquisitionElapsedMs} armed_elapsed_ms=${armedElapsedMs} budget_started_at_ms=${budgetStartedAtMs} ready_at_ms=${readyAtMs}`
+            );
             const inventoryStartedAt = Date.now();
             const inventory = await buildQuickPlayPausedFrameInventory(
               cdp,
@@ -5054,17 +5157,9 @@ async function scanFriendlyVsClosureCandidates(
     scan?.consumeSurveyAttempt !== true &&
     probeTotalMs >= DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS
   ) {
-    friendlyVsPassiveCaptureState.nextClosureSurveyAt = 0;
-    markQuickPlayPassiveSnapshotUnavailable(
-      friendlyVsPassiveCaptureState,
-      "awaiting_gameplay_frame"
+    log?.(
+      `[friendly-vs-capture] slow acquisition probe attempt=${attempt} probe_elapsed_ms=${probeTotalMs} hitch_limit_ms=${DEFAULT_FRIENDLY_VS_GAMEPLAY_FRAME_PROBE_HITCH_LIMIT_MS}`
     );
-    log?.("[friendly-vs-capture] gameplay frame acquisition timed out");
-    log?.(`attempts=${attempt}`);
-    scan = {
-      ...scan,
-      consumeSurveyAttempt: true
-    };
   }
   friendlyVsPassiveCaptureState.diagnostics.closure_scan.completed += 1;
   recordQuickPlayClosureScanDiagnostics(friendlyVsPassiveCaptureState, scan);
@@ -5301,6 +5396,7 @@ export async function maybeRunFriendlyVsPassiveCapture({
   transientState,
   targetUrl = "",
   roundStatus = null,
+  gameplayReadyAt = 0,
   now = Date.now(),
   log = console.log
 } = {}) {
@@ -5314,8 +5410,21 @@ export async function maybeRunFriendlyVsPassiveCapture({
   const captureEnabled = Boolean(browserControlState?.friendlyVsCaptureEnabled);
   const roundId = String(roundStatus?.roundId ?? "").trim();
   const localGameId = normalizedScalar(roundStatus?.localGameId);
+  const roundSeed = String(roundStatus?.seed ?? "");
   const roundActive = Boolean(roundStatus?.active) && roundId && localGameId !== null;
-  if (!modeActive || !captureEnabled || !roundActive) {
+  const admittedRoundId = String(browserControlState?.friendlyVsCaptureRoundId ?? "").trim();
+  const admittedLocalGameId = normalizedScalar(
+    browserControlState?.friendlyVsCaptureLocalGameId
+  );
+  const explicitAdmission =
+    admittedRoundId !== "" || admittedLocalGameId !== null;
+  const captureAdmitted =
+    captureEnabled &&
+    (!explicitAdmission ||
+      (roundActive &&
+        admittedRoundId === roundId &&
+        valuesEqual(admittedLocalGameId, localGameId)));
+  if (!modeActive || !captureAdmitted || !roundActive) {
     if (
       friendlyVsPassiveCaptureState.active ||
       String(
@@ -5336,7 +5445,7 @@ export async function maybeRunFriendlyVsPassiveCapture({
       ran: false,
       reason: !modeActive
         ? "mode_inactive"
-        : !captureEnabled
+        : !captureEnabled || !captureAdmitted
           ? "admission_pending"
           : "round_inactive"
     };
@@ -5361,12 +5470,25 @@ export async function maybeRunFriendlyVsPassiveCapture({
     startFriendlyVsPassiveCapture(friendlyVsPassiveCaptureState, {
       roundId,
       localGameId,
+      roundSeed,
       targetUrl,
       now,
       log
     });
   }
+  if (roundActive) {
+    updateFriendlyVsGameplayReadyAt(friendlyVsPassiveCaptureState, {
+      roundId,
+      localGameId,
+      roundSeed,
+      gameplayReadyAt
+    });
+  }
   friendlyVsPassiveCaptureState.currentTargetUrl = String(targetUrl ?? "");
+  const effectiveGameplayReadyAt = Math.max(
+    0,
+    Number(friendlyVsPassiveCaptureState.gameplayReadyAt ?? 0)
+  );
   const currentGeneration = Math.max(
     0,
     Number(friendlyVsPassiveCaptureState.captureGeneration ?? 0)
@@ -5387,6 +5509,7 @@ export async function maybeRunFriendlyVsPassiveCapture({
       friendlyVsPassiveCaptureState,
       {
         now,
+        gameplayReadyAt: effectiveGameplayReadyAt,
         log
       }
     );
@@ -6823,6 +6946,9 @@ export function createFriendlyVsPassiveCaptureState() {
   state.currentTargetUrl = "";
   state.roundId = "";
   state.localGameId = "";
+  state.roundSeed = "";
+  state.gameplayReadyAt = 0;
+  state.gameplayReadyAtGeneration = 0;
   state.lastArmedSignature = "";
   state.lastBoundSignature = "";
   state.lastTimingLogsAt = {
@@ -11376,10 +11502,18 @@ export function applyBrowserControlMessage({
     message.type === "friendly_vs_capture_enabled" &&
     typeof message.enabled === "boolean"
   ) {
-    if (Boolean(controlState.friendlyVsCaptureEnabled) === message.enabled) {
+    const nextRoundId = String(message.round_id ?? "").trim();
+    const nextLocalGameId = normalizedScalar(message.local_gameid);
+    if (
+      Boolean(controlState.friendlyVsCaptureEnabled) === message.enabled &&
+      String(controlState.friendlyVsCaptureRoundId ?? "") === nextRoundId &&
+      valuesEqual(controlState.friendlyVsCaptureLocalGameId, nextLocalGameId)
+    ) {
       return false;
     }
     controlState.friendlyVsCaptureEnabled = message.enabled;
+    controlState.friendlyVsCaptureRoundId = message.enabled ? nextRoundId : "";
+    controlState.friendlyVsCaptureLocalGameId = message.enabled ? nextLocalGameId : null;
     return true;
   }
   if (message.type === "selected_mode") {
@@ -11395,6 +11529,8 @@ export function applyBrowserControlMessage({
     controlState.modeGeneration = nextGeneration;
     if (nextMode !== RUNTIME_MODE_FRIENDLY_VS) {
       controlState.friendlyVsCaptureEnabled = false;
+      controlState.friendlyVsCaptureRoundId = "";
+      controlState.friendlyVsCaptureLocalGameId = null;
     }
     cancelNextGameReacquire(nextGameReacquireState, {
       reason: "mode_changed",
@@ -11449,6 +11585,8 @@ export function applyBrowserControlMessage({
     });
   } else {
     controlState.friendlyVsCaptureEnabled = false;
+    controlState.friendlyVsCaptureRoundId = "";
+    controlState.friendlyVsCaptureLocalGameId = null;
     cancelNextGameReacquire(nextGameReacquireState, {
       reason: "bot_off",
       log
@@ -12013,6 +12151,7 @@ async function main() {
   let vsRoundId = "";
   let vsLocalGameId = "";
   let vsRoundSeed = "";
+  let vsReadyAt = 0;
   const browserControlState = createBrowserControlState();
   const quickPlayDiagnosticState = createQuickPlayDiagnosticState();
   const friendlyVsPassiveCaptureState = createFriendlyVsPassiveCaptureState();
@@ -12088,15 +12227,18 @@ async function main() {
         const nextRoundId = nextActive ? String(status?.roundId ?? "") : "";
         const nextLocalGameId = nextActive ? String(status?.localGameId ?? "") : "";
         const nextSeed = nextActive ? String(status?.seed ?? "") : "";
+        const nextReadyAt = nextActive ? Math.max(0, Number(status?.readyAt ?? 0)) : 0;
         const changed =
           nextActive !== vsRoundActive ||
           nextRoundId !== vsRoundId ||
           nextLocalGameId !== vsLocalGameId ||
-          nextSeed !== vsRoundSeed;
+          nextSeed !== vsRoundSeed ||
+          nextReadyAt !== vsReadyAt;
         vsRoundActive = nextActive;
         vsRoundId = nextRoundId;
         vsLocalGameId = nextLocalGameId;
         vsRoundSeed = nextSeed;
+        vsReadyAt = nextReadyAt;
         if (!changed || !vsWsSimEnabled) {
           return;
         }
@@ -12157,11 +12299,7 @@ async function main() {
       }`
     );
   }
-  await cdp.send("Page.bringToFront");
   await installBackgroundInputKeepalive(cdp);
-  await safeRuntimeEvaluate(cdp, {
-    expression: "window.focus(); document.body && document.body.focus && document.body.focus(); true"
-  }).catch(() => undefined);
 
   const network = createTetrioNetworkState();
   const bootstrapState = createBootstrapState();
@@ -12455,6 +12593,14 @@ async function main() {
           localGameId: vsLocalGameId,
           seed: vsRoundSeed
         },
+        gameplayReadyAt:
+          Math.max(0, Number(vsReadyAt ?? 0)) > 0
+            ? Math.max(0, Number(vsReadyAt ?? 0))
+            : vsRoundActive &&
+                valuesEqual(normalizedScalar(network?.seed), normalizedScalar(vsRoundSeed)) &&
+                Math.max(0, Number(network?.readyAt ?? 0)) > 0
+              ? Math.max(0, Number(network.readyAt ?? 0))
+              : 0,
         now: loopNow,
         log: (entry) => console.log(entry)
       });

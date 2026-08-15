@@ -145,8 +145,8 @@ test("sequence preserves action order and responds once", async () => {
     type: "sequence",
     actionCount: 3
   });
-  assert.equal(cdp.events[0].method, "Page.bringToFront");
-  assert.equal(cdp.events[1].method, "Runtime.evaluate");
+  assert.equal(cdp.events[0].method, "Runtime.evaluate");
+  assert.equal(cdp.events.some((event) => event.method === "Page.bringToFront"), false);
 });
 
 test("releaseAll only sends keyUp for tracked keys", async () => {
@@ -211,10 +211,10 @@ test("tap prepares focus before dispatching keys", async () => {
     context
   );
 
-  assert.equal(cdp.events[0].method, "Page.bringToFront");
-  assert.equal(cdp.events[1].method, "Runtime.evaluate");
+  assert.equal(cdp.events[0].method, "Runtime.evaluate");
+  assert.equal(cdp.events.some((event) => event.method === "Page.bringToFront"), false);
   assert.deepEqual(
-    cdp.events.slice(2).map((event) => `${event.type}:${event.code}`),
+    cdp.events.slice(1).map((event) => `${event.type}:${event.code}`),
     ["keyDown:Space", "keyUp:Space"]
   );
   assert.equal(responses[0].ok, true);
@@ -327,9 +327,10 @@ test("safe BODY focus allows key input", async () => {
   );
 
   assert.deepEqual(
-    cdp.events.slice(2).map((event) => `${event.type}:${event.code}`),
+    cdp.events.slice(1).map((event) => `${event.type}:${event.code}`),
     ["keyDown:KeyX", "keyUp:KeyX"]
   );
+  assert.equal(cdp.events.some((event) => event.method === "Page.bringToFront"), false);
   assert.equal(responses[0].ok, true);
 });
 

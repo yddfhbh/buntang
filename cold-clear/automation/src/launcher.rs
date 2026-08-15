@@ -23,7 +23,8 @@ use crate::driver::{
 };
 use crate::paths::AppPaths;
 use crate::runner::{
-    prepare_snapshot_execution, PreparedSnapshotExecution, PreparedSnapshotExecutionResult,
+    friendly_execution_start_pose, FriendlyExecutionStartPose, prepare_snapshot_execution,
+    PreparedSnapshotExecution, PreparedSnapshotExecutionResult,
 };
 use crate::runtime::run_automation_with_resources_and_live_pps;
 use crate::scanner::{
@@ -920,6 +921,7 @@ impl FriendlyVsObserver {
             .filter(|previous| previous != round_id)
             .map(|previous| format!("[friendly-vs] round ended round_id={previous}"));
         self.last_round_id = Some(round_id.to_owned());
+        self.clear_ready_state();
         self.last_identity_signature = None;
         self.last_options_signature = None;
         self.last_active_signature = None;
@@ -1043,8 +1045,7 @@ impl FriendlyVsObserver {
         if self.active_round_id.as_deref() != Some(round_id) {
             return None;
         }
-        self.active_round_id = None;
-        self.last_active_signature = None;
+        self.clear_ready_state();
         Some(format!("[friendly-vs] round ended round_id={round_id}"))
     }
 }
@@ -1111,6 +1112,18 @@ impl FriendlyVsDryRunController {
         self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
     }
 
+    fn mark_processed_snapshot(&mut self, snapshot: &FriendlyVsPassivePlannerSnapshot) {
+        self.last_round_id = Some(snapshot.round_id.clone());
+        self.last_game_id = Some(snapshot.gameid.clone());
+        self.last_capture_generation = Some(snapshot.capture_generation);
+        self.last_candidate_id = Some(snapshot.candidate_id.clone());
+        self.last_piece_counter = snapshot.snapshot.piece_counter;
+        self.last_current_signature = Some(snapshot.current_signature.clone());
+        self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.active = true;
+        self.clear_skip_reason();
+    }
+
     fn is_duplicate_attempt(&self, file_signature: &str) -> bool {
         self.last_attempted_file_signature.as_deref() == Some(file_signature)
     }
@@ -1132,6 +1145,7 @@ impl FriendlyVsDryRunController {
         self.last_skip_logged_at = Some(now);
         Some(line)
     }
+
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1139,14 +1153,61 @@ struct FriendlyVsLiveController {
     session_round_id: Option<String>,
     session_game_id: Option<String>,
     session_capture_generation: Option<u64>,
+    session_pps_unlimited: bool,
+    session_target_pps: f32,
     executed_placements: u32,
     limit_logged: bool,
+    last_execution_started_at: Option<Instant>,
+    next_execution_earliest_at: Option<Instant>,
+    last_execution_round_id: Option<String>,
+    last_execution_game_id: Option<String>,
+    deferred_snapshot_token: Option<String>,
+    deferred_plan: Option<FriendlyVsDeferredPlan>,
     last_skip_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct FriendlyVsDeferredPlan {
+    snapshot_token: String,
+    round_id: String,
+    gameid: String,
+    capture_generation: u64,
+    candidate_id: String,
+    piece_counter: Option<u32>,
+    current_signature: String,
+    prepared: PreparedSnapshotExecution,
 }
 
 impl FriendlyVsLiveController {
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn set_session_pacing(&mut self, pps_unlimited: bool, target_pps: f32) {
+        self.session_pps_unlimited = pps_unlimited;
+        self.session_target_pps = normalize_target_pps_value(target_pps);
+        self.clear_pacing_state();
+    }
+
+    fn session_target_pps(&self) -> f32 {
+        normalize_target_pps_value(self.session_target_pps)
+    }
+
+    fn session_target_pps_interval(&self) -> Option<Duration> {
+        if self.session_pps_unlimited {
+            None
+        } else {
+            pacing_interval_for_target_pps(self.session_target_pps())
+        }
+    }
+
+    fn clear_pacing_state(&mut self) {
+        self.last_execution_started_at = None;
+        self.next_execution_earliest_at = None;
+        self.last_execution_round_id = None;
+        self.last_execution_game_id = None;
+        self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
     }
 
     fn sync_session(&mut self, round_id: &str, gameid: &str, capture_generation: u64) {
@@ -1162,6 +1223,7 @@ impl FriendlyVsLiveController {
         self.executed_placements = 0;
         self.limit_logged = false;
         self.last_skip_key = None;
+        self.clear_pacing_state();
     }
 
     fn limit_reached(&self, limit: FriendlyVsLiveLimit) -> bool {
@@ -1183,6 +1245,93 @@ impl FriendlyVsLiveController {
     fn record_execution(&mut self) {
         self.executed_placements = self.executed_placements.saturating_add(1);
         self.clear_skip_reason();
+    }
+
+    fn note_execution_started_for_pacing(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        now: Instant,
+    ) {
+        self.last_execution_started_at = Some(now);
+        self.last_execution_round_id = Some(snapshot.round_id.clone());
+        self.last_execution_game_id = Some(snapshot.gameid.clone());
+        self.next_execution_earliest_at = self
+            .session_target_pps_interval()
+            .map(|interval| now + interval);
+        self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
+    }
+
+    fn pacing_remaining_for_snapshot(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        now: Instant,
+    ) -> Option<Duration> {
+        if self
+            .last_execution_round_id
+            .as_deref()
+            .is_some_and(|round_id| round_id != snapshot.round_id.as_str())
+        {
+            self.clear_pacing_state();
+            return None;
+        }
+        if self
+            .last_execution_game_id
+            .as_deref()
+            .is_some_and(|game_id| game_id != snapshot.gameid.as_str())
+        {
+            self.clear_pacing_state();
+            return None;
+        }
+        let earliest = self.next_execution_earliest_at?;
+        let remaining = earliest.saturating_duration_since(now);
+        if remaining.is_zero() {
+            None
+        } else {
+            Some(remaining)
+        }
+    }
+
+    fn set_deferred_plan(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        prepared: PreparedSnapshotExecution,
+    ) {
+        self.deferred_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.deferred_plan = Some(FriendlyVsDeferredPlan {
+            snapshot_token: snapshot.snapshot.token.clone(),
+            round_id: snapshot.round_id.clone(),
+            gameid: snapshot.gameid.clone(),
+            capture_generation: snapshot.capture_generation,
+            candidate_id: snapshot.candidate_id.clone(),
+            piece_counter: snapshot.snapshot.piece_counter,
+            current_signature: snapshot.current_signature.clone(),
+            prepared,
+        });
+    }
+
+    fn clear_deferred_plan(&mut self) {
+        self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
+    }
+
+    fn is_deferred_snapshot(&self, snapshot: &FriendlyVsPassivePlannerSnapshot) -> bool {
+        self.deferred_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
+    }
+
+    fn deferred_plan_for_snapshot(
+        &self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+    ) -> Option<&FriendlyVsDeferredPlan> {
+        let deferred = self.deferred_plan.as_ref()?;
+        (deferred.snapshot_token == snapshot.snapshot.token
+            || (deferred.round_id == snapshot.round_id
+                && deferred.gameid == snapshot.gameid
+                && deferred.capture_generation == snapshot.capture_generation
+                && deferred.candidate_id == snapshot.candidate_id
+                && deferred.piece_counter == snapshot.snapshot.piece_counter
+                && deferred.current_signature == snapshot.current_signature))
+        .then_some(deferred)
     }
 
     fn note_limit_locked(&mut self, limit: FriendlyVsLiveLimit) -> Option<String> {
@@ -1662,6 +1811,8 @@ pub struct LauncherApp {
     bot_waiting_for_next_game: bool,
     bot_restart_pending: bool,
     friendly_vs_capture_enabled: bool,
+    friendly_vs_capture_round_id: Option<String>,
+    friendly_vs_capture_local_game_id: Option<String>,
     friendly_vs: FriendlyVsObserver,
     friendly_vs_dry_run: FriendlyVsDryRunController,
     friendly_vs_live: FriendlyVsLiveController,
@@ -1702,6 +1853,8 @@ impl LauncherApp {
             bot_waiting_for_next_game: false,
             bot_restart_pending: false,
             friendly_vs_capture_enabled: false,
+            friendly_vs_capture_round_id: None,
+            friendly_vs_capture_local_game_id: None,
             friendly_vs: FriendlyVsObserver::default(),
             friendly_vs_dry_run: FriendlyVsDryRunController::default(),
             friendly_vs_live: FriendlyVsLiveController::default(),
@@ -1791,6 +1944,22 @@ impl LauncherApp {
 
     fn update_live_target_pps(&mut self) {
         let effective_target_pps = self.state.effective_target_pps();
+        if self.state.selected_mode == RuntimeMode::FriendlyVs
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.friendly_vs_live
+                .set_session_pacing(self.state.pps_unlimited, self.state.target_pps);
+        }
+        if self.state.selected_mode == RuntimeMode::Zenith
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.zenith_live
+                .set_session_pacing(self.state.pps_unlimited, self.state.target_pps);
+        }
         if let Some(bot_session) = self.bot_session.as_ref() {
             bot_session
                 .live_target_pps
@@ -1925,6 +2094,46 @@ impl LauncherApp {
         self.state.selected_mode == RuntimeMode::Zenith && self.state.zenith_live_input_enabled
     }
 
+    fn friendly_vs_live_pps_unlimited(&self) -> bool {
+        if self.state.selected_mode == RuntimeMode::FriendlyVs
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.friendly_vs_live.session_pps_unlimited
+        } else {
+            self.state.pps_unlimited
+        }
+    }
+
+    fn friendly_vs_live_target_pps(&self) -> f32 {
+        if self.state.selected_mode == RuntimeMode::FriendlyVs
+            && (self.bot_desired_enabled
+                || self.bot_session.is_some()
+                || self.bot_status == BotStatus::On)
+        {
+            self.friendly_vs_live.session_target_pps()
+        } else {
+            normalize_target_pps_value(self.state.target_pps)
+        }
+    }
+
+    fn friendly_vs_live_pps_interval(&self) -> Option<Duration> {
+        if self.friendly_vs_live_pps_unlimited() {
+            None
+        } else {
+            pacing_interval_for_target_pps(self.friendly_vs_live_target_pps())
+        }
+    }
+
+    fn friendly_vs_live_pps_label(&self) -> String {
+        if self.friendly_vs_live_pps_unlimited() {
+            "unlimited".to_owned()
+        } else {
+            format_target_pps_log_label(self.friendly_vs_live_target_pps())
+        }
+    }
+
     fn friendly_vs_live_limit(&self) -> FriendlyVsLiveLimit {
         self.state.effective_friendly_vs_live_limit()
     }
@@ -1980,9 +2189,30 @@ impl LauncherApp {
 
     fn friendly_vs_live_session_armed_log(&self) -> String {
         format!(
-            "[friendly-vs-live] session armed limit={}",
+            "[friendly-vs-live] pacing target_pps={} interval_ms={} limit={}",
+            self.friendly_vs_live_pps_label(),
+            self.friendly_vs_live_pps_interval()
+                .map(|interval| interval.as_millis())
+                .unwrap_or(0),
             self.friendly_vs_live_limit().count_suffix()
         )
+    }
+
+    fn friendly_vs_live_execution_started_log(&self, piece_counter: Option<u32>) -> String {
+        match self.friendly_vs_live_limit() {
+            FriendlyVsLiveLimit::Twenty => format!(
+                "[friendly-vs-live] execution started piece_counter={} executed={} max_pieces=20 pps={}",
+                piece_counter_label(piece_counter),
+                self.friendly_vs_live.executed_placements,
+                self.friendly_vs_live_pps_label()
+            ),
+            FriendlyVsLiveLimit::Unlimited => format!(
+                "[friendly-vs-live] execution started piece_counter={} executed={} limit=unlimited pps={}",
+                piece_counter_label(piece_counter),
+                self.friendly_vs_live.executed_placements,
+                self.friendly_vs_live_pps_label()
+            ),
+        }
     }
 
     fn zenith_live_limit_reached(&self) -> bool {
@@ -2051,28 +2281,15 @@ impl LauncherApp {
         }
     }
 
-    fn execute_live_plan_with_existing_executor(
-        &mut self,
-        config: &AutomationConfig,
-        prepared: &PreparedSnapshotExecution,
-    ) -> Result<()> {
-        let timings = Self::zenith_execution_timings(config);
-
+    fn create_live_input_backend(&mut self) -> Result<Box<dyn InputBackend>> {
         #[cfg(test)]
         if self.browser_session.is_none() {
             self.zenith_live_test_hook
                 .dispatch_count
                 .fetch_add(1, Ordering::Relaxed);
-            let mut backend = ZenithLiveTestBackend {
+            return Ok(Box::new(ZenithLiveTestBackend {
                 hook: self.zenith_live_test_hook.clone(),
-            };
-            return execute_plan(
-                &mut backend,
-                &prepared.execution_plan,
-                &config.handling,
-                timings,
-                |line| self.push_log(line),
-            );
+            }));
         }
 
         let shared = self
@@ -2080,9 +2297,18 @@ impl LauncherApp {
             .as_ref()
             .map(|session| session.input_backend.clone())
             .context("browser input backend missing for live execution")?;
-        let mut backend = BrowserCdpInputBackend::from_shared(shared);
+        Ok(Box::new(BrowserCdpInputBackend::from_shared(shared)))
+    }
+
+    fn execute_live_plan_with_existing_executor(
+        &mut self,
+        config: &AutomationConfig,
+        prepared: &PreparedSnapshotExecution,
+    ) -> Result<()> {
+        let timings = Self::zenith_execution_timings(config);
+        let mut backend = self.create_live_input_backend()?;
         execute_plan(
-            &mut backend,
+            &mut *backend,
             &prepared.execution_plan,
             &config.handling,
             timings,
@@ -2104,6 +2330,14 @@ impl LauncherApp {
         prepared: &PreparedSnapshotExecution,
     ) -> Result<()> {
         self.execute_live_plan_with_existing_executor(config, prepared)
+    }
+
+    fn dispatch_friendly_vs_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        prepared: &PreparedSnapshotExecution,
+    ) -> Result<()> {
+        self.execute_friendly_vs_live_plan(config, prepared)
     }
 
     fn release_live_input_now(&mut self) -> Result<()> {
@@ -2157,6 +2391,64 @@ impl LauncherApp {
         }
     }
 
+    fn friendly_vs_live_uses_start_pose_freshness(
+        &self,
+        prepared: &PreparedSnapshotExecution,
+    ) -> bool {
+        self.friendly_vs_live_input_allowed()
+            && !prepared.summary.use_hold
+            && prepared.friendly_execution_start_pose.is_some()
+    }
+
+    fn log_friendly_vs_execution_start_pose_confirmed(
+        &mut self,
+        piece_counter: Option<u32>,
+        pose: &FriendlyExecutionStartPose,
+    ) {
+        self.push_log(format!(
+            "[friendly-vs-live] execution start pose confirmed piece_counter={} piece={} x={} y={} rotation={:?}",
+            piece_counter_label(piece_counter),
+            pose.piece.label(),
+            pose.x,
+            pose.y,
+            pose.rotation
+        ));
+    }
+
+    fn invalidate_friendly_vs_live_plan_for_start_pose(
+        &mut self,
+        fresh_snapshot: &FriendlyVsPassivePlannerSnapshot,
+        planned_pose: &FriendlyExecutionStartPose,
+        fresh_pose: Option<&FriendlyExecutionStartPose>,
+    ) {
+        let (fresh_piece, fresh_x, fresh_y, fresh_rotation) = match fresh_pose {
+            Some(pose) => (
+                pose.piece.label().to_owned(),
+                pose.x.to_string(),
+                pose.y.to_string(),
+                format!("{:?}", pose.rotation),
+            ),
+            None => (
+                "?".to_owned(),
+                "missing".to_owned(),
+                "missing".to_owned(),
+                "missing".to_owned(),
+            ),
+        };
+        self.push_log(format!(
+            "[friendly-vs-live] plan invalidated reason=active_pose_changed piece_counter={} planned_piece={} planned_x={} planned_y={} planned_rotation={:?} fresh_piece={} fresh_x={} fresh_y={} fresh_rotation={}",
+            piece_counter_label(fresh_snapshot.snapshot.piece_counter),
+            planned_pose.piece.label(),
+            planned_pose.x,
+            planned_pose.y,
+            planned_pose.rotation,
+            fresh_piece,
+            fresh_x,
+            fresh_y,
+            fresh_rotation
+        ));
+    }
+
     fn friendly_vs_live_reread_matches_plan(
         &mut self,
         path: &std::path::Path,
@@ -2206,6 +2498,7 @@ impl LauncherApp {
         &mut self,
         config: &AutomationConfig,
         path: &std::path::Path,
+        file_signature: &str,
         planned_snapshot: &FriendlyVsPassivePlannerSnapshot,
         prepared: &PreparedSnapshotExecution,
     ) {
@@ -2337,6 +2630,24 @@ impl LauncherApp {
             return;
         }
 
+        if let Some(planned_pose) = prepared.friendly_execution_start_pose.as_ref() {
+            let fresh_pose =
+                friendly_execution_start_pose(&fresh_snapshot.snapshot, false, prepared.summary.piece.into());
+            if fresh_pose.as_ref() != Some(planned_pose) {
+                self.friendly_vs_live.clear_deferred_plan();
+                self.invalidate_friendly_vs_live_plan_for_start_pose(
+                    &fresh_snapshot,
+                    planned_pose,
+                    fresh_pose.as_ref(),
+                );
+                return;
+            }
+            self.log_friendly_vs_execution_start_pose_confirmed(
+                fresh_snapshot.snapshot.piece_counter,
+                planned_pose,
+            );
+        }
+
         self.friendly_vs_live.clear_skip_reason();
         self.push_log(format!(
             "[friendly-vs-live] freshness confirmed round_id={} gameid={} generation={} piece_counter={}",
@@ -2345,12 +2656,26 @@ impl LauncherApp {
             fresh_snapshot.capture_generation,
             piece_counter_label(fresh_snapshot.snapshot.piece_counter)
         ));
+        let execution_started_at = self.monotonic_now();
+        self.friendly_vs_live
+            .note_execution_started_for_pacing(&fresh_snapshot, execution_started_at);
+        #[cfg(test)]
+        if let Ok(mut started_at) = self.zenith_live_test_hook.started_at.lock() {
+            started_at.push(execution_started_at);
+        }
+        self.push_log(self.friendly_vs_live_execution_started_log(
+            fresh_snapshot.snapshot.piece_counter,
+        ));
         self.push_log(format!(
             "[friendly-vs-live] input dispatch actions={:?}",
             prepared.summary.actions
         ));
-        match self.execute_friendly_vs_live_plan(config, prepared) {
+        match self.dispatch_friendly_vs_live_plan(config, prepared) {
             Ok(()) => {
+                self.friendly_vs_dry_run
+                    .mark_processed_snapshot(&fresh_snapshot);
+                self.friendly_vs_dry_run
+                    .record_attempted(&fresh_snapshot, file_signature);
                 self.friendly_vs_live.record_execution();
                 self.push_log(format!(
                     "[friendly-vs-live] placement executed count={}",
@@ -2364,6 +2689,8 @@ impl LauncherApp {
                 }
             }
             Err(err) => {
+                self.friendly_vs_dry_run
+                    .record_processed(&fresh_snapshot, file_signature);
                 self.push_log(format!(
                     "[friendly-vs-live] dispatch error piece_counter={} error={err:#}",
                     piece_counter_label(planned_snapshot.snapshot.piece_counter)
@@ -2637,7 +2964,7 @@ impl LauncherApp {
             }
             self.sync_browser_local_tetrio_username();
             if self.state.selected_mode == RuntimeMode::FriendlyVs {
-                self.sync_friendly_vs_capture_enabled(false);
+                self.sync_friendly_vs_capture_enabled(false, None, None);
                 self.prepare_friendly_vs_observer_arm();
             }
             if self.state.selected_mode == RuntimeMode::Zenith {
@@ -2666,7 +2993,7 @@ impl LauncherApp {
                         self.set_passive_provider_owner(PassiveProviderOwner::ZenithDryRun, false);
                 }
                 if self.state.selected_mode == RuntimeMode::FriendlyVs {
-                    self.sync_friendly_vs_capture_enabled(false);
+                    self.sync_friendly_vs_capture_enabled(false, None, None);
                     if let Some(line) = self.friendly_vs.note_stopped() {
                         self.push_log(line);
                     }
@@ -2682,6 +3009,8 @@ impl LauncherApp {
             self.bot_restart_pending = false;
             self.zenith_dry_run.reset();
             self.zenith_live.reset();
+            self.friendly_vs_live
+                .set_session_pacing(self.state.pps_unlimited, self.state.target_pps);
             self.zenith_live.session_max_pieces = self.state.effective_zenith_live_max_pieces();
             self.zenith_live
                 .set_session_pacing(self.state.pps_unlimited, self.state.target_pps);
@@ -2835,8 +3164,9 @@ impl LauncherApp {
         self.bot_waiting_for_next_game = false;
         self.bot_restart_pending = false;
         self.cancel_zenith_live_execution("bot_off");
-        self.sync_friendly_vs_capture_enabled(false);
+        self.sync_friendly_vs_capture_enabled(false, None, None);
         self.friendly_vs_dry_run.reset();
+        self.friendly_vs_live.clear_pacing_state();
         self.zenith_dry_run.reset();
         self.zenith_live.reset();
         let had_runner = self.bot_session.is_some();
@@ -2874,7 +3204,7 @@ impl LauncherApp {
         }
         self.state.selected_mode = next_mode;
         self.state.mode_generation = self.state.mode_generation.saturating_add(1);
-        self.sync_friendly_vs_capture_enabled(false);
+        self.sync_friendly_vs_capture_enabled(false, None, None);
         if next_mode != RuntimeMode::Zenith {
             self.clear_passive_provider_owners();
         }
@@ -2921,6 +3251,8 @@ impl LauncherApp {
         self.snapshot_status = SnapshotStatus::Closed;
         self.input_status = InputStatus::Closed;
         self.friendly_vs_capture_enabled = false;
+        self.friendly_vs_capture_round_id = None;
+        self.friendly_vs_capture_local_game_id = None;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
         self.passive_provider.reset();
@@ -3075,6 +3407,8 @@ impl LauncherApp {
         self.snapshot_status = SnapshotStatus::Closed;
         self.input_status = InputStatus::Closed;
         self.friendly_vs_capture_enabled = false;
+        self.friendly_vs_capture_round_id = None;
+        self.friendly_vs_capture_local_game_id = None;
         self.latest_snapshot_token = None;
         self.latest_snapshot_age_ms = None;
         self.bot_desired_enabled = false;
@@ -3242,30 +3576,62 @@ impl LauncherApp {
         self.snapshot_status = SnapshotStatus::Error;
         self.browser_status = BrowserStatus::Error;
         self.friendly_vs_capture_enabled = false;
+        self.friendly_vs_capture_round_id = None;
+        self.friendly_vs_capture_local_game_id = None;
         self.push_log(format!(
             "[browser] failed to forward {control_name} to snapshot provider: {err:#}"
         ));
     }
 
-    fn sync_friendly_vs_capture_enabled(&mut self, enabled: bool) -> bool {
+    fn sync_friendly_vs_capture_enabled(
+        &mut self,
+        enabled: bool,
+        round_id: Option<&str>,
+        local_gameid: Option<&str>,
+    ) -> bool {
         if self.snapshot_status == SnapshotStatus::Error
             || self.browser_status == BrowserStatus::Error
         {
             return false;
         }
-        if self.friendly_vs_capture_enabled == enabled {
+        let next_round_id = if enabled {
+            round_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        let next_local_game_id = if enabled {
+            local_gameid
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        if self.friendly_vs_capture_enabled == enabled
+            && self.friendly_vs_capture_round_id == next_round_id
+            && self.friendly_vs_capture_local_game_id == next_local_game_id
+        {
             return true;
         }
         let result = if let Some(session) = self.browser_session.as_mut() {
             session
                 .snapshot_provider
-                .set_friendly_vs_capture_enabled(enabled)
+                .set_friendly_vs_capture_enabled(
+                    enabled,
+                    next_round_id.as_deref(),
+                    next_local_game_id.as_deref(),
+                )
         } else {
             Ok(())
         };
         match result {
             Ok(()) => {
                 self.friendly_vs_capture_enabled = enabled;
+                self.friendly_vs_capture_round_id = next_round_id;
+                self.friendly_vs_capture_local_game_id = next_local_game_id;
                 true
             }
             Err(err) => {
@@ -3293,14 +3659,14 @@ impl LauncherApp {
 
     fn poll_friendly_vs_observer(&mut self) {
         if self.state.selected_mode != RuntimeMode::FriendlyVs || !self.bot_desired_enabled {
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
             if let Some(line) = self.friendly_vs.note_stopped() {
                 self.push_log(line);
             }
             return;
         }
         if self.bot_status != BotStatus::On || !self.friendly_vs_runtime_ready() {
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
             if let Some(line) = self.friendly_vs.note_stopped() {
                 self.push_log(line);
             }
@@ -3316,7 +3682,7 @@ impl LauncherApp {
                 {
                     self.push_log(line);
                 }
-                self.sync_friendly_vs_capture_enabled(false);
+                self.sync_friendly_vs_capture_enabled(false, None, None);
                 if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
                     self.push_log(line);
                 }
@@ -3329,7 +3695,7 @@ impl LauncherApp {
                 {
                     self.push_log(line);
                 }
-                self.sync_friendly_vs_capture_enabled(false);
+                self.sync_friendly_vs_capture_enabled(false, None, None);
                 let error = format!("{err:#}");
                 if let Some(line) = self.friendly_vs.note_bridge_error(&error) {
                     self.push_log(line);
@@ -3344,7 +3710,7 @@ impl LauncherApp {
             self.push_log(line);
         }
         if !self.friendly_vs.is_fresh_bridge(&observation) {
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
             if let Some(line) = self.friendly_vs.note_waiting("bridge_not_fresh") {
                 self.push_log(line);
             }
@@ -3359,7 +3725,7 @@ impl LauncherApp {
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         else {
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
             self.friendly_vs.clear_ready_state();
             return;
         };
@@ -3388,12 +3754,42 @@ impl LauncherApp {
             ) {
                 self.push_log(line);
             }
-            self.sync_friendly_vs_capture_enabled(true);
+            self.sync_friendly_vs_capture_enabled(
+                true,
+                Some(&observation.round_id),
+                Some(&observation.local_game_id),
+            );
         } else if let Some(line) = self.friendly_vs.note_round_ended(&observation.round_id) {
             self.push_log(line);
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
         } else {
-            self.sync_friendly_vs_capture_enabled(false);
+            self.sync_friendly_vs_capture_enabled(false, None, None);
+        }
+    }
+
+    fn defer_friendly_vs_live_input_for_pacing(
+        &mut self,
+        snapshot: &FriendlyVsPassivePlannerSnapshot,
+        prepared: PreparedSnapshotExecution,
+        remaining: Duration,
+    ) {
+        self.friendly_vs_live.set_deferred_plan(snapshot, prepared);
+        let skip_key = format!(
+            "pps_pacing:{}:{}:{}:{}",
+            snapshot.gameid,
+            snapshot.capture_generation,
+            snapshot.candidate_id,
+            piece_counter_label(snapshot.snapshot.piece_counter)
+        );
+        if let Some(line) = self.friendly_vs_live.note_skip(
+            &skip_key,
+            format!(
+                "[friendly-vs-live] input deferred reason=pps_pacing remaining_ms={} piece_counter={}",
+                remaining.as_millis(),
+                piece_counter_label(snapshot.snapshot.piece_counter)
+            ),
+        ) {
+            self.push_log(line);
         }
     }
 
@@ -3588,7 +3984,46 @@ impl LauncherApp {
             self.friendly_vs_dry_run.reset_processed_state();
             return;
         }
-        if self
+        if self.friendly_vs_live.is_deferred_snapshot(snapshot) {
+            if let Some(remaining) = self
+                .friendly_vs_live
+                .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
+            {
+                let skip_key = format!(
+                    "pps_pacing:{}:{}:{}:{}",
+                    snapshot.gameid,
+                    snapshot.capture_generation,
+                    snapshot.candidate_id,
+                    piece_counter_label(snapshot.snapshot.piece_counter)
+                );
+                if let Some(line) = self.friendly_vs_live.note_skip(
+                    &skip_key,
+                    format!(
+                        "[friendly-vs-live] input deferred reason=pps_pacing remaining_ms={} piece_counter={}",
+                        remaining.as_millis(),
+                        piece_counter_label(snapshot.snapshot.piece_counter)
+                    ),
+                ) {
+                    self.push_log(line);
+                }
+                return;
+            }
+            if let Some(deferred) = self
+                .friendly_vs_live
+                .deferred_plan_for_snapshot(snapshot)
+                .cloned()
+            {
+                let config = self.state.to_automation_config(&self.paths);
+                self.try_dispatch_friendly_vs_live_plan(
+                    &config,
+                    &path,
+                    &file_signature,
+                    snapshot,
+                    &deferred.prepared,
+                );
+                return;
+            }
+        } else if self
             .friendly_vs_dry_run
             .is_duplicate_processed_piece(snapshot)
         {
@@ -3653,9 +4088,49 @@ impl LauncherApp {
                     plan.route_kind,
                     plan.planner
                 ));
-                self.friendly_vs_dry_run
-                    .record_processed(snapshot, &file_signature);
-                self.try_dispatch_friendly_vs_live_plan(&config, &path, snapshot, &prepared);
+                if self.friendly_vs_live_uses_start_pose_freshness(&prepared) {
+                    self.friendly_vs_dry_run
+                        .record_attempted(snapshot, &file_signature);
+                    if let Some(remaining) = self
+                        .friendly_vs_live
+                        .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
+                    {
+                        self.defer_friendly_vs_live_input_for_pacing(
+                            snapshot,
+                            prepared.clone(),
+                            remaining,
+                        );
+                    } else {
+                        self.try_dispatch_friendly_vs_live_plan(
+                            &config,
+                            &path,
+                            &file_signature,
+                            snapshot,
+                            &prepared,
+                        );
+                    }
+                } else {
+                    self.friendly_vs_dry_run
+                        .record_processed(snapshot, &file_signature);
+                    if let Some(remaining) = self
+                        .friendly_vs_live
+                        .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
+                    {
+                        self.defer_friendly_vs_live_input_for_pacing(
+                            snapshot,
+                            prepared.clone(),
+                            remaining,
+                        );
+                    } else {
+                        self.try_dispatch_friendly_vs_live_plan(
+                            &config,
+                            &path,
+                            &file_signature,
+                            snapshot,
+                            &prepared,
+                        );
+                    }
+                }
             }
             Ok(PreparedSnapshotExecutionResult::Skipped { reason, retryable }) => {
                 self.friendly_vs_dry_run
@@ -4883,6 +5358,16 @@ mod tests {
             .collect()
     }
 
+    fn friendly_vs_live_started_offsets_ms(app: &LauncherApp, baseline: Instant) -> Vec<u128> {
+        app.zenith_live_test_hook
+            .started_at
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|started_at| started_at.duration_since(baseline).as_millis())
+            .collect()
+    }
+
     fn zenith_passive_snapshot_path(paths: &AppPaths) -> std::path::PathBuf {
         paths.resolve_workspace_path(ZENITH_PASSIVE_SNAPSHOT_RELATIVE_PATH)
     }
@@ -5100,6 +5585,36 @@ mod tests {
             None,
             queue,
         );
+        write_friendly_vs_passive_snapshot_value(paths, &raw);
+    }
+
+    fn write_friendly_vs_passive_snapshot_with_active_pose(
+        paths: &AppPaths,
+        round_id: &str,
+        gameid: &str,
+        candidate_id: &str,
+        piece_counter: u32,
+        userid: serde_json::Value,
+        current_piece: &str,
+        current_x: i32,
+        current_y: i32,
+        current_rotation: &str,
+        queue: &[&str],
+    ) {
+        let mut raw = friendly_vs_ready_snapshot_value(
+            round_id,
+            gameid,
+            candidate_id,
+            7,
+            piece_counter,
+            userid,
+            current_piece,
+            None,
+            queue,
+        );
+        raw["snapshot"]["current"]["x"] = json!(current_x);
+        raw["snapshot"]["current"]["y"] = json!(current_y);
+        raw["snapshot"]["current"]["rotation"] = json!(current_rotation);
         write_friendly_vs_passive_snapshot_value(paths, &raw);
     }
 
@@ -5532,7 +6047,7 @@ mod tests {
         app.browser_status = BrowserStatus::Error;
         let initial_log_count = app.logs.len();
 
-        assert!(!app.sync_friendly_vs_capture_enabled(true));
+        assert!(!app.sync_friendly_vs_capture_enabled(true, Some("7001:seed-1"), Some("7001")));
         assert_eq!(app.logs.len(), initial_log_count);
         assert!(!app.friendly_vs_capture_enabled);
 
@@ -5632,6 +6147,14 @@ mod tests {
             .iter()
             .any(|line| line.contains("round_id=5449:1744077000")));
         assert!(app.friendly_vs_capture_enabled);
+        assert_eq!(
+            app.friendly_vs_capture_round_id.as_deref(),
+            Some("4942:461010047")
+        );
+        assert_eq!(
+            app.friendly_vs_capture_local_game_id.as_deref(),
+            Some("4942")
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -5998,6 +6521,15 @@ mod tests {
             .logs
             .iter()
             .any(|line| { line == "[friendly-vs] round active opponents=2 incoming_garbage=1" }));
+        assert_eq!(
+            app.friendly_vs_capture_round_id.as_deref(),
+            Some("7003:1744077374")
+        );
+        assert_eq!(
+            app.friendly_vs_capture_local_game_id.as_deref(),
+            Some("7003")
+        );
+        assert_eq!(app.friendly_vs.resolved_game_id.as_deref(), Some("7003"));
 
         cleanup_test_paths(&paths);
     }
@@ -6972,6 +7504,235 @@ mod tests {
     }
 
     #[test]
+    fn friendly_vs_live_session_pps_is_fixed_while_bot_is_on() {
+        let paths = test_paths("friendly-vs-live-session-pps-fixed");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.selected_mode = RuntimeMode::FriendlyVs;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 2.0;
+        app.state.normalize_pps_state();
+        configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = true;
+        app.start_bot();
+        arm_friendly_vs_round(&mut app, &paths, "7001:1744077373", 7001);
+
+        assert!(!app.friendly_vs_live_pps_unlimited());
+        assert_eq!(app.friendly_vs_live_target_pps(), 2.0);
+        assert_eq!(
+            app.friendly_vs_live_pps_interval(),
+            Some(Duration::from_millis(500))
+        );
+
+        app.state.pps_unlimited = true;
+        app.state.target_pps = 4.0;
+        app.state.normalize_pps_state();
+
+        assert!(!app.friendly_vs_live_pps_unlimited());
+        assert_eq!(app.friendly_vs_live_target_pps(), 2.0);
+        assert_eq!(
+            app.friendly_vs_live_pps_interval(),
+            Some(Duration::from_millis(500))
+        );
+
+        app.stop_bot_with_browser_hint(false);
+
+        assert!(app.friendly_vs_live_pps_unlimited());
+        assert_eq!(app.friendly_vs_live_pps_interval(), None);
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_pps_two_enforces_half_second_start_interval() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-pps-two");
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 2.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        app.test_now = Some(baseline + Duration::from_millis(500));
+        app.poll_friendly_vs_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(700));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 6, 2);
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            friendly_vs_live_started_offsets_ms(&app, baseline),
+            vec![0, 500, 1000]
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] input deferred reason=pps_pacing remaining_ms=")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_pps_four_enforces_quarter_second_start_interval() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-pps-four");
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 4.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(100));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        app.poll_friendly_vs_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(300));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 6, 2);
+
+        app.test_now = Some(baseline + Duration::from_millis(500));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            friendly_vs_live_started_offsets_ms(&app, baseline),
+            vec![0, 250, 500]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_pps_wait_does_not_replan_same_snapshot() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-pps-no-replan");
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        app.test_now = Some(baseline + Duration::from_millis(500));
+        app.poll_friendly_vs_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(999));
+        app.poll_friendly_vs_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            friendly_vs_live_started_offsets_ms(&app, baseline),
+            vec![0, 1000]
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_pps_wait_stale_snapshot_suppresses_old_dispatch() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-pps-stale-snapshot");
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot(
+                &app.paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                6,
+                json!("friendly-user"),
+                "L",
+                &["I", "O", "T", "S", "Z"],
+            );
+        }));
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_pps_bot_off_cancels_deferred_pacing() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-pps-bot-off-reset");
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
+
+        app.stop_bot_with_browser_hint(false);
+        assert!(app.friendly_vs_live.next_execution_earliest_at.is_none());
+        assert!(app.friendly_vs_live.deferred_snapshot_token.is_none());
+        assert!(app.friendly_vs_live.deferred_plan.is_none());
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
     fn friendly_vs_live_unlimited_stale_then_fresher_piece_progresses_normally() {
         let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
             "friendly-vs-live-unlimited-stale-then-fresh",
@@ -7019,6 +7780,236 @@ mod tests {
         assert!(app.logs.iter().any(|line| {
             line == "[friendly-vs-live] placement executed count=1/Unlimited"
         }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_matching_start_pose_confirms_and_dispatches_once() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-start-pose-confirmed");
+        app.state.bot.use_hold = false;
+
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] execution start pose confirmed")
+                && line.contains("piece_counter=4")
+                && line.contains("piece=J")
+        }));
+        assert!(!app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_active_pose_changes_invalidate_old_plan_without_dispatch() {
+        for (name, mutate) in [
+            ("friendly-vs-live-active-pose-x", "x"),
+            ("friendly-vs-live-active-pose-y", "y"),
+            ("friendly-vs-live-active-pose-rotation", "rotation"),
+        ] {
+            let (paths, mut app, round_id) = setup_friendly_vs_live_app(name);
+            app.state.bot.use_hold = false;
+            write_friendly_vs_passive_snapshot(
+                &paths,
+                &round_id,
+                "7001",
+                "cand-local",
+                4,
+                json!("friendly-user"),
+                "J",
+                &["O", "T", "L", "S", "Z"],
+            );
+            app.friendly_vs_live_before_reread = Some(Box::new(move |app| match mutate {
+                "x" => write_friendly_vs_passive_snapshot_with_active_pose(
+                    &app.paths,
+                    &round_id,
+                    "7001",
+                    "cand-local",
+                    4,
+                    json!("friendly-user"),
+                    "J",
+                    3,
+                    19,
+                    "north",
+                    &["O", "T", "L", "S", "Z"],
+                ),
+                "y" => write_friendly_vs_passive_snapshot_with_active_pose(
+                    &app.paths,
+                    &round_id,
+                    "7001",
+                    "cand-local",
+                    4,
+                    json!("friendly-user"),
+                    "J",
+                    4,
+                    18,
+                    "north",
+                    &["O", "T", "L", "S", "Z"],
+                ),
+                "rotation" => write_friendly_vs_passive_snapshot_with_active_pose(
+                    &app.paths,
+                    &round_id,
+                    "7001",
+                    "cand-local",
+                    4,
+                    json!("friendly-user"),
+                    "J",
+                    4,
+                    19,
+                    "west",
+                    &["O", "T", "L", "S", "Z"],
+                ),
+                _ => unreachable!(),
+            }));
+
+            app.poll_friendly_vs_dry_run();
+
+            assert_eq!(app.friendly_vs_live.executed_placements, 0);
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert!(app.logs.iter().any(|line| {
+                line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+                    && line.contains("piece_counter=4")
+            }));
+            assert!(app.friendly_vs_dry_run.last_processed_snapshot_token.is_none());
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn friendly_vs_live_active_pose_invalidated_piece_replans_same_piece_without_resetting_pps() {
+        let (paths, mut app, round_id) = setup_friendly_vs_live_app_with_options(
+            "friendly-vs-live-active-pose-replan",
+            true,
+            FriendlyVsLiveLimit::Unlimited,
+        );
+        app.state.bot.use_hold = false;
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 1.0;
+        app.state.normalize_pps_state();
+        app.update_live_target_pps();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 4, 0);
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_friendly_vs_dry_run();
+
+        let invalidated_round_id = round_id.clone();
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_with_active_pose(
+                &app.paths,
+                &invalidated_round_id,
+                "7001",
+                "cand-local",
+                5,
+                json!("friendly-user"),
+                "J",
+                3,
+                19,
+                "north",
+                &["O", "T", "L", "S", "Z"],
+            );
+        }));
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(app.friendly_vs_live.executed_placements, 1);
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+                && line.contains("piece_counter=5")
+        }));
+
+        let dispatches_after_invalidation = app
+            .zenith_live_test_hook
+            .dispatch_count
+            .load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(20));
+        write_friendly_vs_passive_snapshot_with_active_pose(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            5,
+            json!("friendly-user"),
+            "J",
+            3,
+            19,
+            "north",
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.test_now = Some(baseline + Duration::from_millis(1000));
+        app.poll_friendly_vs_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            dispatches_after_invalidation + 1
+        );
+        assert_eq!(app.friendly_vs_live.executed_placements, 2);
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] execution start pose confirmed")
+                && line.contains("piece_counter=5")
+        }));
+        assert_eq!(friendly_vs_live_started_offsets_ms(&app, baseline), vec![0, 1000]);
+
+        app.poll_friendly_vs_dry_run();
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            dispatches_after_invalidation + 1
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[friendly-vs-dry-run] plan ready"))
+                .count(),
+            3
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -7373,6 +8364,7 @@ mod tests {
                 movement_actions: vec![GameAction::Left],
                 hard_drop: true,
             },
+            friendly_execution_start_pose: None,
         };
 
         app.execute_friendly_vs_live_plan(&config, &prepared)
@@ -7429,6 +8421,7 @@ mod tests {
                 ],
                 hard_drop: true,
             },
+            friendly_execution_start_pose: None,
         };
 
         app.execute_friendly_vs_live_plan(&config, &prepared)
@@ -7449,6 +8442,73 @@ mod tests {
                 GameAction::HardDrop,
             ]
         );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_soft_drop_spin_route_uses_existing_executor_sequence() {
+        let paths = test_paths("friendly-vs-live-soft-drop-spin-sequence");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_friendly_vs_runtime_ready(&mut app);
+        clear_tapped_actions(&app);
+        let config = app.state.to_automation_config(&app.paths);
+        let prepared = PreparedSnapshotExecution {
+            summary: DryRunPlanSummary {
+                token: "friendly-softdrop-spin".to_owned(),
+                piece: PieceToken::T,
+                hold_piece: None,
+                use_hold: false,
+                target_x: 2,
+                target_rotation: RotationToken::East,
+                movement_mode_used: MovementModeConfig::ZeroGSafe,
+                fallback_from: None,
+                fallback_reason: None,
+                action_count: 5,
+                actions: vec![
+                    GameAction::Left,
+                    GameAction::RotateCw,
+                    GameAction::SoftDrop,
+                    GameAction::RotateCw,
+                    GameAction::HardDrop,
+                ],
+                route_kind: "SoftDropSpinRoute".to_owned(),
+                planner: "test".to_owned(),
+            },
+            execution_plan: ExecutionPlan {
+                hold: false,
+                movement_actions: vec![
+                    GameAction::Left,
+                    GameAction::RotateCw,
+                    GameAction::SoftDrop,
+                    GameAction::RotateCw,
+                ],
+                hard_drop: true,
+            },
+            friendly_execution_start_pose: None,
+        };
+
+        app.dispatch_friendly_vs_live_plan(&config, &prepared).unwrap();
+        assert_eq!(
+            tapped_actions(&app),
+            vec![
+                GameAction::Left,
+                GameAction::RotateCw,
+                GameAction::SoftDrop,
+                GameAction::RotateCw,
+                GameAction::HardDrop,
+            ]
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|line| line.contains("[friendly-vs-spin-step]")));
 
         cleanup_test_paths(&paths);
     }

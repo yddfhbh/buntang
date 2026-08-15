@@ -1,0 +1,31 @@
+{
+  "timestamp": 1700,
+  "target_generation": 0,
+  "script_url_basename": "",
+  "script_id": null,
+  "frame_function_name": null,
+  "call_frame_index": 0,
+  "scope_index": 0,
+  "scope_type": null,
+  "local_binding_name": "Ai4",
+  "successful_locator": "Ai4",
+  "property_chain": [
+    "Ai4",
+    "ejectState",
+    "game",
+    "board"
+  ],
+  "root_object_keys": [
+    "ejectState",
+    "ejectBoardState"
+  ],
+  "eject_keys": [
+    "game"
+  ],
+  "state_keys": [
+    "board"
+  ],
+  "board_state_keys": [
+    "b"
+  ]
+}

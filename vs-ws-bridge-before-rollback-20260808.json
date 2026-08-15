@@ -1,0 +1,26 @@
+{
+  "mode": "zenith",
+  "roundId": "zenith:zenith-session-flat:7302:9932",
+  "round_id": "zenith:zenith-session-flat:7302:9932",
+  "phase": "active",
+  "bagtype": "zenith",
+  "local": {
+    "userid": "local-id",
+    "username": "hebi_",
+    "gameid": 7302,
+    "seed": 9932
+  },
+  "opponents": [],
+  "options": {
+    "bagtype": "zenith",
+    "nextcount": 5,
+    "boardwidth": 10,
+    "boardheight": 20
+  },
+  "roomSeed": null,
+  "version": 1,
+  "sequence": 3,
+  "active": true,
+  "capturedAt": 1786199658710,
+  "incomingGarbage": []
+}

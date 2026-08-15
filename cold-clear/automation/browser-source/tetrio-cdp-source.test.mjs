@@ -902,7 +902,9 @@ test("friendly_vs_capture_enabled control updates the browser gate", () => {
   const applied = applyBrowserControlMessage({
     message: {
       type: "friendly_vs_capture_enabled",
-      enabled: true
+      enabled: true,
+      round_id: "100:seed-1",
+      local_gameid: 100
     },
     controlState,
     closureCaptureState: createClosureCaptureState(),
@@ -913,6 +915,47 @@ test("friendly_vs_capture_enabled control updates the browser gate", () => {
 
   assert.equal(applied, true);
   assert.equal(controlState.friendlyVsCaptureEnabled, true);
+  assert.equal(controlState.friendlyVsCaptureRoundId, "100:seed-1");
+  assert.equal(controlState.friendlyVsCaptureLocalGameId, 100);
+});
+
+test("friendly vs passive capture waits for explicit admission when round metadata is provided", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  controlState.friendlyVsCaptureRoundId = "101:seed-2";
+  controlState.friendlyVsCaptureLocalGameId = 101;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const calls = [];
+  try {
+    const skipped = await maybeRunFriendlyVsPassiveCapture({
+      cdp: {
+        async send(method) {
+          calls.push(method);
+          return {};
+        }
+      },
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "100:seed-1",
+        localGameId: 100
+      },
+      now: 1_000,
+      log: () => {}
+    });
+
+    assert.equal(skipped.reason, "admission_pending");
+    assert.equal(friendlyState.active, false);
+    assert.equal(calls.includes("Debugger.pause"), false);
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
 });
 
 test("zenith passive owner starts while bot is enabled and avoids manual artifacts", () => {
@@ -4601,7 +4644,10 @@ test("friendly vs passive capture waits for a preferred gameplay frame before ru
 
     assert.equal(friendlyState.boundLocalClosureCandidate.candidateId, "cand-local-preferred");
     assert.equal(logs.includes("[friendly-vs-capture] acquisition waiting"), true);
-    assert.equal(logs.includes("[friendly-vs-capture] gameplay frame acquired"), true);
+    assert.equal(
+      logs.some((line) => line.startsWith("[friendly-vs-capture] gameplay frame acquired")),
+      true
+    );
     assert.equal(
       logs.includes("[friendly-vs-capture] bound local gameplay state gameid=8005"),
       true
@@ -5161,15 +5207,20 @@ test("friendly vs passive capture bounds preferred-frame probes per round and re
     }
 
     assert.equal(
-      logs.filter((line) => line === "[friendly-vs-capture] gameplay frame acquisition timed out")
-        .length,
+      logs.filter((line) =>
+        line.startsWith("[friendly-vs-capture] gameplay frame acquisition timed out")
+      ).length,
       1
     );
     assert.equal(
       JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8")).reason,
-      "awaiting_gameplay_frame"
+      "capture_timed_out"
     );
-    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 10);
+    const pauseCountBeforeRearm = harness.calls.filter(
+      (entry) => entry.method === "Debugger.pause"
+    ).length;
+    assert.equal(pauseCountBeforeRearm >= 10, true);
+    assert.equal(pauseCountBeforeRearm <= 20, true);
     assert.equal(harness.counts().semanticProbeCalls, 0);
 
     controlState.botEnabled = false;
@@ -5205,7 +5256,10 @@ test("friendly vs passive capture bounds preferred-frame probes per round and re
       log: (line) => logs.push(line)
       });
 
-    assert.equal(harness.calls.filter((entry) => entry.method === "Debugger.pause").length, 11);
+    assert.equal(
+      harness.calls.filter((entry) => entry.method === "Debugger.pause").length,
+      pauseCountBeforeRearm + 1
+    );
   } finally {
     Date.now = originalDateNow;
     cleanupQuickPlayDiagnosticTempPaths(paths);
@@ -5252,7 +5306,7 @@ test("friendly acquisition does not issue a second pause while the prior probe i
   }
 });
 
-test("friendly acquisition aborts the cycle after one long cheap probe", async () => {
+test("friendly acquisition keeps a slow cheap probe non-fatal while budget remains", async () => {
   const paths = makeQuickPlayDiagnosticTempPaths();
   const controlState = createBrowserControlState();
   controlState.selectedMode = "friendly_vs";
@@ -5290,7 +5344,7 @@ test("friendly acquisition aborts the cycle after one long cheap probe", async (
         roundId: "6002:seed-1",
         localGameId: 6002
       },
-      now: 12_200,
+      now: 12_120,
       log: (line) => logs.push(line)
     });
 
@@ -5298,8 +5352,178 @@ test("friendly acquisition aborts the cycle after one long cheap probe", async (
     assert.equal(harness.counts().getPropertiesCalls, 0);
     assert.equal(harness.counts().callFunctionCalls, 0);
     assert.equal(
-      logs.includes("[friendly-vs-capture] gameplay frame acquisition timed out"),
+      logs.some((line) => line.includes("[friendly-vs-capture] slow acquisition probe attempt=1")),
       true
+    );
+    assert.equal(
+      logs.some((line) => line.includes("[friendly-vs-capture] gameplay frame acquisition timed out")),
+      false
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly acquisition keeps budget pending when readyAt already exists before arm", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  controlState.friendlyVsCaptureRoundId = "7007:ready-at";
+  controlState.friendlyVsCaptureLocalGameId = 7007;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyDeferredAcquisitionHarness();
+  const logs = [];
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "7007:ready-at",
+        localGameId: 7007,
+        seed: "ready-at"
+      },
+      gameplayReadyAt: 33_000,
+      now: 30_000,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(
+      logs.some((line) =>
+        line.includes("acquisition budget pending") &&
+        line.includes("ready_at_ms=33000") &&
+        line.includes("budget_started_at_ms=33000")
+      ),
+      true
+    );
+    assert.equal(
+      logs.some((line) =>
+        line.includes("acquisition probe attempt=1") && line.includes("wall_elapsed_ms=0")
+      ),
+      true
+    );
+    assert.equal(
+      logs.some((line) => line.includes("gameplay frame acquisition timed out")),
+      false
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly acquisition updates countdown alignment when readyAt arrives after arm", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  controlState.friendlyVsCaptureRoundId = "7008:late-ready";
+  controlState.friendlyVsCaptureLocalGameId = 7008;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyDeferredAcquisitionHarness();
+  const logs = [];
+  try {
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "7008:late-ready",
+        localGameId: 7008,
+        seed: "late-ready"
+      },
+      gameplayReadyAt: 0,
+      now: 30_000,
+      log: (line) => logs.push(line)
+    });
+
+    await maybeRunFriendlyVsPassiveCapture({
+      cdp: harness.cdp,
+      friendlyVsPassiveCaptureState: friendlyState,
+      browserControlState: controlState,
+      transientState: { lastRuntimeError: "" },
+      targetUrl: "https://tetr.io/",
+      roundStatus: {
+        active: true,
+        roundId: "7008:late-ready",
+        localGameId: 7008,
+        seed: "late-ready"
+      },
+      gameplayReadyAt: 33_500,
+      now: 31_000,
+      log: (line) => logs.push(line)
+    });
+
+    assert.equal(
+      logs.some((line) =>
+        line.includes("acquisition budget pending") &&
+        line.includes("ready_at_ms=33500") &&
+        line.includes("budget_started_at_ms=33500")
+      ),
+      true
+    );
+    assert.equal(
+      logs.some((line) =>
+        line.includes("acquisition probe attempt=2") && line.includes("wall_elapsed_ms=0")
+      ),
+      true
+    );
+  } finally {
+    cleanupQuickPlayDiagnosticTempPaths(paths);
+  }
+});
+
+test("friendly acquisition times out only after the 3500ms wall budget expires", async () => {
+  const paths = makeQuickPlayDiagnosticTempPaths();
+  const controlState = createBrowserControlState();
+  controlState.selectedMode = "friendly_vs";
+  controlState.botEnabled = true;
+  controlState.friendlyVsCaptureEnabled = true;
+  controlState.friendlyVsCaptureRoundId = "7009:timeout";
+  controlState.friendlyVsCaptureLocalGameId = 7009;
+  const friendlyState = makeFriendlyVsPassiveState(paths);
+  const harness = createFriendlyDeferredAcquisitionHarness();
+  const logs = [];
+  try {
+    for (const tickNow of [
+      40_000, 40_400, 40_800, 41_200, 41_600, 42_000, 42_400, 42_800, 43_200, 43_618
+    ]) {
+      await maybeRunFriendlyVsPassiveCapture({
+        cdp: harness.cdp,
+        friendlyVsPassiveCaptureState: friendlyState,
+        browserControlState: controlState,
+        transientState: { lastRuntimeError: "" },
+        targetUrl: "https://tetr.io/",
+        roundStatus: {
+          active: true,
+          roundId: "7009:timeout",
+          localGameId: 7009,
+          seed: "timeout"
+        },
+        gameplayReadyAt: 40_000,
+        now: tickNow,
+        log: (line) => logs.push(line)
+      });
+    }
+
+    assert.equal(
+      logs.some((line) =>
+        line.includes("[friendly-vs-capture] gameplay frame acquisition timed out") &&
+        line.includes("wall_elapsed_ms=3618")
+      ),
+      true
+    );
+    assert.equal(
+      JSON.parse(readFileSync(friendlyState.passiveSnapshotPath, "utf8")).reason,
+      "capture_timed_out"
     );
   } finally {
     cleanupQuickPlayDiagnosticTempPaths(paths);

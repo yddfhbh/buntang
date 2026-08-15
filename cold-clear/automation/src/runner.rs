@@ -1247,10 +1247,19 @@ pub(crate) struct DryRunPlanSummary {
     pub planner: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FriendlyExecutionStartPose {
+    pub piece: PieceToken,
+    pub x: i32,
+    pub y: i32,
+    pub rotation: RotationToken,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSnapshotExecution {
     pub summary: DryRunPlanSummary,
     pub execution_plan: ExecutionPlan,
+    pub friendly_execution_start_pose: Option<FriendlyExecutionStartPose>,
 }
 
 #[derive(Debug)]
@@ -1368,6 +1377,11 @@ fn finalize_snapshot_execution_attempt(
                         planner: attempt.planner_label,
                     },
                     execution_plan: plan.execution_plan,
+                    friendly_execution_start_pose: friendly_execution_start_pose(
+                        snapshot,
+                        attempt.planned_move.hold,
+                        active_piece.into(),
+                    ),
                 },
             ))
         }
@@ -1598,6 +1612,32 @@ fn rotation_token_from_state(rotation: RotationState) -> RotationToken {
         RotationState::South => RotationToken::South,
         RotationState::West => RotationToken::West,
     }
+}
+
+fn piece_token_from_piece(piece: Piece) -> PieceToken {
+    match piece {
+        Piece::I => PieceToken::I,
+        Piece::O => PieceToken::O,
+        Piece::T => PieceToken::T,
+        Piece::L => PieceToken::L,
+        Piece::J => PieceToken::J,
+        Piece::S => PieceToken::S,
+        Piece::Z => PieceToken::Z,
+    }
+}
+
+pub(crate) fn friendly_execution_start_pose(
+    snapshot: &GameSnapshot,
+    use_hold: bool,
+    active_piece: Piece,
+) -> Option<FriendlyExecutionStartPose> {
+    let piece = active_piece_for_execution(snapshot, use_hold, active_piece)?;
+    Some(FriendlyExecutionStartPose {
+        piece: piece_token_from_piece(piece.kind.0),
+        x: piece.x,
+        y: piece.y,
+        rotation: rotation_token_from_state(piece.kind.1),
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

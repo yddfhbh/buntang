@@ -497,7 +497,8 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
   const roundId = active ? String(current?.roundId ?? "") : "";
   const localGameId = active ? String(current?.local?.gameid ?? "") : "";
   const seed = active ? String(current?.options?.seed ?? "") : "";
-  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${seed}`;
+  const readyAt = active ? Math.max(0, Number(current?.readyAt ?? 0)) : 0;
+  const nextKey = `${active ? 1 : 0}|${roundId}|${localGameId}|${seed}|${readyAt}`;
   if (nextKey === observerState.lastVsRoundStatusKey) {
     return;
   }
@@ -507,7 +508,8 @@ function emitVsRoundStatusIfChanged(observerState, onVsRoundStatus) {
       active,
       roundId,
       localGameId,
-      seed
+      seed,
+      readyAt
     });
   } catch {}
 }

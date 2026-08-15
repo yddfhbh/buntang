@@ -1147,32 +1147,82 @@ test("observer callback fires only when active state or roundId changes", async 
   cdp.emit("Network.webSocketClosed", { requestId: "req-vs-1" });
   cleanup();
 
-  assert.deepEqual(statuses, [
-    {
-      active: false,
-      roundId: "",
-      localGameId: "",
-      seed: ""
+  assert.equal(statuses.length, 4);
+  assert.deepEqual(statuses[0], {
+    active: false,
+    roundId: "",
+    localGameId: "",
+    seed: "",
+    readyAt: 0
+  });
+  assert.equal(statuses[1].active, true);
+  assert.equal(statuses[1].roundId, "5449:1744077373");
+  assert.equal(statuses[1].localGameId, "5449");
+  assert.equal(statuses[1].seed, "1744077373");
+  assert.equal(statuses[1].readyAt > 0, true);
+  assert.equal(statuses[2].active, true);
+  assert.equal(statuses[2].roundId, "5451:1744077374");
+  assert.equal(statuses[2].localGameId, "5451");
+  assert.equal(statuses[2].seed, "1744077374");
+  assert.equal(statuses[2].readyAt > 0, true);
+  assert.deepEqual(statuses[3], {
+    active: false,
+    roundId: "",
+    localGameId: "",
+    seed: "",
+    readyAt: 0
+  });
+});
+
+test("observer callback re-emits when readyAt changes for the same active round", async () => {
+  const cdp = new FakeCdp();
+  const statuses = [];
+  const cleanup = await installDddWsObserver(cdp, {
+    unpack: () => {
+      throw new Error("unused");
     },
-    {
-      active: true,
-      roundId: "5449:1744077373",
-      localGameId: "5449",
-      seed: "1744077373"
-    },
-    {
-      active: true,
-      roundId: "5451:1744077374",
-      localGameId: "5451",
-      seed: "1744077374"
-    },
-    {
-      active: false,
-      roundId: "",
-      localGameId: "",
-      seed: ""
+    log: () => {},
+    vsSimEnabled: true,
+    onVsRoundStatus: (status) => statuses.push(status)
+  });
+  setObserverMode(cleanup, "friendly_vs", 1, true, "hebi_");
+
+  const firstPayload = vsRoundPayload();
+  const secondPayload = vsRoundPayload();
+  secondPayload.options.countdown_interval = 1500;
+
+  cdp.emit("Network.webSocketCreated", {
+    requestId: "req-vs-ready-at",
+    url: "wss://spool.tetr.io/socket"
+  });
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-ready-at",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(firstPayload)
     }
-  ]);
+  });
+  cdp.emit("Network.webSocketFrameReceived", {
+    requestId: "req-vs-ready-at",
+    response: {
+      opcode: 1,
+      payloadData: JSON.stringify(secondPayload)
+    }
+  });
+  cleanup();
+
+  assert.equal(statuses.length, 4);
+  assert.equal(statuses[1].roundId, "5449:1744077373");
+  assert.equal(statuses[2].roundId, "5449:1744077373");
+  assert.equal(statuses[1].readyAt > 0, true);
+  assert.equal(statuses[2].readyAt > statuses[1].readyAt, true);
+  assert.deepEqual(statuses[3], {
+    active: false,
+    roundId: "",
+    localGameId: "",
+    seed: "",
+    readyAt: 0
+  });
 });
 
 test("observer callback errors do not stop frame handling", async () => {
@@ -2092,12 +2142,14 @@ test("DDD WebSocket observer is installed by default", () => {
   const readyIndex = source.indexOf("process.stdout.write(");
   const observerIndex = source.indexOf('await import("./ddd-ws-observer.mjs")');
   const bringToFrontIndex = source.indexOf('cdp.send("Page.bringToFront")');
+  const startupFocusIndex = source.indexOf("window.focus(); document.body");
 
   assert.ok(pageEnableIndex >= 0);
   assert.ok(runtimeEnableIndex > pageEnableIndex);
   assert.ok(readyIndex > runtimeEnableIndex);
   assert.ok(observerIndex > readyIndex);
-  assert.ok(bringToFrontIndex > observerIndex);
+  assert.equal(bringToFrontIndex, -1);
+  assert.equal(startupFocusIndex, -1);
 });
 
 test("DDD WebSocket observer cleanup runs before cdp close", () => {

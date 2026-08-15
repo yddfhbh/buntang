@@ -217,7 +217,6 @@ async function focusPage(cdp) {
         typeof keepalive?.originalHasFocus === "function"
           ? Boolean(keepalive.originalHasFocus())
           : Boolean(document.hasFocus?.());
-      window.focus();
       const active = document.activeElement;
       if (active && typeof active.blur === "function") active.blur();
       if (document.body && typeof document.body.focus === "function") document.body.focus();
@@ -261,7 +260,6 @@ class InputCommandError extends Error {
 }
 
 async function prepareInputTarget(cdp, focusLogState) {
-  await cdp.send("Page.bringToFront");
   const focusState = await focusPage(cdp);
   const visibilityState = `${focusState?.visibilityState ?? ""}`;
   const activeTag = `${focusState?.activeTag ?? ""}`.toUpperCase();
@@ -417,7 +415,6 @@ async function connectToTarget({ port, url, targetHint }) {
   const cdp = await CdpClient.connect(target.webSocketDebuggerUrl);
   await cdp.send("Page.enable").catch(() => undefined);
   await cdp.send("Runtime.enable").catch(() => undefined);
-  await cdp.send("Page.bringToFront").catch(() => undefined);
   await installBackgroundInputKeepalive(cdp);
   await focusPage(cdp);
   return cdp;

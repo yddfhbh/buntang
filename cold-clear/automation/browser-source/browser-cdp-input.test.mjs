@@ -149,33 +149,29 @@ test("sequence preserves action order and responds once", async () => {
   assert.equal(cdp.events.some((event) => event.method === "Page.bringToFront"), false);
 });
 
-test("sequence pipelines keyUp acknowledgement with next keyDown without reordering events", async () => {
+test("sequence fire-and-collect overlaps CDP acknowledgements without reordering key events", async () => {
   const cdp = createFakeCdp();
 
   const originalSend = cdp.send.bind(cdp);
-  let inFlightDispatches = 0;
-  let maxInFlightDispatches = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
 
   cdp.send = async (method, params = {}) => {
     if (method !== "Input.dispatchKeyEvent") {
       return originalSend(method, params);
     }
 
-    // ?? ???? ?? ???? CDP acknowledgement? ??
-    // ???? ??? ?? ??.
+    // Record/submit the event immediately, then delay only its ACK.
     const result = await originalSend(method, params);
 
-    inFlightDispatches += 1;
-    maxInFlightDispatches = Math.max(
-      maxInFlightDispatches,
-      inFlightDispatches
-    );
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
 
     try {
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await new Promise((resolve) => setTimeout(resolve, 30));
       return result;
     } finally {
-      inFlightDispatches -= 1;
+      inFlight -= 1;
     }
   };
 
@@ -211,8 +207,8 @@ test("sequence pipelines keyUp acknowledgement with next keyDown without reorder
   );
 
   assert.ok(
-    maxInFlightDispatches >= 2,
-    `expected pipelined dispatches, max=${maxInFlightDispatches}`
+    maxInFlight >= 4,
+    `expected several outstanding CDP ACKs, max=${maxInFlight}`
   );
 
   assert.equal(pressedKeys.size, 0);
@@ -223,6 +219,51 @@ test("sequence pipelines keyUp acknowledgement with next keyDown without reorder
     type: "sequence",
     actionCount: 4
   });
+});
+
+test("sequence tracking survives out-of-order CDP acknowledgements", async () => {
+  const cdp = createFakeCdp();
+  const originalSend = cdp.send.bind(cdp);
+
+  cdp.send = async (method, params = {}) => {
+    if (method !== "Input.dispatchKeyEvent") {
+      return originalSend(method, params);
+    }
+
+    const result = await originalSend(method, params);
+
+    // Make the older keyDown ACK arrive after the newer keyUp ACK.
+    const delay = params.type === "keyDown" ? 30 : 5;
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    return result;
+  };
+
+  const pressedKeys = new Set();
+  const { context, responses } = createContext(cdp, pressedKeys);
+
+  await handleMessage(
+    {
+      id: 102,
+      type: "sequence",
+      actions: [
+        { key: "moveRight", durationMs: 5 }
+      ]
+    },
+    context
+  );
+
+  assert.deepEqual(
+    keyEventCodes(cdp.events),
+    [
+      "keyDown:ArrowRight",
+      "keyUp:ArrowRight"
+    ]
+  );
+
+  assert.equal(pressedKeys.size, 0);
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].ok, true);
 });
 
 test("releaseAll only sends keyUp for tracked keys", async () => {

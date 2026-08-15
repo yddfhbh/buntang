@@ -346,20 +346,20 @@ function dispatchSequenceKey(cdp, spec, type, pressedKeys, keyEpochs) {
   keyEpochs.set(spec.code, epoch);
 
   // Track keyDown immediately so recovery can always release it.
-  // On failure, recoverInputState() can send keyUp again to clean up safely.
   if (type === "keyDown") {
     pressedKeys.add(spec.code);
   }
 
   return dispatchKey(cdp, spec, type).then(() => {
-    if (type === "keyDown") {
-      pressedKeys.add(spec.code);
+    // Never let an acknowledgement from an older event overwrite
+    // the tracked state established by a newer event for this key.
+    if (keyEpochs.get(spec.code) !== epoch) {
       return;
     }
 
-    // ?? ?? ? ??? ???? ?? queue? ??,
-    // ?? keyUp ACK? ?? ????? pressed ??? ??? ???.
-    if (keyEpochs.get(spec.code) === epoch) {
+    if (type === "keyDown") {
+      pressedKeys.add(spec.code);
+    } else {
       pressedKeys.delete(spec.code);
     }
   });
@@ -403,70 +403,50 @@ async function executeInputAction(cdp, action, targetInfo, setClient, pressedKey
 
 export async function executeSequence(cdp, actions, targetInfo, setClient, pressedKeys) {
   const keyEpochs = new Map();
-  let pendingKeyUp = null;
+  const pendingDispatches = [];
 
-  const settleDispatch = (promise) =>
-    promise.then(
+  const queueDispatch = (spec, type) => {
+    // Start the CDP command immediately, but convert its result to a
+    // settled promise so a delayed failure cannot become unhandled.
+    const settled = dispatchSequenceKey(
+      cdp,
+      spec,
+      type,
+      pressedKeys,
+      keyEpochs
+    ).then(
       () => null,
       (error) => error
     );
 
+    pendingDispatches.push(settled);
+  };
+
   try {
     for (const action of actions) {
-      // ?? keyUp ACK? ???? ?? ?? keyDown? ?? ????.
-      // WebSocket/CDP ?? ?? ???
-      // previous keyUp -> current keyDown ?? ????.
-      const pendingKeyDown = settleDispatch(
-        dispatchSequenceKey(
-          cdp,
-          action.spec,
-          "keyDown",
-          pressedKeys,
-          keyEpochs
-        )
-      );
+      // Commands are still submitted in strict event order:
+      // keyDown -> duration -> keyUp -> next keyDown.
+      //
+      // The optimization is that CDP acknowledgement latency no
+      // longer blocks the configured key timing.
+      queueDispatch(action.spec, "keyDown");
 
-      // ?? keyUp? ?? keyDown acknowledgement? ??? ????.
-      const pendingBeforeHold = pendingKeyUp
-        ? [pendingKeyUp, pendingKeyDown]
-        : [pendingKeyDown];
-
-      const dispatchErrors = await Promise.all(pendingBeforeHold);
-      const firstDispatchError = dispatchErrors.find(
-        (error) => error !== null
-      );
-
-      if (firstDispatchError) {
-        throw firstDispatchError;
-      }
-
-      // keyDown ACK ???? duration? ???
-      // ?? ? ????? ???? ???? ???.
       await sleep(action.durationMs);
 
-      // keyUp? ??? ???? ???? ACK? ???? ???.
-      // ?? loop? keyDown? ?? ????.
-      pendingKeyUp = settleDispatch(
-        dispatchSequenceKey(
-          cdp,
-          action.spec,
-          "keyUp",
-          pressedKeys,
-          keyEpochs
-        )
-      );
+      queueDispatch(action.spec, "keyUp");
 
       if (action.afterMs > 0) {
         await sleep(action.afterMs);
       }
     }
 
-    // ??? keyUp? ??? ?? ???? ????.
-    if (pendingKeyUp) {
-      const finalError = await pendingKeyUp;
-      if (finalError) {
-        throw finalError;
-      }
+    // Do not report sequence success until every CDP command has
+    // acknowledged successfully.
+    const errors = await Promise.all(pendingDispatches);
+    const firstError = errors.find((error) => error !== null);
+
+    if (firstError) {
+      throw firstError;
     }
   } catch (error) {
     await recoverInputState(

@@ -9561,7 +9561,7 @@ mod tests {
     }
 
     #[test]
-        fn zenith_live_three_pps_anchor_dispatches_saved_plan_after_wait() {
+    fn zenith_live_three_pps_anchor_dispatches_saved_plan_after_wait() {
         let paths = test_paths("zenith-live-three-pps-anchor");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
@@ -9637,7 +9637,7 @@ mod tests {
         ] {
             let paths = test_paths(name);
             let mut app = LauncherApp::new(paths.clone());
-           app.state.pps_unlimited = false;
+            app.state.pps_unlimited = false;
             app.state.target_pps = 3.0;
             app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
             app.state.normalize_pps_state();
@@ -9794,7 +9794,7 @@ mod tests {
     }
 
     #[test]
-        fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
+    fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
         let paths = test_paths("zenith-live-pose-piece-advanced");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
@@ -9855,7 +9855,7 @@ mod tests {
     }
 
     #[test]
-        fn zenith_live_deferred_plan_identity_change_clears_and_replans_next_poll() {
+    fn zenith_live_deferred_plan_identity_change_clears_and_replans_next_poll() {
         let paths = test_paths("zenith-live-deferred-identity-change");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;

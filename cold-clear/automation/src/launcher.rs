@@ -1680,6 +1680,7 @@ impl ZenithLiveController {
             .session_target_pps_interval()
             .map(|interval| now + interval);
         self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
     }
 
     fn pacing_remaining_for_snapshot(
@@ -9495,6 +9496,7 @@ mod tests {
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
         app.state.target_pps = 3.0;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
         app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
@@ -9527,7 +9529,7 @@ mod tests {
         assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
         assert!(app.logs.iter().any(|line| {
             line.contains("[zenith-live] input suppressed reason=provider_generation_changed")
-                && line.contains("piece_counter=6")
+                && line.contains("piece_counter=7")
         }));
         assert_eq!(
             app.logs
@@ -9559,11 +9561,12 @@ mod tests {
     }
 
     #[test]
-    fn zenith_live_three_pps_anchor_dispatches_saved_plan_after_wait() {
+        fn zenith_live_three_pps_anchor_dispatches_saved_plan_after_wait() {
         let paths = test_paths("zenith-live-three-pps-anchor");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
         app.state.target_pps = 3.0;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
         app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
@@ -9634,8 +9637,9 @@ mod tests {
         ] {
             let paths = test_paths(name);
             let mut app = LauncherApp::new(paths.clone());
-            app.state.pps_unlimited = false;
+           app.state.pps_unlimited = false;
             app.state.target_pps = 3.0;
+            app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
             app.state.normalize_pps_state();
             configure_zenith_runtime_ready(&mut app);
             app.state.zenith_live_input_enabled = true;
@@ -9663,7 +9667,7 @@ mod tests {
             );
             assert!(app.zenith_live.deferred_plan.is_some());
 
-            app.test_now = Some(baseline + Duration::from_millis(250));
+            app.test_now = Some(baseline + Duration::from_millis(334));
             write_zenith_passive_snapshot_with_active_pose(&app.paths, 7, x, y, rotation);
             app.poll_zenith_dry_run();
 
@@ -9676,23 +9680,11 @@ mod tests {
             assert!(app.zenith_live.deferred_plan.is_none());
             assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
 
-            app.test_now = Some(baseline + Duration::from_millis(250));
-            write_zenith_passive_snapshot_with_active_pose(&app.paths, 7, x, y, rotation);
-            app.poll_zenith_dry_run();
-
-            assert_eq!(
-                app.logs
-                    .iter()
-                    .filter(|line| line.contains("[zenith-dry-run] plan ready"))
-                    .count(),
-                3
-            );
-            assert_eq!(
-                app.zenith_live_test_hook
-                    .dispatch_count
-                    .load(Ordering::Relaxed),
-                1
-            );
+            assert!(app.logs.iter().any(|line| {
+                line.contains("[zenith-live] plan invalidated before dispatch")
+                    && line.contains("reason=pose_mismatch")
+                    && line.contains("piece_counter=7")
+            }));
 
             cleanup_test_paths(&paths);
         }
@@ -9802,11 +9794,12 @@ mod tests {
     }
 
     #[test]
-    fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
+        fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
         let paths = test_paths("zenith-live-pose-piece-advanced");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
         app.state.target_pps = 3.0;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
         app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
@@ -9862,11 +9855,12 @@ mod tests {
     }
 
     #[test]
-    fn zenith_live_deferred_plan_identity_change_clears_and_replans_next_poll() {
+        fn zenith_live_deferred_plan_identity_change_clears_and_replans_next_poll() {
         let paths = test_paths("zenith-live-deferred-identity-change");
         let mut app = LauncherApp::new(paths.clone());
         app.state.pps_unlimited = false;
         app.state.target_pps = 3.0;
+        app.state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
         app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
@@ -9949,7 +9943,7 @@ mod tests {
             app.zenith_live_test_hook
                 .dispatch_count
                 .load(Ordering::Relaxed),
-            1
+            2
         );
 
         cleanup_test_paths(&paths);

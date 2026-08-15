@@ -1248,18 +1248,20 @@ pub(crate) struct DryRunPlanSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct FriendlyExecutionStartPose {
+pub(crate) struct ExecutionStartPose {
     pub piece: PieceToken,
     pub x: i32,
     pub y: i32,
     pub rotation: RotationToken,
+    pub piece_counter: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedSnapshotExecution {
     pub summary: DryRunPlanSummary,
     pub execution_plan: ExecutionPlan,
-    pub friendly_execution_start_pose: Option<FriendlyExecutionStartPose>,
+    pub execution_start_pose: Option<ExecutionStartPose>,
+    pub planned_provider_generation: u64,
 }
 
 #[derive(Debug)]
@@ -1275,11 +1277,13 @@ struct SnapshotExecutionAttempt {
     movement_mode_used: MovementModeConfig,
     fallback_from: Option<MovementModeConfig>,
     fallback_reason: Option<String>,
+    planned_provider_generation: u64,
 }
 
 pub(crate) fn prepare_snapshot_execution(
     config: &AutomationConfig,
     snapshot: &GameSnapshot,
+    planned_provider_generation: u64,
 ) -> Result<PreparedSnapshotExecutionResult> {
     let sprint_state = SprintState::default();
     let active_piece = snapshot
@@ -1307,6 +1311,7 @@ pub(crate) fn prepare_snapshot_execution(
                 movement_mode_used: config.bot.movement_mode,
                 fallback_from: None,
                 fallback_reason: None,
+                planned_provider_generation,
             },
         ),
         Err(BuildExecutionError::NoSafeRoute(failure)) => {
@@ -1342,6 +1347,7 @@ pub(crate) fn prepare_snapshot_execution(
                     movement_mode_used: fallback_mode,
                     fallback_from: Some(config.bot.movement_mode),
                     fallback_reason: Some(fallback_reason),
+                    planned_provider_generation: 0,
                 },
             )
         }
@@ -1377,11 +1383,8 @@ fn finalize_snapshot_execution_attempt(
                         planner: attempt.planner_label,
                     },
                     execution_plan: plan.execution_plan,
-                    friendly_execution_start_pose: friendly_execution_start_pose(
-                        snapshot,
-                        attempt.planned_move.hold,
-                        active_piece.into(),
-                    ),
+                    execution_start_pose: execution_start_pose(snapshot),
+                    planned_provider_generation: attempt.planned_provider_generation,
                 },
             ))
         }
@@ -1614,29 +1617,15 @@ fn rotation_token_from_state(rotation: RotationState) -> RotationToken {
     }
 }
 
-fn piece_token_from_piece(piece: Piece) -> PieceToken {
-    match piece {
-        Piece::I => PieceToken::I,
-        Piece::O => PieceToken::O,
-        Piece::T => PieceToken::T,
-        Piece::L => PieceToken::L,
-        Piece::J => PieceToken::J,
-        Piece::S => PieceToken::S,
-        Piece::Z => PieceToken::Z,
-    }
-}
-
-pub(crate) fn friendly_execution_start_pose(
-    snapshot: &GameSnapshot,
-    use_hold: bool,
-    active_piece: Piece,
-) -> Option<FriendlyExecutionStartPose> {
-    let piece = active_piece_for_execution(snapshot, use_hold, active_piece)?;
-    Some(FriendlyExecutionStartPose {
-        piece: piece_token_from_piece(piece.kind.0),
-        x: piece.x,
-        y: piece.y,
-        rotation: rotation_token_from_state(piece.kind.1),
+pub(crate) fn execution_start_pose(snapshot: &GameSnapshot) -> Option<ExecutionStartPose> {
+    let piece = snapshot.queue.first().copied()?;
+    let active = snapshot.active?;
+    Some(ExecutionStartPose {
+        piece,
+        x: active.x,
+        y: active.y,
+        rotation: active.rotation,
+        piece_counter: snapshot.piece_counter,
     })
 }
 
@@ -2700,6 +2689,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn execution_start_pose_preserves_active_pose_and_piece_counter() {
+        let mut snapshot = runner_test_snapshot("execution-start-pose", 42);
+        snapshot.hold = Some(PieceToken::T);
+        snapshot.active = Some(ActivePieceState {
+            x: 5,
+            y: 17,
+            rotation: RotationToken::East,
+        });
+
+        assert_eq!(
+            execution_start_pose(&snapshot),
+            Some(ExecutionStartPose {
+                piece: PieceToken::J,
+                x: 5,
+                y: 17,
+                rotation: RotationToken::East,
+                piece_counter: Some(42),
+            })
+        );
+    }
+
     fn write_runner_snapshot_file(path: &Path, snapshot: &GameSnapshot) {
         let current = snapshot
             .queue
@@ -3058,6 +3069,7 @@ mod tests {
             SnapshotExecutionAttempt {
                 planned_move,
                 planner_label: "normal nodes=1 depth=1 rank=0".to_owned(),
+                planned_provider_generation: 0,
                 execution_result: Ok(ExecutionPlanBuildResult {
                     execution_plan: ExecutionPlan {
                         hold: false,
@@ -3142,6 +3154,7 @@ mod tests {
                 fallback_reason: Some(
                     "post_softdrop_horizontal_blocked actions=Left x1".to_owned(),
                 ),
+                planned_provider_generation: 0,
             },
         )
         .unwrap();

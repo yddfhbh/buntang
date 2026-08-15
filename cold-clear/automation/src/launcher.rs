@@ -23,7 +23,7 @@ use crate::driver::{
 };
 use crate::paths::AppPaths;
 use crate::runner::{
-    friendly_execution_start_pose, FriendlyExecutionStartPose, prepare_snapshot_execution,
+    execution_start_pose, prepare_snapshot_execution, ExecutionStartPose,
     PreparedSnapshotExecution, PreparedSnapshotExecutionResult,
 };
 use crate::runtime::run_automation_with_resources_and_live_pps;
@@ -1393,10 +1393,23 @@ impl ZenithDryRunController {
         self.clear_skip_reason();
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn record_processed(&mut self, snapshot: &ZenithPassivePlannerSnapshot, file_signature: &str) {
         self.record_attempted(snapshot, file_signature);
         self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
         self.last_planned_at = Some(Instant::now());
+    }
+
+    fn mark_processed_snapshot(&mut self, snapshot: &ZenithPassivePlannerSnapshot) {
+        self.last_game_id = Some(snapshot.gameid.clone());
+        self.last_capture_generation = Some(snapshot.capture_generation);
+        self.last_candidate_id = Some(snapshot.candidate_id.clone());
+        self.last_piece_counter = snapshot.snapshot.piece_counter;
+        self.last_current_signature = Some(snapshot.current_signature.clone());
+        self.last_processed_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.last_planned_at = Some(Instant::now());
+        self.active = true;
+        self.clear_skip_reason();
     }
 
     fn is_duplicate_attempt(&self, file_signature: &str) -> bool {
@@ -1668,6 +1681,10 @@ impl ZenithLiveController {
         self.deferred_snapshot_token = Some(snapshot.snapshot.token.clone());
     }
 
+    fn clear_deferred_snapshot(&mut self) {
+        self.deferred_snapshot_token = None;
+    }
+
     fn is_deferred_snapshot(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
         self.deferred_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
     }
@@ -1825,6 +1842,8 @@ pub struct LauncherApp {
     test_now: Option<Instant>,
     #[cfg(test)]
     friendly_vs_live_before_reread: Option<Box<dyn FnOnce(&mut LauncherApp)>>,
+    #[cfg(test)]
+    zenith_live_before_reread: Option<Box<dyn FnOnce(&mut LauncherApp)>>,
 }
 
 impl LauncherApp {
@@ -1867,6 +1886,8 @@ impl LauncherApp {
             test_now: None,
             #[cfg(test)]
             friendly_vs_live_before_reread: None,
+            #[cfg(test)]
+            zenith_live_before_reread: None,
         }
     }
 
@@ -2391,61 +2412,67 @@ impl LauncherApp {
         }
     }
 
-    fn friendly_vs_live_uses_start_pose_freshness(
-        &self,
-        prepared: &PreparedSnapshotExecution,
-    ) -> bool {
+    fn friendly_vs_live_requires_source_pose_guard(&self) -> bool {
         self.friendly_vs_live_input_allowed()
-            && !prepared.summary.use_hold
-            && prepared.friendly_execution_start_pose.is_some()
     }
 
-    fn log_friendly_vs_execution_start_pose_confirmed(
+    fn log_execution_start_pose_confirmed(
         &mut self,
-        piece_counter: Option<u32>,
-        pose: &FriendlyExecutionStartPose,
+        mode: &str,
+        pose: &ExecutionStartPose,
     ) {
         self.push_log(format!(
-            "[friendly-vs-live] execution start pose confirmed piece_counter={} piece={} x={} y={} rotation={:?}",
-            piece_counter_label(piece_counter),
+            "[{mode}] plan source pose confirmed before dispatch piece={} x={} y={} rotation={:?} piece_counter={}",
             pose.piece.label(),
             pose.x,
             pose.y,
-            pose.rotation
+            pose.rotation,
+            piece_counter_label(pose.piece_counter)
         ));
     }
 
-    fn invalidate_friendly_vs_live_plan_for_start_pose(
+    fn invalidate_live_plan_for_start_pose(
         &mut self,
-        fresh_snapshot: &FriendlyVsPassivePlannerSnapshot,
-        planned_pose: &FriendlyExecutionStartPose,
-        fresh_pose: Option<&FriendlyExecutionStartPose>,
+        mode: &str,
+        planned_pose: &ExecutionStartPose,
+        fresh_pose: Option<&ExecutionStartPose>,
     ) {
-        let (fresh_piece, fresh_x, fresh_y, fresh_rotation) = match fresh_pose {
+        let reason = if fresh_pose
+            .is_some_and(|pose| pose.piece_counter != planned_pose.piece_counter)
+        {
+            "piece_advanced"
+        } else {
+            "pose_mismatch"
+        };
+        let (fresh_piece, fresh_x, fresh_y, fresh_rotation, fresh_counter) = match fresh_pose {
             Some(pose) => (
                 pose.piece.label().to_owned(),
                 pose.x.to_string(),
                 pose.y.to_string(),
                 format!("{:?}", pose.rotation),
+                piece_counter_label(pose.piece_counter),
             ),
             None => (
                 "?".to_owned(),
                 "missing".to_owned(),
                 "missing".to_owned(),
                 "missing".to_owned(),
+                "missing".to_owned(),
             ),
         };
         self.push_log(format!(
-            "[friendly-vs-live] plan invalidated reason=active_pose_changed piece_counter={} planned_piece={} planned_x={} planned_y={} planned_rotation={:?} fresh_piece={} fresh_x={} fresh_y={} fresh_rotation={}",
-            piece_counter_label(fresh_snapshot.snapshot.piece_counter),
+            "[{mode}] plan invalidated before dispatch planned=(piece={} x={} y={} rotation={:?} piece_counter={}) actual=(piece={} x={} y={} rotation={} piece_counter={}) reason={} action=discard_and_replan",
             planned_pose.piece.label(),
             planned_pose.x,
             planned_pose.y,
             planned_pose.rotation,
+            piece_counter_label(planned_pose.piece_counter),
             fresh_piece,
             fresh_x,
             fresh_y,
-            fresh_rotation
+            fresh_rotation,
+            fresh_counter,
+            reason
         ));
     }
 
@@ -2492,6 +2519,25 @@ impl LauncherApp {
             return Ok(Some(snapshot));
         }
         Ok(Some(snapshot))
+    }
+
+    fn zenith_live_reread_snapshot(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<Option<ZenithPassivePlannerSnapshot>> {
+        let Some((envelope, age)) = read_zenith_passive_snapshot_file_with_age(path)? else {
+            return Ok(None);
+        };
+        if envelope.status != "ready" || envelope.capture_status.as_deref() != Some("running") {
+            return Ok(None);
+        }
+        if age
+            .map(|value| value.as_millis() > u128::from(MAX_SNAPSHOT_AGE_MS))
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        Ok(envelope.snapshot)
     }
 
     fn try_dispatch_friendly_vs_live_plan(
@@ -2622,30 +2668,34 @@ impl LauncherApp {
             self.suppress_friendly_vs_live_input("not_playing", &fresh_snapshot);
             return;
         }
-        if fresh_snapshot.candidate_id != planned_snapshot.candidate_id
-            || fresh_snapshot.current_signature != planned_snapshot.current_signature
-            || fresh_snapshot.snapshot.piece_counter != planned_snapshot.snapshot.piece_counter
-        {
+        if fresh_snapshot.candidate_id != planned_snapshot.candidate_id {
             self.suppress_friendly_vs_live_input("stale_snapshot", &fresh_snapshot);
             return;
         }
 
-        if let Some(planned_pose) = prepared.friendly_execution_start_pose.as_ref() {
-            let fresh_pose =
-                friendly_execution_start_pose(&fresh_snapshot.snapshot, false, prepared.summary.piece.into());
-            if fresh_pose.as_ref() != Some(planned_pose) {
-                self.friendly_vs_live.clear_deferred_plan();
-                self.invalidate_friendly_vs_live_plan_for_start_pose(
-                    &fresh_snapshot,
-                    planned_pose,
-                    fresh_pose.as_ref(),
-                );
-                return;
-            }
-            self.log_friendly_vs_execution_start_pose_confirmed(
-                fresh_snapshot.snapshot.piece_counter,
-                planned_pose,
+        let Some(planned_pose) = prepared.execution_start_pose.as_ref() else {
+            self.friendly_vs_live.clear_deferred_plan();
+            self.push_log(
+                "[friendly-vs-live] plan invalidated before dispatch reason=source_pose_missing action=discard_and_replan",
             );
+            return;
+        };
+        let fresh_pose = execution_start_pose(&fresh_snapshot.snapshot);
+        if fresh_pose.as_ref() != Some(planned_pose) {
+            self.friendly_vs_live.clear_deferred_plan();
+            self.invalidate_live_plan_for_start_pose(
+                "friendly-vs-live",
+                planned_pose,
+                fresh_pose.as_ref(),
+            );
+            return;
+        }
+        self.log_execution_start_pose_confirmed("friendly-vs-live", planned_pose);
+
+        if fresh_snapshot.current_signature != planned_snapshot.current_signature {
+            self.friendly_vs_live.clear_deferred_plan();
+            self.suppress_friendly_vs_live_input("stale_snapshot", &fresh_snapshot);
+            return;
         }
 
         self.friendly_vs_live.clear_skip_reason();
@@ -2741,6 +2791,182 @@ impl LauncherApp {
             ),
         ) {
             self.push_log(line);
+        }
+    }
+
+    fn try_dispatch_zenith_live_plan(
+        &mut self,
+        config: &AutomationConfig,
+        path: &std::path::Path,
+        file_signature: &str,
+        planned_snapshot: &ZenithPassivePlannerSnapshot,
+        prepared: &PreparedSnapshotExecution,
+    ) {
+        #[cfg(test)]
+        if let Some(callback) = self.zenith_live_before_reread.take() {
+            callback(self);
+        }
+        let planned_provider_generation = prepared.planned_provider_generation;
+
+        let piece_counter = planned_snapshot.snapshot.piece_counter;
+        if !self.zenith_live_input_allowed() {
+            self.suppress_zenith_live_input("live_disabled", piece_counter);
+            return;
+        }
+        if self.state.selected_mode != RuntimeMode::Zenith
+            || !self.bot_desired_enabled
+            || self.bot_status != BotStatus::On
+        {
+            self.suppress_zenith_live_input("bot_off", piece_counter);
+            return;
+        }
+        if self.browser_status != BrowserStatus::Ready
+            || self.input_status != InputStatus::Ready
+            || !self
+                .passive_provider
+                .is_requested(PassiveProviderOwner::ZenithDryRun)
+        {
+            self.suppress_zenith_live_input("stale_snapshot", piece_counter);
+            return;
+        }
+        if self.passive_provider.activation_generation != planned_provider_generation {
+            self.zenith_live.clear_deferred_snapshot();
+            self.suppress_zenith_live_input("provider_generation_changed", piece_counter);
+            return;
+        }
+        if self.zenith_live_limit_reached() {
+            self.suppress_zenith_live_input("max_pieces_reached", piece_counter);
+            return;
+        }
+
+        let fresh_snapshot = match self.zenith_live_reread_snapshot(path) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.suppress_zenith_live_input("stale_snapshot", piece_counter);
+                return;
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[zenith-live] input suppressed reason=stale_snapshot error={err:#}"
+                ));
+                return;
+            }
+        };
+
+        if fresh_snapshot.gameid != planned_snapshot.gameid {
+            self.suppress_zenith_live_input(
+                "gameid_changed",
+                fresh_snapshot.snapshot.piece_counter,
+            );
+            return;
+        }
+        if fresh_snapshot.capture_generation != planned_snapshot.capture_generation {
+            self.suppress_zenith_live_input(
+                "generation_mismatch",
+                fresh_snapshot.snapshot.piece_counter,
+            );
+            return;
+        }
+        if fresh_snapshot.candidate_id != planned_snapshot.candidate_id
+            || fresh_snapshot.userid != planned_snapshot.userid
+        {
+            self.suppress_zenith_live_input(
+                "identity_mismatch",
+                fresh_snapshot.snapshot.piece_counter,
+            );
+            return;
+        }
+        if !fresh_snapshot.playing
+            || !fresh_snapshot.started
+            || fresh_snapshot.countdown_started
+            || fresh_snapshot.paused == Some(true)
+            || fresh_snapshot.destroyed
+            || fresh_snapshot.successful
+            || fresh_snapshot.gameoverreason.is_some()
+        {
+            self.suppress_zenith_live_input("not_playing", fresh_snapshot.snapshot.piece_counter);
+            return;
+        }
+
+        let Some(planned_pose) = prepared.execution_start_pose.as_ref() else {
+            self.zenith_live.clear_deferred_snapshot();
+            self.push_log(
+                "[zenith-live] plan invalidated before dispatch reason=source_pose_missing action=discard_and_replan",
+            );
+            return;
+        };
+        let fresh_pose = execution_start_pose(&fresh_snapshot.snapshot);
+        if fresh_pose.as_ref() != Some(planned_pose) {
+            self.zenith_live.clear_deferred_snapshot();
+            self.invalidate_live_plan_for_start_pose(
+                "zenith-live",
+                planned_pose,
+                fresh_pose.as_ref(),
+            );
+            return;
+        }
+        self.log_execution_start_pose_confirmed("zenith-live", planned_pose);
+
+        if fresh_snapshot.current_signature != planned_snapshot.current_signature {
+            self.zenith_live.clear_deferred_snapshot();
+            self.suppress_zenith_live_input(
+                "stale_snapshot",
+                fresh_snapshot.snapshot.piece_counter,
+            );
+            return;
+        }
+
+        self.zenith_dry_run.mark_processed_snapshot(&fresh_snapshot);
+        self.zenith_dry_run
+            .record_attempted(&fresh_snapshot, file_signature);
+        let execution_started_at = self.monotonic_now();
+        self.zenith_live.clear_skip_reason();
+        self.push_log(format!(
+            "[zenith-live] plan accepted piece_counter={} generation={}",
+            piece_counter_label(fresh_snapshot.snapshot.piece_counter),
+            fresh_snapshot.capture_generation
+        ));
+        self.zenith_live.start_planned(
+            &fresh_snapshot,
+            self.passive_provider.activation_generation,
+            ZenithLiveStage::Planned,
+        );
+        self.zenith_live
+            .note_execution_started_for_pacing(&fresh_snapshot, execution_started_at);
+        #[cfg(test)]
+        if let Ok(mut started_at) = self.zenith_live_test_hook.started_at.lock() {
+            started_at.push(execution_started_at);
+        }
+        self.push_log(
+            self.zenith_live_execution_started_log(fresh_snapshot.snapshot.piece_counter),
+        );
+        self.zenith_live.stage = ZenithLiveStage::Executing;
+        match self.execute_zenith_live_plan(config, prepared) {
+            Ok(()) => {
+                self.push_log(format!(
+                    "[zenith-live] input dispatched piece_counter={}",
+                    piece_counter_label(fresh_snapshot.snapshot.piece_counter)
+                ));
+                if let Some(line) = self.zenith_live.note_startup_stage("first_input") {
+                    self.push_log(line);
+                }
+                self.zenith_live.start_planned(
+                    &fresh_snapshot,
+                    self.passive_provider.activation_generation,
+                    ZenithLiveStage::AwaitingLock,
+                );
+                self.push_log(format!(
+                    "[zenith-live] awaiting lock piece_counter={}",
+                    piece_counter_label(fresh_snapshot.snapshot.piece_counter)
+                ));
+            }
+            Err(err) => {
+                self.push_log(format!(
+                    "[zenith-live] dispatch error piece_counter={} error={err:#}",
+                    piece_counter_label(fresh_snapshot.snapshot.piece_counter)
+                ));
+                self.cancel_zenith_live_execution("dispatch_failed");
+            }
         }
     }
 
@@ -4065,7 +4291,11 @@ impl LauncherApp {
                 .unwrap_or("?")
         ));
         let config = self.state.to_automation_config(&self.paths);
-        match prepare_snapshot_execution(&config, &snapshot.snapshot) {
+        match prepare_snapshot_execution(
+            &config,
+            &snapshot.snapshot,
+            self.passive_provider.activation_generation,
+        ) {
             Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => {
                 let plan = &prepared.summary;
                 if let Some(fallback_from) = plan.fallback_from {
@@ -4088,7 +4318,7 @@ impl LauncherApp {
                     plan.route_kind,
                     plan.planner
                 ));
-                if self.friendly_vs_live_uses_start_pose_freshness(&prepared) {
+                if self.friendly_vs_live_requires_source_pose_guard() {
                     self.friendly_vs_dry_run
                         .record_attempted(snapshot, &file_signature);
                     if let Some(remaining) = self
@@ -4420,7 +4650,11 @@ impl LauncherApp {
             snapshot.snapshot.queue.len().saturating_sub(1)
         ));
         let config = self.state.to_automation_config(&self.paths);
-        match prepare_snapshot_execution(&config, &snapshot.snapshot) {
+        match prepare_snapshot_execution(
+            &config,
+            &snapshot.snapshot,
+            self.passive_provider.activation_generation,
+        ) {
             Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => {
                 let plan = &prepared.summary;
                 if let Some(fallback_from) = plan.fallback_from {
@@ -4445,82 +4679,49 @@ impl LauncherApp {
                     plan.planner
                 ));
                 self.zenith_dry_run
-                    .record_processed(snapshot, &file_signature);
+                    .record_attempted(snapshot, &file_signature);
                 if let Some(line) = self.zenith_live.note_startup_stage("first_plan") {
                     self.push_log(line);
                 }
                 let piece_counter = snapshot.snapshot.piece_counter;
                 if !self.zenith_live_input_allowed() {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.push_log("[zenith-dry-run] input suppressed reason=dry_run");
                 } else if self.zenith_live_limit_reached() {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.suppress_zenith_live_input("max_pieces_reached", piece_counter);
                 } else if self
                     .zenith_live
                     .aborted_execution_matches_snapshot(snapshot)
                 {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.suppress_zenith_live_input("aborted_piece", piece_counter);
                 } else if self
                     .zenith_live
                     .completed_execution_matches_snapshot(snapshot)
                 {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.suppress_zenith_live_input("completed_piece", piece_counter);
                 } else if self.zenith_live.is_executing_piece(piece_counter) {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.suppress_zenith_live_input("already_executing", piece_counter);
                 } else if snapshot.userid.trim().is_empty() {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.suppress_zenith_live_input("identity_mismatch", piece_counter);
                 } else if let Some(remaining) = self
                     .zenith_live
                     .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
                 {
+                    self.zenith_dry_run.mark_processed_snapshot(snapshot);
                     self.defer_zenith_live_input_for_pacing(snapshot, remaining);
                 } else {
-                    let execution_started_at = self.monotonic_now();
-                    self.zenith_live.clear_skip_reason();
-                    self.push_log(format!(
-                        "[zenith-live] plan accepted piece_counter={} generation={}",
-                        piece_counter_label(piece_counter),
-                        snapshot.capture_generation
-                    ));
-                    self.zenith_live.start_planned(
+                    self.try_dispatch_zenith_live_plan(
+                        &config,
+                        &path,
+                        &file_signature,
                         snapshot,
-                        self.passive_provider.activation_generation,
-                        ZenithLiveStage::Planned,
+                        &prepared,
                     );
-                    self.zenith_live
-                        .note_execution_started_for_pacing(snapshot, execution_started_at);
-                    #[cfg(test)]
-                    if let Ok(mut started_at) = self.zenith_live_test_hook.started_at.lock() {
-                        started_at.push(execution_started_at);
-                    }
-                    self.push_log(self.zenith_live_execution_started_log(piece_counter));
-                    self.zenith_live.stage = ZenithLiveStage::Executing;
-                    match self.execute_zenith_live_plan(&config, &prepared) {
-                        Ok(()) => {
-                            self.push_log(format!(
-                                "[zenith-live] input dispatched piece_counter={}",
-                                piece_counter_label(piece_counter)
-                            ));
-                            if let Some(line) = self.zenith_live.note_startup_stage("first_input") {
-                                self.push_log(line);
-                            }
-                            self.zenith_live.start_planned(
-                                snapshot,
-                                self.passive_provider.activation_generation,
-                                ZenithLiveStage::AwaitingLock,
-                            );
-                            self.push_log(format!(
-                                "[zenith-live] awaiting lock piece_counter={}",
-                                piece_counter_label(piece_counter)
-                            ));
-                        }
-                        Err(err) => {
-                            self.push_log(format!(
-                                "[zenith-live] dispatch error piece_counter={} error={err:#}",
-                                piece_counter_label(piece_counter)
-                            ));
-                            self.cancel_zenith_live_execution("dispatch_failed");
-                        }
-                    }
                 }
             }
             Ok(PreparedSnapshotExecutionResult::Skipped { reason, retryable }) => {
@@ -5529,6 +5730,23 @@ mod tests {
             json!(null),
             &["O", "T", "L", "S", "Z"],
         );
+    }
+
+    fn write_zenith_passive_snapshot_with_active_pose(
+        paths: &AppPaths,
+        piece_counter: u32,
+        x: i32,
+        y: i32,
+        rotation: &str,
+    ) {
+        write_zenith_passive_snapshot(paths, "ready", "running", piece_counter, json!(false));
+        let path = zenith_passive_snapshot_path(paths);
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        raw["snapshot"]["current"]["x"] = json!(x);
+        raw["snapshot"]["current"]["y"] = json!(y);
+        raw["snapshot"]["current"]["rotation"] = json!(rotation);
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
     }
 
     fn write_zenith_passive_snapshot_with_state_flags(
@@ -7422,7 +7640,8 @@ mod tests {
             0
         );
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                && line.contains("reason=pose_mismatch")
         }));
 
         cleanup_test_paths(&paths);
@@ -7455,7 +7674,8 @@ mod tests {
 
         assert_eq!(app.friendly_vs_live.executed_placements, 0);
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                && line.contains("reason=pose_mismatch")
         }));
 
         poll_friendly_vs_live_test_piece(&mut app, &paths, &round_id, 5, 1);
@@ -7703,7 +7923,10 @@ mod tests {
         assert!(app
             .logs
             .iter()
-            .any(|line| line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")));
+            .any(|line| {
+                line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                    && line.contains("reason=piece_advanced")
+            }));
 
         cleanup_test_paths(&paths);
     }
@@ -7809,12 +8032,12 @@ mod tests {
             1
         );
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] execution start pose confirmed")
+            line.contains("[friendly-vs-live] plan source pose confirmed before dispatch")
                 && line.contains("piece_counter=4")
                 && line.contains("piece=J")
         }));
         assert!(!app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
         }));
 
         cleanup_test_paths(&paths);
@@ -7892,7 +8115,8 @@ mod tests {
                 0
             );
             assert!(app.logs.iter().any(|line| {
-                line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+                line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                    && line.contains("reason=pose_mismatch")
                     && line.contains("piece_counter=4")
             }));
             assert!(app.friendly_vs_dry_run.last_processed_snapshot_token.is_none());
@@ -7958,7 +8182,8 @@ mod tests {
             1
         );
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] plan invalidated reason=active_pose_changed")
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                && line.contains("reason=pose_mismatch")
                 && line.contains("piece_counter=5")
         }));
 
@@ -7991,7 +8216,7 @@ mod tests {
         );
         assert_eq!(app.friendly_vs_live.executed_placements, 2);
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] execution start pose confirmed")
+            line.contains("[friendly-vs-live] plan source pose confirmed before dispatch")
                 && line.contains("piece_counter=5")
         }));
         assert_eq!(friendly_vs_live_started_offsets_ms(&app, baseline), vec![0, 1000]);
@@ -8045,7 +8270,8 @@ mod tests {
             0
         );
         assert!(app.logs.iter().any(|line| {
-            line.contains("[friendly-vs-live] input suppressed reason=stale_snapshot")
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                && line.contains("reason=piece_advanced")
         }));
 
         cleanup_test_paths(&paths);
@@ -8338,9 +8564,25 @@ mod tests {
 
     #[test]
     fn friendly_vs_live_hold_plan_uses_existing_executor_sequence() {
-        let paths = test_paths("friendly-vs-live-hold-sequence");
-        let mut app = LauncherApp::new(paths.clone());
-        configure_friendly_vs_runtime_ready(&mut app);
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-hold-sequence");
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "J",
+            &["O", "T", "L", "S", "Z"],
+        );
+        let path = friendly_vs_passive_snapshot_path(&paths);
+        let planned_snapshot = read_friendly_vs_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .unwrap()
+            .0
+            .snapshot
+            .unwrap();
         clear_tapped_actions(&app);
         let config = app.state.to_automation_config(&app.paths);
         let prepared = PreparedSnapshotExecution {
@@ -8364,11 +8606,17 @@ mod tests {
                 movement_actions: vec![GameAction::Left],
                 hard_drop: true,
             },
-            friendly_execution_start_pose: None,
+            execution_start_pose: execution_start_pose(&planned_snapshot.snapshot),
+            planned_provider_generation: app.passive_provider.activation_generation,
         };
 
-        app.execute_friendly_vs_live_plan(&config, &prepared)
-            .unwrap();
+        app.try_dispatch_friendly_vs_live_plan(
+            &config,
+            &path,
+            "friendly-hold-signature",
+            &planned_snapshot,
+            &prepared,
+        );
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -8380,15 +8628,35 @@ mod tests {
             tapped_actions(&app),
             vec![GameAction::Hold, GameAction::Left, GameAction::HardDrop]
         );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] plan source pose confirmed before dispatch")
+                && line.contains("piece_counter=4")
+        }));
 
         cleanup_test_paths(&paths);
     }
 
     #[test]
     fn friendly_vs_live_rotation_route_uses_existing_executor_sequence() {
-        let paths = test_paths("friendly-vs-live-rotation-sequence");
-        let mut app = LauncherApp::new(paths.clone());
-        configure_friendly_vs_runtime_ready(&mut app);
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-rotation-sequence");
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        let path = friendly_vs_passive_snapshot_path(&paths);
+        let planned_snapshot = read_friendly_vs_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .unwrap()
+            .0
+            .snapshot
+            .unwrap();
         clear_tapped_actions(&app);
         let config = app.state.to_automation_config(&app.paths);
         let prepared = PreparedSnapshotExecution {
@@ -8421,11 +8689,17 @@ mod tests {
                 ],
                 hard_drop: true,
             },
-            friendly_execution_start_pose: None,
+            execution_start_pose: execution_start_pose(&planned_snapshot.snapshot),
+            planned_provider_generation: app.passive_provider.activation_generation,
         };
 
-        app.execute_friendly_vs_live_plan(&config, &prepared)
-            .unwrap();
+        app.try_dispatch_friendly_vs_live_plan(
+            &config,
+            &path,
+            "friendly-rotation-signature",
+            &planned_snapshot,
+            &prepared,
+        );
 
         assert_eq!(
             app.zenith_live_test_hook
@@ -8442,6 +8716,95 @@ mod tests {
                 GameAction::HardDrop,
             ]
         );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn friendly_vs_live_rotation_route_pose_mismatch_dispatches_zero_actions() {
+        let (paths, mut app, round_id) =
+            setup_friendly_vs_live_app("friendly-vs-live-rotation-pose-mismatch");
+        write_friendly_vs_passive_snapshot(
+            &paths,
+            &round_id,
+            "7001",
+            "cand-local",
+            4,
+            json!("friendly-user"),
+            "T",
+            &["I", "O", "L", "S", "Z"],
+        );
+        let path = friendly_vs_passive_snapshot_path(&paths);
+        let planned_snapshot = read_friendly_vs_passive_snapshot_file_with_age(&path)
+            .unwrap()
+            .unwrap()
+            .0
+            .snapshot
+            .unwrap();
+        let prepared = PreparedSnapshotExecution {
+            summary: DryRunPlanSummary {
+                token: "friendly-rotation-stale".to_owned(),
+                piece: PieceToken::T,
+                hold_piece: None,
+                use_hold: false,
+                target_x: 7,
+                target_rotation: RotationToken::East,
+                movement_mode_used: MovementModeConfig::ZeroGSafe,
+                fallback_from: None,
+                fallback_reason: None,
+                action_count: 2,
+                actions: vec![GameAction::RotateCw, GameAction::HardDrop],
+                route_kind: "test".to_owned(),
+                planner: "test".to_owned(),
+            },
+            execution_plan: ExecutionPlan {
+                hold: false,
+                movement_actions: vec![GameAction::RotateCw],
+                hard_drop: true,
+            },
+            execution_start_pose: execution_start_pose(&planned_snapshot.snapshot),
+            planned_provider_generation: app.passive_provider.activation_generation,
+        };
+        let stale_round_id = round_id.clone();
+        app.friendly_vs_live_before_reread = Some(Box::new(move |app| {
+            write_friendly_vs_passive_snapshot_with_active_pose(
+                &app.paths,
+                &stale_round_id,
+                "7001",
+                "cand-local",
+                4,
+                json!("friendly-user"),
+                "T",
+                4,
+                19,
+                "east",
+                &["I", "O", "L", "S", "Z"],
+            );
+        }));
+        clear_tapped_actions(&app);
+        let config = app.state.to_automation_config(&app.paths);
+
+        app.try_dispatch_friendly_vs_live_plan(
+            &config,
+            &path,
+            "friendly-rotation-stale-signature",
+            &planned_snapshot,
+            &prepared,
+        );
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(tapped_actions(&app).is_empty());
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[friendly-vs-live] plan invalidated before dispatch")
+                && line.contains("reason=pose_mismatch")
+                && line.contains("rotation=North")
+                && line.contains("rotation=East")
+        }));
 
         cleanup_test_paths(&paths);
     }
@@ -8485,7 +8848,8 @@ mod tests {
                 ],
                 hard_drop: true,
             },
-            friendly_execution_start_pose: None,
+            execution_start_pose: None,
+            planned_provider_generation: app.passive_provider.activation_generation,
         };
 
         app.dispatch_friendly_vs_live_plan(&config, &prepared).unwrap();
@@ -8996,6 +9360,7 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+        assert!(!tapped_actions(&app).is_empty());
         assert_eq!(app.zenith_live.stage, ZenithLiveStage::AwaitingLock);
         assert!(app
             .logs
@@ -9007,10 +9372,232 @@ mod tests {
             .logs
             .iter()
             .any(|line| line.contains("[zenith-live] input dispatched piece_counter=6")));
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] plan source pose confirmed before dispatch")
+                && line.contains("piece=J")
+                && line.contains("piece_counter=6")
+        }));
         assert!(app
             .logs
             .iter()
             .any(|line| line.contains("[zenith-live] awaiting lock piece_counter=6")));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_provider_generation_change_discards_prepared_plan_without_dispatch() {
+        let paths = test_paths("zenith-live-provider-generation-change");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+        let planned_snapshot = read_test_zenith_passive_snapshot(&paths);
+        app.zenith_live.set_deferred_snapshot(&planned_snapshot);
+        let planned_provider_generation = app.passive_provider.activation_generation;
+        app.zenith_live_before_reread = Some(Box::new(move |app| {
+            app.passive_provider.activation_generation = planned_provider_generation + 1;
+        }));
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(tapped_actions(&app).is_empty());
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Idle);
+        assert!(app.zenith_live.deferred_snapshot_token.is_none());
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] input suppressed reason=provider_generation_changed")
+                && line.contains("piece_counter=6")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pose_changes_invalidate_old_plan_without_dispatch() {
+        let (spawn_x, spawn_y) = zenith_spawn_coordinates(Piece::J);
+        for (name, x, y, rotation) in [
+            ("zenith-live-pose-x", spawn_x - 1, spawn_y, "north"),
+            ("zenith-live-pose-y", spawn_x, spawn_y - 1, "north"),
+            ("zenith-live-pose-rotation", spawn_x, spawn_y, "east"),
+        ] {
+            let paths = test_paths(name);
+            let mut app = LauncherApp::new(paths.clone());
+            configure_zenith_runtime_ready(&mut app);
+            app.state.zenith_live_input_enabled = true;
+            app.logs.clear();
+            write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+            app.zenith_live_before_reread = Some(Box::new(move |app| {
+                write_zenith_passive_snapshot_with_active_pose(
+                    &app.paths,
+                    6,
+                    x,
+                    y,
+                    rotation,
+                );
+            }));
+
+            app.poll_zenith_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                0
+            );
+            assert_eq!(app.zenith_live.stage, ZenithLiveStage::Idle);
+            assert!(app.logs.iter().any(|line| {
+                line.contains("[zenith-live] plan invalidated before dispatch")
+                    && line.contains("reason=pose_mismatch")
+                    && line.contains("piece_counter=6")
+            }));
+            assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
+
+            cleanup_test_paths(&paths);
+        }
+    }
+
+    #[test]
+    fn zenith_live_fractional_y_within_same_logical_row_keeps_plan_valid() {
+        let paths = test_paths("zenith-live-pose-fractional-y");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        let (spawn_x, _spawn_y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot_with_pieces(
+            &paths,
+            "ready",
+            "running",
+            6,
+            json!(false),
+            "J",
+            json!(spawn_x),
+            json!(18.0),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.zenith_live_before_reread = Some(Box::new(move |app| {
+            write_zenith_passive_snapshot_with_pieces(
+                &app.paths,
+                "ready",
+                "running",
+                6,
+                json!(false),
+                "J",
+                json!(spawn_x),
+                json!(18.4125),
+                json!(null),
+                &["O", "T", "L", "S", "Z"],
+            );
+        }));
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] plan source pose confirmed before dispatch")
+                && line.contains("y=18")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_pose_mismatch_replans_same_piece_from_fresh_snapshot() {
+        let paths = test_paths("zenith-live-pose-replan");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        let (spawn_x, spawn_y) = zenith_spawn_coordinates(Piece::J);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+        app.zenith_live_before_reread = Some(Box::new(move |app| {
+            write_zenith_passive_snapshot_with_active_pose(
+                &app.paths,
+                6,
+                spawn_x - 1,
+                spawn_y,
+                "north",
+            );
+        }));
+
+        app.poll_zenith_dry_run();
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_zenith_passive_snapshot_with_active_pose(
+            &paths,
+            6,
+            spawn_x - 1,
+            spawn_y,
+            "north",
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(app.zenith_live.stage, ZenithLiveStage::AwaitingLock);
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] plan source pose confirmed before dispatch")
+                && line.contains("piece_counter=6")
+        }));
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
+        let paths = test_paths("zenith-live-pose-piece-advanced");
+        let mut app = LauncherApp::new(paths.clone());
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+        app.zenith_live_before_reread = Some(Box::new(move |app| {
+            write_zenith_passive_snapshot(
+                &app.paths,
+                "ready",
+                "running",
+                7,
+                json!(false),
+            );
+        }));
+
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(app.logs.iter().any(|line| {
+            line.contains("[zenith-live] plan invalidated before dispatch")
+                && line.contains("reason=piece_advanced")
+                && line.contains("piece_counter=6")
+                && line.contains("piece_counter=7")
+        }));
 
         cleanup_test_paths(&paths);
     }

@@ -1519,6 +1519,7 @@ struct ZenithLiveController {
     next_execution_earliest_at: Option<Instant>,
     last_execution_game_id: Option<String>,
     deferred_snapshot_token: Option<String>,
+    deferred_plan: Option<ZenithDeferredPlan>,
     last_skip_key: Option<String>,
     last_abort_key: Option<String>,
     last_completed_execution: Option<ZenithLiveExecutionIdentity>,
@@ -1532,6 +1533,30 @@ struct ZenithLiveExecutionIdentity {
     candidate_id: String,
     capture_generation: u64,
     piece_counter: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct ZenithDeferredPlan {
+    snapshot_token: String,
+    gameid: String,
+    capture_generation: u64,
+    candidate_id: String,
+    userid: String,
+    piece_counter: Option<u32>,
+    current_signature: String,
+    prepared: PreparedSnapshotExecution,
+}
+
+impl ZenithDeferredPlan {
+    fn matches_snapshot(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
+        self.snapshot_token == snapshot.snapshot.token
+            && self.gameid == snapshot.gameid
+            && self.capture_generation == snapshot.capture_generation
+            && self.candidate_id == snapshot.candidate_id
+            && self.userid == snapshot.userid
+            && self.piece_counter == snapshot.snapshot.piece_counter
+            && self.current_signature == snapshot.current_signature
+    }
 }
 
 impl ZenithLiveController {
@@ -1583,6 +1608,7 @@ impl ZenithLiveController {
         self.next_execution_earliest_at = None;
         self.last_execution_game_id = None;
         self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
     }
 
     fn start_startup_session(&mut self) {
@@ -1631,6 +1657,7 @@ impl ZenithLiveController {
     ) {
         self.stage = stage;
         self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
         self.active_piece_counter = snapshot.snapshot.piece_counter;
         self.active_snapshot_token = Some(snapshot.snapshot.token.clone());
         self.active_game_id = Some(snapshot.gameid.clone());
@@ -1677,16 +1704,39 @@ impl ZenithLiveController {
         }
     }
 
-    fn set_deferred_snapshot(&mut self, snapshot: &ZenithPassivePlannerSnapshot) {
+    fn set_deferred_plan(
+        &mut self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+        prepared: PreparedSnapshotExecution,
+    ) {
         self.deferred_snapshot_token = Some(snapshot.snapshot.token.clone());
+        self.deferred_plan = Some(ZenithDeferredPlan {
+            snapshot_token: snapshot.snapshot.token.clone(),
+            gameid: snapshot.gameid.clone(),
+            capture_generation: snapshot.capture_generation,
+            candidate_id: snapshot.candidate_id.clone(),
+            userid: snapshot.userid.clone(),
+            piece_counter: snapshot.snapshot.piece_counter,
+            current_signature: snapshot.current_signature.clone(),
+            prepared,
+        });
     }
 
     fn clear_deferred_snapshot(&mut self) {
         self.deferred_snapshot_token = None;
+        self.deferred_plan = None;
     }
 
     fn is_deferred_snapshot(&self, snapshot: &ZenithPassivePlannerSnapshot) -> bool {
         self.deferred_snapshot_token.as_deref() == Some(snapshot.snapshot.token.as_str())
+    }
+
+    fn deferred_plan_for_snapshot(
+        &self,
+        snapshot: &ZenithPassivePlannerSnapshot,
+    ) -> Option<&ZenithDeferredPlan> {
+        let deferred = self.deferred_plan.as_ref()?;
+        deferred.matches_snapshot(snapshot).then_some(deferred)
     }
 
     fn active_execution_identity(&self) -> Option<ZenithLiveExecutionIdentity> {
@@ -2769,12 +2819,18 @@ impl LauncherApp {
         }
     }
 
+    fn discard_zenith_live_deferred_plan_for_replan(&mut self) {
+        self.zenith_live.clear_deferred_snapshot();
+        self.zenith_dry_run.reset_processed_state();
+    }
+
     fn defer_zenith_live_input_for_pacing(
         &mut self,
         snapshot: &ZenithPassivePlannerSnapshot,
+        prepared: PreparedSnapshotExecution,
         remaining: Duration,
     ) {
-        self.zenith_live.set_deferred_snapshot(snapshot);
+        self.zenith_live.set_deferred_plan(snapshot, prepared);
         let skip_key = format!(
             "pps_pacing:{}:{}:{}:{}",
             snapshot.gameid,
@@ -2810,6 +2866,7 @@ impl LauncherApp {
 
         let piece_counter = planned_snapshot.snapshot.piece_counter;
         if !self.zenith_live_input_allowed() {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input("live_disabled", piece_counter);
             return;
         }
@@ -2817,6 +2874,7 @@ impl LauncherApp {
             || !self.bot_desired_enabled
             || self.bot_status != BotStatus::On
         {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input("bot_off", piece_counter);
             return;
         }
@@ -2826,11 +2884,12 @@ impl LauncherApp {
                 .passive_provider
                 .is_requested(PassiveProviderOwner::ZenithDryRun)
         {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input("stale_snapshot", piece_counter);
             return;
         }
         if self.passive_provider.activation_generation != planned_provider_generation {
-            self.zenith_live.clear_deferred_snapshot();
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input("provider_generation_changed", piece_counter);
             return;
         }
@@ -2842,10 +2901,12 @@ impl LauncherApp {
         let fresh_snapshot = match self.zenith_live_reread_snapshot(path) {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
+                self.discard_zenith_live_deferred_plan_for_replan();
                 self.suppress_zenith_live_input("stale_snapshot", piece_counter);
                 return;
             }
             Err(err) => {
+                self.discard_zenith_live_deferred_plan_for_replan();
                 self.push_log(format!(
                     "[zenith-live] input suppressed reason=stale_snapshot error={err:#}"
                 ));
@@ -2854,6 +2915,7 @@ impl LauncherApp {
         };
 
         if fresh_snapshot.gameid != planned_snapshot.gameid {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input(
                 "gameid_changed",
                 fresh_snapshot.snapshot.piece_counter,
@@ -2861,6 +2923,7 @@ impl LauncherApp {
             return;
         }
         if fresh_snapshot.capture_generation != planned_snapshot.capture_generation {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input(
                 "generation_mismatch",
                 fresh_snapshot.snapshot.piece_counter,
@@ -2870,6 +2933,7 @@ impl LauncherApp {
         if fresh_snapshot.candidate_id != planned_snapshot.candidate_id
             || fresh_snapshot.userid != planned_snapshot.userid
         {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input(
                 "identity_mismatch",
                 fresh_snapshot.snapshot.piece_counter,
@@ -2884,12 +2948,13 @@ impl LauncherApp {
             || fresh_snapshot.successful
             || fresh_snapshot.gameoverreason.is_some()
         {
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input("not_playing", fresh_snapshot.snapshot.piece_counter);
             return;
         }
 
         let Some(planned_pose) = prepared.execution_start_pose.as_ref() else {
-            self.zenith_live.clear_deferred_snapshot();
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.push_log(
                 "[zenith-live] plan invalidated before dispatch reason=source_pose_missing action=discard_and_replan",
             );
@@ -2897,7 +2962,7 @@ impl LauncherApp {
         };
         let fresh_pose = execution_start_pose(&fresh_snapshot.snapshot);
         if fresh_pose.as_ref() != Some(planned_pose) {
-            self.zenith_live.clear_deferred_snapshot();
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.invalidate_live_plan_for_start_pose(
                 "zenith-live",
                 planned_pose,
@@ -2908,7 +2973,7 @@ impl LauncherApp {
         self.log_execution_start_pose_confirmed("zenith-live", planned_pose);
 
         if fresh_snapshot.current_signature != planned_snapshot.current_signature {
-            self.zenith_live.clear_deferred_snapshot();
+            self.discard_zenith_live_deferred_plan_for_replan();
             self.suppress_zenith_live_input(
                 "stale_snapshot",
                 fresh_snapshot.snapshot.piece_counter,
@@ -4600,15 +4665,37 @@ impl LauncherApp {
         if self.update_zenith_live_lock_state(snapshot) {
             return;
         }
-        if self.zenith_live.is_deferred_snapshot(snapshot) {
+        let config = self.state.to_automation_config(&self.paths);
+        if let Some(deferred_plan) = self.zenith_live.deferred_plan_for_snapshot(snapshot).cloned() {
+            if self.zenith_live_limit_reached() {
+                self.zenith_live.clear_deferred_snapshot();
+                return;
+            }
             if let Some(remaining) = self
                 .zenith_live
                 .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
             {
-                self.defer_zenith_live_input_for_pacing(snapshot, remaining);
+                self.defer_zenith_live_input_for_pacing(
+                    snapshot,
+                    deferred_plan.prepared.clone(),
+                    remaining,
+                );
                 return;
             }
-        } else if self.zenith_dry_run.is_duplicate_processed_piece(snapshot) {
+            self.try_dispatch_zenith_live_plan(
+                &config,
+                &path,
+                &file_signature,
+                snapshot,
+                &deferred_plan.prepared,
+            );
+            return;
+        }
+        if self.zenith_live.deferred_plan.is_some() {
+            self.discard_zenith_live_deferred_plan_for_replan();
+            return;
+        }
+        if self.zenith_dry_run.is_duplicate_processed_piece(snapshot) {
             if let Some(line) = self.zenith_dry_run.note_skip(
                 "duplicate_piece",
                 "[zenith-dry-run] snapshot skipped reason=duplicate_piece".to_owned(),
@@ -4649,7 +4736,6 @@ impl LauncherApp {
                 .unwrap_or("-"),
             snapshot.snapshot.queue.len().saturating_sub(1)
         ));
-        let config = self.state.to_automation_config(&self.paths);
         match prepare_snapshot_execution(
             &config,
             &snapshot.snapshot,
@@ -4713,7 +4799,11 @@ impl LauncherApp {
                     .pacing_remaining_for_snapshot(snapshot, self.monotonic_now())
                 {
                     self.zenith_dry_run.mark_processed_snapshot(snapshot);
-                    self.defer_zenith_live_input_for_pacing(snapshot, remaining);
+                    self.defer_zenith_live_input_for_pacing(
+                        snapshot,
+                        prepared.clone(),
+                        remaining,
+                    );
                 } else {
                     self.try_dispatch_zenith_live_plan(
                         &config,
@@ -5557,6 +5647,20 @@ mod tests {
             .iter()
             .map(|started_at| started_at.duration_since(baseline).as_millis())
             .collect()
+    }
+
+    fn prepare_zenith_test_plan(
+        app: &LauncherApp,
+        snapshot: &ZenithPassivePlannerSnapshot,
+    ) -> PreparedSnapshotExecution {
+        match prepare_snapshot_execution(
+            &app.state.to_automation_config(&app.paths),
+            &snapshot.snapshot,
+            app.passive_provider.activation_generation,
+        ) {
+            Ok(PreparedSnapshotExecutionResult::Ready(prepared)) => prepared,
+            result => panic!("expected ready zenith plan for test, got {result:?}"),
+        }
     }
 
     fn friendly_vs_live_started_offsets_ms(app: &LauncherApp, baseline: Instant) -> Vec<u128> {
@@ -9389,32 +9493,133 @@ mod tests {
     fn zenith_live_provider_generation_change_discards_prepared_plan_without_dispatch() {
         let paths = test_paths("zenith-live-provider-generation-change");
         let mut app = LauncherApp::new(paths.clone());
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 3.0;
+        app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
         write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
-        let planned_snapshot = read_test_zenith_passive_snapshot(&paths);
-        app.zenith_live.set_deferred_snapshot(&planned_snapshot);
+        app.poll_zenith_dry_run();
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
+        app.poll_zenith_dry_run();
+        assert!(app.zenith_live.deferred_plan.is_some());
+
         let planned_provider_generation = app.passive_provider.activation_generation;
         app.zenith_live_before_reread = Some(Box::new(move |app| {
             app.passive_provider.activation_generation = planned_provider_generation + 1;
         }));
-
+        app.test_now = Some(baseline + Duration::from_millis(334));
         app.poll_zenith_dry_run();
 
         assert_eq!(
             app.zenith_live_test_hook
                 .dispatch_count
                 .load(Ordering::Relaxed),
-            0
+            1
         );
-        assert!(tapped_actions(&app).is_empty());
-        assert_eq!(app.zenith_live.stage, ZenithLiveStage::Idle);
+        assert!(!tapped_actions(&app).is_empty());
         assert!(app.zenith_live.deferred_snapshot_token.is_none());
+        assert!(app.zenith_live.deferred_plan.is_none());
+        assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
         assert!(app.logs.iter().any(|line| {
             line.contains("[zenith-live] input suppressed reason=provider_generation_changed")
                 && line.contains("piece_counter=6")
         }));
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            2
+        );
+
+        app.zenith_live_before_reread = None;
+        app.test_now = Some(baseline + Duration::from_millis(334));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            3
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_three_pps_anchor_dispatches_saved_plan_after_wait() {
+        let paths = test_paths("zenith-live-three-pps-anchor");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 3.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert!(app.zenith_live.deferred_plan.is_some());
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            2
+        );
+
+        app.test_now = Some(baseline + Duration::from_millis(334));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .started_at
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|started_at| started_at.duration_since(baseline).as_millis())
+                .collect::<Vec<_>>(),
+            vec![0, 334]
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            2
+        );
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("input deferred reason=pps_pacing"))
+                .count(),
+            1
+        );
 
         cleanup_test_paths(&paths);
     }
@@ -9429,35 +9634,65 @@ mod tests {
         ] {
             let paths = test_paths(name);
             let mut app = LauncherApp::new(paths.clone());
+            app.state.pps_unlimited = false;
+            app.state.target_pps = 3.0;
+            app.state.normalize_pps_state();
             configure_zenith_runtime_ready(&mut app);
             app.state.zenith_live_input_enabled = true;
             app.logs.clear();
+            let baseline = Instant::now();
+            app.test_now = Some(baseline);
             write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
-            app.zenith_live_before_reread = Some(Box::new(move |app| {
-                write_zenith_passive_snapshot_with_active_pose(
-                    &app.paths,
-                    6,
-                    x,
-                    y,
-                    rotation,
-                );
-            }));
+            app.poll_zenith_dry_run();
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                1
+            );
 
+            app.test_now = Some(baseline + Duration::from_millis(200));
+            write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
             app.poll_zenith_dry_run();
 
             assert_eq!(
                 app.zenith_live_test_hook
                     .dispatch_count
                     .load(Ordering::Relaxed),
-                0
+                1
             );
-            assert_eq!(app.zenith_live.stage, ZenithLiveStage::Idle);
-            assert!(app.logs.iter().any(|line| {
-                line.contains("[zenith-live] plan invalidated before dispatch")
-                    && line.contains("reason=pose_mismatch")
-                    && line.contains("piece_counter=6")
-            }));
+            assert!(app.zenith_live.deferred_plan.is_some());
+
+            app.test_now = Some(baseline + Duration::from_millis(250));
+            write_zenith_passive_snapshot_with_active_pose(&app.paths, 7, x, y, rotation);
+            app.poll_zenith_dry_run();
+
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert!(app.zenith_live.deferred_plan.is_none());
             assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
+
+            app.test_now = Some(baseline + Duration::from_millis(250));
+            write_zenith_passive_snapshot_with_active_pose(&app.paths, 7, x, y, rotation);
+            app.poll_zenith_dry_run();
+
+            assert_eq!(
+                app.logs
+                    .iter()
+                    .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                app.zenith_live_test_hook
+                    .dispatch_count
+                    .load(Ordering::Relaxed),
+                1
+            );
 
             cleanup_test_paths(&paths);
         }
@@ -9570,34 +9805,152 @@ mod tests {
     fn zenith_live_piece_advance_invalidates_old_plan_without_dispatch() {
         let paths = test_paths("zenith-live-pose-piece-advanced");
         let mut app = LauncherApp::new(paths.clone());
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 3.0;
+        app.state.normalize_pps_state();
         configure_zenith_runtime_ready(&mut app);
         app.state.zenith_live_input_enabled = true;
         app.logs.clear();
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
         write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
-        app.zenith_live_before_reread = Some(Box::new(move |app| {
-            write_zenith_passive_snapshot(
-                &app.paths,
-                "ready",
-                "running",
-                7,
-                json!(false),
-            );
-        }));
+        app.poll_zenith_dry_run();
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
 
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
+        app.poll_zenith_dry_run();
+        assert!(app.zenith_live.deferred_plan.is_some());
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 8, json!(false));
         app.poll_zenith_dry_run();
 
         assert_eq!(
             app.zenith_live_test_hook
                 .dispatch_count
                 .load(Ordering::Relaxed),
-            0
+            1
         );
-        assert!(app.logs.iter().any(|line| {
-            line.contains("[zenith-live] plan invalidated before dispatch")
-                && line.contains("reason=piece_advanced")
-                && line.contains("piece_counter=6")
-                && line.contains("piece_counter=7")
-        }));
+        assert!(app.zenith_live.deferred_plan.is_none());
+        assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 8, json!(false));
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        cleanup_test_paths(&paths);
+    }
+
+    #[test]
+    fn zenith_live_deferred_plan_identity_change_clears_and_replans_next_poll() {
+        let paths = test_paths("zenith-live-deferred-identity-change");
+        let mut app = LauncherApp::new(paths.clone());
+        app.state.pps_unlimited = false;
+        app.state.target_pps = 3.0;
+        app.state.normalize_pps_state();
+        configure_zenith_runtime_ready(&mut app);
+        app.state.zenith_live_input_enabled = true;
+        app.logs.clear();
+        let (spawn_x, spawn_y) = zenith_spawn_coordinates(Piece::J);
+
+        let baseline = Instant::now();
+        app.test_now = Some(baseline);
+        write_zenith_passive_snapshot(&paths, "ready", "running", 6, json!(false));
+        app.poll_zenith_dry_run();
+
+        app.test_now = Some(baseline + Duration::from_millis(200));
+        write_zenith_passive_snapshot(&paths, "ready", "running", 7, json!(false));
+        app.poll_zenith_dry_run();
+        assert!(app.zenith_live.deferred_plan.is_some());
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        write_zenith_passive_snapshot_with_metadata_and_flags(
+            &paths,
+            "ready",
+            "running",
+            6,
+            "user-other",
+            "game-other",
+            "candidate-other",
+            7,
+            true,
+            json!(false),
+            false,
+            false,
+            None,
+            "J",
+            json!(spawn_x),
+            json!(spawn_y),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(app.zenith_live.deferred_plan.is_none());
+        assert!(app.zenith_dry_run.last_processed_snapshot_token.is_none());
+
+        app.test_now = Some(baseline + Duration::from_millis(250));
+        write_zenith_passive_snapshot_with_metadata_and_flags(
+            &paths,
+            "ready",
+            "running",
+            6,
+            "user-other",
+            "game-other",
+            "candidate-other",
+            7,
+            true,
+            json!(false),
+            false,
+            false,
+            None,
+            "J",
+            json!(spawn_x),
+            json!(spawn_y),
+            json!(null),
+            &["O", "T", "L", "S", "Z"],
+        );
+        app.poll_zenith_dry_run();
+
+        assert_eq!(
+            app.logs
+                .iter()
+                .filter(|line| line.contains("[zenith-dry-run] plan ready"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            app.zenith_live_test_hook
+                .dispatch_count
+                .load(Ordering::Relaxed),
+            1
+        );
 
         cleanup_test_paths(&paths);
     }

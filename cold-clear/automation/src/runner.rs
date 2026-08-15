@@ -121,7 +121,7 @@ where
     let poll_delay = Duration::from_millis(config.poll_interval_ms);
     let piece_interval = Duration::from_millis(config.piece_interval_ms);
     let mut last_piece_counter = None;
-    let mut last_hard_drop_started_at = None;
+    let mut last_execution_started_at = None;
     let execution_timings = ExecutionTimings {
         tap_duration: Duration::from_millis(config.tap_duration_ms),
         movement_tap_duration: Duration::from_millis(config.movement_tap_duration_ms),
@@ -172,7 +172,7 @@ where
                 }
                 let target_pps = current_target_pps(config, live_target_pps);
                 if should_apply_solo_pps_wait(&observed_snapshot.snapshot) {
-                    if let Some(wait) = target_pps_wait(last_hard_drop_started_at, target_pps) {
+                    if let Some(wait) = target_pps_wait(last_execution_started_at, target_pps) {
                         log_solo_pps_wait(wait, &mut log);
                         log(format!(
                             "[automation] pps_limit target_pps={:.2} cycle_ms={} elapsed_ms={} wait_ms={} before_planning",
@@ -232,13 +232,16 @@ where
                             thread::sleep(poll_delay);
                             continue;
                         }
-                        let plan_ready_at = Instant::now();
+                        let previous_execution_started_at = last_execution_started_at;
+                        let execution_started_at = Instant::now();
                         log_solo_execution_started(
                             &snapshot,
-                            plan_ready_at.elapsed(),
-                            last_hard_drop_started_at.map(|started_at| started_at.elapsed()),
+                            execution_started_at.elapsed(),
+                            previous_execution_started_at
+                                .map(|previous| execution_started_at.duration_since(previous)),
                             &mut log,
                         );
+                        last_execution_started_at = Some(execution_started_at);
                         let input_started_at = Instant::now();
                         let executed_hold = prepared.execution_plan.hold;
                         if let Err(error) = execute_plan_until_hard_drop_with_vs_post_hold_delay(
@@ -299,7 +302,6 @@ where
                             };
                             match hard_drop_decision {
                                 HardDropDecision::Proceed => {
-                                    let hard_drop_started_at = Instant::now();
                                     if let Err(error) = execute_hard_drop_action(
                                         driver,
                                         &prepared.execution_plan.movement_actions,
@@ -333,7 +335,6 @@ where
                                             continue;
                                         }
                                     }
-                                    last_hard_drop_started_at = Some(hard_drop_started_at);
                                     if snapshot.piece_counter.is_some() {
                                         last_piece_counter = snapshot.piece_counter;
                                     }
@@ -767,16 +768,16 @@ fn pps_wait_duration(target_piece_time: Option<Duration>, elapsed: Duration) -> 
 }
 
 fn target_pps_wait(
-    last_hard_drop_started_at: Option<Instant>,
+    last_execution_started_at: Option<Instant>,
     target_pps: f32,
 ) -> Option<TargetPpsWait> {
     let Some(target_piece_time) = target_pps_interval(target_pps) else {
         return None;
     };
-    let Some(last_hard_drop_started_at) = last_hard_drop_started_at else {
+    let Some(last_execution_started_at) = last_execution_started_at else {
         return None;
     };
-    let elapsed = last_hard_drop_started_at.elapsed();
+    let elapsed = last_execution_started_at.elapsed();
     let wait = pps_wait_duration(Some(target_piece_time), elapsed)?;
     Some(TargetPpsWait {
         target_pps,
@@ -2589,6 +2590,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         hard_drop_sequences: Arc<AtomicU32>,
         route_sequences: Arc<AtomicU32>,
+        route_batch_instants: Arc<Mutex<Vec<Instant>>>,
     }
 
     impl InputBackend for StopAfterHardDropBackend {
@@ -2616,6 +2618,9 @@ mod tests {
                 }
             } else if !actions.is_empty() {
                 self.route_sequences.fetch_add(1, AtomicOrdering::Relaxed);
+                if let Ok(mut instants) = self.route_batch_instants.lock() {
+                    instants.push(Instant::now());
+                }
             }
             Ok(())
         }
@@ -4101,6 +4106,7 @@ mod tests {
             stop: stop.clone(),
             hard_drop_sequences: hard_drop_sequences.clone(),
             route_sequences: route_sequences.clone(),
+            route_batch_instants: Arc::new(Mutex::new(Vec::new())),
         };
 
         run_loop_until(&config, &mut scanner, &mut backend, stop.as_ref(), {
@@ -4136,6 +4142,191 @@ mod tests {
         assert!(refreshed_snapshot_index < plan_ready_index);
         assert_eq!(route_sequences.load(AtomicOrdering::Relaxed), 2);
         assert_eq!(hard_drop_sequences.load(AtomicOrdering::Relaxed), 2);
+    }
+
+    #[test]
+    fn solo_pps_wait_anchors_previous_execution_start() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let hard_drop_sequences = Arc::new(AtomicU32::new(0));
+        let route_sequences = Arc::new(AtomicU32::new(0));
+        let route_batch_instants = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_dir = temp_bridge_dir("solo-pps-anchor");
+        let snapshot_path = snapshot_dir.join("live-snapshot.json");
+
+        let first_snapshot = runner_test_snapshot("browser-1-0", 0);
+        let second_snapshot = runner_test_snapshot("browser-1-1", 1);
+        write_runner_snapshot_file(&snapshot_path, &second_snapshot);
+
+        let mut config = AutomationConfig {
+            snapshot_path: snapshot_path.clone(),
+            target_pps: 3.0,
+            ..AutomationConfig::default()
+        };
+        config.tap_duration_ms = 40;
+        config.movement_tap_duration_ms = 40;
+        config.rotate_tap_duration_ms = 40;
+        config.hold_tap_duration_ms = 40;
+        config.hard_drop_tap_duration_ms = 40;
+        config.soft_drop_tap_duration_ms = 40;
+        config.movement_interval_ms = 0;
+        config.rotation_interval_ms = 0;
+        config.piece_interval_ms = 0;
+        config.hard_drop_interval_ms = 0;
+
+        let mut scanner = ScriptedScanner {
+            snapshots: VecDeque::from([
+                (first_snapshot, Some(Duration::ZERO)),
+                (second_snapshot, Some(Duration::ZERO)),
+            ]),
+            latest_age: None,
+        };
+        let mut backend = StopAfterHardDropBackend {
+            stop: stop.clone(),
+            hard_drop_sequences: hard_drop_sequences.clone(),
+            route_sequences: route_sequences.clone(),
+            route_batch_instants: route_batch_instants.clone(),
+        };
+
+        run_loop_until(&config, &mut scanner, &mut backend, stop.as_ref(), {
+            let logs = logs.clone();
+            move |line| logs.lock().unwrap().push(line)
+        })
+        .unwrap();
+
+        let route_batch_instants = route_batch_instants.lock().unwrap();
+        assert_eq!(route_batch_instants.len(), 2);
+        let execution_gap_ms = route_batch_instants[1]
+            .duration_since(route_batch_instants[0])
+            .as_millis();
+        assert!(
+            (300..380).contains(&execution_gap_ms),
+            "expected execution-start-based PPS gap near 333ms, got {execution_gap_ms}ms"
+        );
+        assert_eq!(route_sequences.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(hard_drop_sequences.load(AtomicOrdering::Relaxed), 2);
+
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
+    }
+
+    #[test]
+    fn solo_pps_wait_preserves_anchor_across_pre_hard_drop_retry() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let route_sequences = Arc::new(AtomicU32::new(0));
+        let route_batch_instants = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_dir = temp_bridge_dir("solo-pps-retry-anchor");
+        let snapshot_path = snapshot_dir.join("live-snapshot.json");
+
+        let snapshot = runner_test_snapshot("browser-1-0", 0);
+        let mut retry_snapshot = snapshot.clone();
+        retry_snapshot.active = Some(ActivePieceState {
+            x: 20,
+            y: 18,
+            rotation: RotationToken::East,
+        });
+        write_runner_snapshot_file(&snapshot_path, &retry_snapshot);
+
+        let updater_path = snapshot_path.clone();
+        let corrected_snapshot = snapshot.clone();
+        let updater = thread::spawn(move || {
+            thread::sleep(StdDuration::from_millis(20));
+            let mut corrected_snapshot = corrected_snapshot;
+            corrected_snapshot.active = None;
+            write_runner_snapshot_file(&updater_path, &corrected_snapshot);
+        });
+
+        let mut config = AutomationConfig {
+            snapshot_path: snapshot_path.clone(),
+            target_pps: 3.0,
+            ..AutomationConfig::default()
+        };
+        config.tap_duration_ms = 0;
+        config.movement_tap_duration_ms = 0;
+        config.rotate_tap_duration_ms = 0;
+        config.hold_tap_duration_ms = 0;
+        config.hard_drop_tap_duration_ms = 0;
+        config.soft_drop_tap_duration_ms = 0;
+        config.movement_interval_ms = 0;
+        config.rotation_interval_ms = 0;
+        config.piece_interval_ms = 0;
+        config.hard_drop_interval_ms = 0;
+
+        struct SoloRetryAnchorBackend {
+            stop: Arc<AtomicBool>,
+            route_sequences: Arc<AtomicU32>,
+            route_batch_instants: Arc<Mutex<Vec<Instant>>>,
+        }
+
+        impl InputBackend for SoloRetryAnchorBackend {
+            fn tap(&mut self, _: GameAction, _: Duration) -> Result<()> {
+                Ok(())
+            }
+
+            fn execute_sequence(&mut self, actions: &[TimedGameAction]) -> Result<()> {
+                if !actions.is_empty() {
+                    let count = self
+                        .route_sequences
+                        .fetch_add(1, AtomicOrdering::Relaxed)
+                        + 1;
+                    if let Ok(mut instants) = self.route_batch_instants.lock() {
+                        instants.push(Instant::now());
+                    }
+                    if count >= 2 {
+                        self.stop.store(true, AtomicOrdering::Relaxed);
+                    }
+                }
+                Ok(())
+            }
+
+            fn release_all_keys(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn supports_batched_sequences(&self) -> bool {
+                true
+            }
+        }
+
+        let mut scanner = ScriptedScanner {
+            snapshots: VecDeque::from([(snapshot, Some(Duration::ZERO))]),
+            latest_age: None,
+        };
+        let mut backend = SoloRetryAnchorBackend {
+            stop: stop.clone(),
+            route_sequences: route_sequences.clone(),
+            route_batch_instants: route_batch_instants.clone(),
+        };
+
+        run_loop_until(&config, &mut scanner, &mut backend, stop.as_ref(), {
+            let logs = logs.clone();
+            move |line| logs.lock().unwrap().push(line)
+        })
+        .unwrap();
+
+        updater.join().unwrap();
+
+        let route_batch_instants = route_batch_instants.lock().unwrap();
+        assert!(
+            route_batch_instants.len() >= 2,
+            "expected at least two execution starts, got {}",
+            route_batch_instants.len()
+        );
+        let execution_gap_ms = route_batch_instants[1]
+            .duration_since(route_batch_instants[0])
+            .as_millis();
+        assert!(
+            (300..500).contains(&execution_gap_ms),
+            "expected retry execution to wait for the previous execution start anchor, got {execution_gap_ms}ms"
+        );
+        assert!(route_sequences.load(AtomicOrdering::Relaxed) >= 2);
+        assert!(logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("pre_hard_drop_mismatch")));
+
+        let _ = std::fs::remove_dir_all(&snapshot_dir);
     }
 
     #[test]

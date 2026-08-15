@@ -341,6 +341,30 @@ async function dispatchTrackedKey(cdp, spec, type, pressedKeys) {
   pressedKeys.delete(spec.code);
 }
 
+function dispatchSequenceKey(cdp, spec, type, pressedKeys, keyEpochs) {
+  const epoch = (keyEpochs.get(spec.code) ?? 0) + 1;
+  keyEpochs.set(spec.code, epoch);
+
+  // Track keyDown immediately so recovery can always release it.
+  // On failure, recoverInputState() can send keyUp again to clean up safely.
+  if (type === "keyDown") {
+    pressedKeys.add(spec.code);
+  }
+
+  return dispatchKey(cdp, spec, type).then(() => {
+    if (type === "keyDown") {
+      pressedKeys.add(spec.code);
+      return;
+    }
+
+    // ?? ?? ? ??? ???? ?? queue? ??,
+    // ?? keyUp ACK? ?? ????? pressed ??? ??? ???.
+    if (keyEpochs.get(spec.code) === epoch) {
+      pressedKeys.delete(spec.code);
+    }
+  });
+}
+
 export async function releaseTrackedKeys(cdp, pressedKeys) {
   let firstError = null;
   for (const code of [...pressedKeys]) {
@@ -378,8 +402,80 @@ async function executeInputAction(cdp, action, targetInfo, setClient, pressedKey
 }
 
 export async function executeSequence(cdp, actions, targetInfo, setClient, pressedKeys) {
-  for (const action of actions) {
-    await executeInputAction(cdp, action, targetInfo, setClient, pressedKeys);
+  const keyEpochs = new Map();
+  let pendingKeyUp = null;
+
+  const settleDispatch = (promise) =>
+    promise.then(
+      () => null,
+      (error) => error
+    );
+
+  try {
+    for (const action of actions) {
+      // ?? keyUp ACK? ???? ?? ?? keyDown? ?? ????.
+      // WebSocket/CDP ?? ?? ???
+      // previous keyUp -> current keyDown ?? ????.
+      const pendingKeyDown = settleDispatch(
+        dispatchSequenceKey(
+          cdp,
+          action.spec,
+          "keyDown",
+          pressedKeys,
+          keyEpochs
+        )
+      );
+
+      // ?? keyUp? ?? keyDown acknowledgement? ??? ????.
+      const pendingBeforeHold = pendingKeyUp
+        ? [pendingKeyUp, pendingKeyDown]
+        : [pendingKeyDown];
+
+      const dispatchErrors = await Promise.all(pendingBeforeHold);
+      const firstDispatchError = dispatchErrors.find(
+        (error) => error !== null
+      );
+
+      if (firstDispatchError) {
+        throw firstDispatchError;
+      }
+
+      // keyDown ACK ???? duration? ???
+      // ?? ? ????? ???? ???? ???.
+      await sleep(action.durationMs);
+
+      // keyUp? ??? ???? ???? ACK? ???? ???.
+      // ?? loop? keyDown? ?? ????.
+      pendingKeyUp = settleDispatch(
+        dispatchSequenceKey(
+          cdp,
+          action.spec,
+          "keyUp",
+          pressedKeys,
+          keyEpochs
+        )
+      );
+
+      if (action.afterMs > 0) {
+        await sleep(action.afterMs);
+      }
+    }
+
+    // ??? keyUp? ??? ?? ???? ????.
+    if (pendingKeyUp) {
+      const finalError = await pendingKeyUp;
+      if (finalError) {
+        throw finalError;
+      }
+    }
+  } catch (error) {
+    await recoverInputState(
+      cdp,
+      error,
+      targetInfo,
+      setClient,
+      pressedKeys
+    );
   }
 }
 

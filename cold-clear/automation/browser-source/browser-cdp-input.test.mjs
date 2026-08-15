@@ -149,6 +149,82 @@ test("sequence preserves action order and responds once", async () => {
   assert.equal(cdp.events.some((event) => event.method === "Page.bringToFront"), false);
 });
 
+test("sequence pipelines keyUp acknowledgement with next keyDown without reordering events", async () => {
+  const cdp = createFakeCdp();
+
+  const originalSend = cdp.send.bind(cdp);
+  let inFlightDispatches = 0;
+  let maxInFlightDispatches = 0;
+
+  cdp.send = async (method, params = {}) => {
+    if (method !== "Input.dispatchKeyEvent") {
+      return originalSend(method, params);
+    }
+
+    // ?? ???? ?? ???? CDP acknowledgement? ??
+    // ???? ??? ?? ??.
+    const result = await originalSend(method, params);
+
+    inFlightDispatches += 1;
+    maxInFlightDispatches = Math.max(
+      maxInFlightDispatches,
+      inFlightDispatches
+    );
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return result;
+    } finally {
+      inFlightDispatches -= 1;
+    }
+  };
+
+  const pressedKeys = new Set();
+  const { context, responses } = createContext(cdp, pressedKeys);
+
+  await handleMessage(
+    {
+      id: 101,
+      type: "sequence",
+      actions: [
+        { key: "moveRight", durationMs: 5 },
+        { key: "moveRight", durationMs: 5 },
+        { key: "rotateCW", durationMs: 5 },
+        { key: "hardDrop", durationMs: 5 }
+      ]
+    },
+    context
+  );
+
+  assert.deepEqual(
+    keyEventCodes(cdp.events),
+    [
+      "keyDown:ArrowRight",
+      "keyUp:ArrowRight",
+      "keyDown:ArrowRight",
+      "keyUp:ArrowRight",
+      "keyDown:KeyX",
+      "keyUp:KeyX",
+      "keyDown:Space",
+      "keyUp:Space"
+    ]
+  );
+
+  assert.ok(
+    maxInFlightDispatches >= 2,
+    `expected pipelined dispatches, max=${maxInFlightDispatches}`
+  );
+
+  assert.equal(pressedKeys.size, 0);
+  assert.equal(responses.length, 1);
+  assert.deepEqual(responses[0], {
+    ok: true,
+    id: 101,
+    type: "sequence",
+    actionCount: 4
+  });
+});
+
 test("releaseAll only sends keyUp for tracked keys", async () => {
   const cdp = createFakeCdp();
   const pressedKeys = new Set(["KeyC", "Space"]);

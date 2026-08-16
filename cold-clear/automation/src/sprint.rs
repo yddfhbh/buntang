@@ -5,6 +5,7 @@ use libtetris::{Board, LockResult, PlacementKind};
 use crate::scanner::GameSnapshot;
 
 const SPRINT_TARGET_LINES: u32 = 40;
+const SIX_THREE_WELL_COLUMN: usize = 6;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SprintState {
@@ -26,6 +27,16 @@ pub struct SprintBoardFeatures {
     pub tetris_ready: bool,
     pub almost_tetris_ready: bool,
     pub blocked_well_cells: u32,
+
+    // Speed style uses adaptive 6-3 stacking:
+    // columns 0..=5 | well 6 | columns 7..=9.
+    pub six_three_well_occupied_cells: u32,
+    pub six_three_well_depth: u32,
+    pub six_three_well_blocked_cells: u32,
+    pub left_surface_roughness: u32,
+    pub right_surface_roughness: u32,
+    pub right_height_span: u32,
+
     pub cavity_cells: u32,
     pub covered_cells: u32,
     pub max_height: u32,
@@ -49,7 +60,14 @@ pub struct Sprint40lEvaluator {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct SprintCandidateScore {
     completes_run: bool,
+
+    // During Build, preserving the seventh-column 6-3 well is a hard
+    // placement preference. Finish/Recovery deliberately disable it.
+    six_three_well_clear: bool,
+    neg_six_three_well_occupied: i32,
+
     phase_priority: i32,
+    six_three_shape_priority: i32,
     safety_priority: i32,
     clean_well_depth: i32,
     clear_lines: i32,
@@ -76,7 +94,7 @@ impl Evaluator for Sprint40lEvaluator {
     type Reward = StandardReward;
 
     fn name(&self) -> String {
-        "Sprint40L".to_owned()
+        "Sprint40L-6-3".to_owned()
     }
 
     fn evaluate(
@@ -157,8 +175,8 @@ pub fn snapshot_game_epoch(snapshot: &GameSnapshot) -> Option<u64> {
 pub fn sprint_phase(features: &SprintBoardFeatures, remaining_lines: u32) -> SprintPhase {
     if features.max_height >= 14
         || features.cavity_cells > 0
-        || features.blocked_well_cells > 0
-        || (features.clean_well_depth == 0 && features.max_height >= 10)
+        || features.six_three_well_occupied_cells > 0
+        || (features.six_three_well_depth == 0 && features.max_height >= 10)
     {
         SprintPhase::Recovery
     } else if remaining_lines <= 8 {
@@ -193,7 +211,9 @@ pub fn sprint_build_weights() -> Standard {
     weights.combo_garbage = 0;
     weights.perfect_clear = 150;
     weights.wasted_t = 0;
-    weights.move_time = -10;
+    // Speed style should care materially about placement cost, not just
+    // produce a safe Tetris stack.
+    weights.move_time = -24;
     weights.cavity_cells = -200;
     weights.covered_cells = -24;
     weights.overhang_cells = -42;
@@ -279,6 +299,14 @@ pub fn analyze_board(board: &Board) -> SprintBoardFeatures {
     let cavity_cells = cavity_cells(board);
     let covered_cells = covered_cells(board);
 
+    let six_three_well_occupied_cells = well_occupied_cells(board, SIX_THREE_WELL_COLUMN);
+    let six_three_well_depth = clean_well_depth_for_column(board, SIX_THREE_WELL_COLUMN);
+    let six_three_well_blocked_cells = blocked_well_cells_for_column(board, SIX_THREE_WELL_COLUMN);
+
+    let left_surface_roughness = surface_roughness(heights, 0, SIX_THREE_WELL_COLUMN);
+    let right_surface_roughness = surface_roughness(heights, SIX_THREE_WELL_COLUMN + 1, 10);
+    let right_height_span = height_span(heights, SIX_THREE_WELL_COLUMN + 1, 10);
+
     let mut best_well_column = 0usize;
     let mut clean_well_depth = 0u32;
     let mut blocked_well_cells = u32::MAX;
@@ -312,6 +340,12 @@ pub fn analyze_board(board: &Board) -> SprintBoardFeatures {
         tetris_ready: clean_well_depth >= 4 && blocked_well_cells == 0,
         almost_tetris_ready: clean_well_depth >= 3 && blocked_well_cells == 0,
         blocked_well_cells,
+        six_three_well_occupied_cells,
+        six_three_well_depth,
+        six_three_well_blocked_cells,
+        left_surface_roughness,
+        right_surface_roughness,
+        right_height_span,
         cavity_cells,
         covered_cells,
         max_height,
@@ -337,6 +371,29 @@ fn sprint_candidate_score(
         0
     };
 
+    let (
+        six_three_well_clear,
+        neg_six_three_well_occupied,
+        six_three_shape_priority,
+        scoring_well_depth,
+        scoring_blocked_well_cells,
+    ) = match context.phase {
+        SprintPhase::Build => (
+            features.six_three_well_occupied_cells == 0,
+            -(features.six_three_well_occupied_cells as i32),
+            six_three_build_shape_priority(&features),
+            features.six_three_well_depth,
+            features.six_three_well_blocked_cells,
+        ),
+        SprintPhase::Finish | SprintPhase::Recovery => (
+            true,
+            0,
+            0,
+            features.clean_well_depth,
+            features.blocked_well_cells,
+        ),
+    };
+
     let (phase_priority, safety_priority) = match context.phase {
         SprintPhase::Build => (
             build_phase_priority(candidate.lock.placement_kind, &features),
@@ -359,13 +416,16 @@ fn sprint_candidate_score(
 
     SprintCandidateScore {
         completes_run,
+        six_three_well_clear,
+        neg_six_three_well_occupied,
         phase_priority,
+        six_three_shape_priority,
         safety_priority,
-        clean_well_depth: features.clean_well_depth as i32,
+        clean_well_depth: scoring_well_depth as i32,
         clear_lines: clear_lines as i32,
         clears_without_tetris: -clears_without_tetris,
         neg_cavity_cells: -(features.cavity_cells as i32),
-        neg_blocked_well_cells: -(features.blocked_well_cells as i32),
+        neg_blocked_well_cells: -(scoring_blocked_well_cells as i32),
         neg_covered_cells: -(features.covered_cells as i32),
         neg_max_height: -(features.max_height as i32),
         neg_deep_well_count: -(features.deep_well_count as i32),
@@ -387,15 +447,31 @@ fn build_phase_priority(kind: PlacementKind, features: &SprintBoardFeatures) -> 
         | PlacementKind::Tspin3 => -110,
         PlacementKind::MiniTspin | PlacementKind::MiniTspin1 | PlacementKind::MiniTspin2 => -130,
     };
+    let six_three_ready =
+        features.six_three_well_depth >= 4 && features.six_three_well_blocked_cells == 0;
+    let six_three_almost_ready =
+        features.six_three_well_depth >= 3 && features.six_three_well_blocked_cells == 0;
+
     clear_bonus
-        + (features.tetris_ready as i32) * 90
-        + (features.almost_tetris_ready as i32) * 35
-        + (features.clean_well_depth as i32) * 10
+        + (six_three_ready as i32) * 90
+        + (six_three_almost_ready as i32) * 35
+        + (features.six_three_well_depth as i32) * 10
+}
+
+fn six_three_build_shape_priority(features: &SprintBoardFeatures) -> i32 {
+    // Once the fixed well is preserved, prefer a compact 3-side and a
+    // reasonably smooth 6-side. The 3-side is weighted more strongly because
+    // ugly three-column surfaces quickly create expensive future routes.
+    (features.six_three_well_depth as i32) * 18
+        - (features.six_three_well_blocked_cells as i32) * 120
+        - (features.right_surface_roughness as i32) * 18
+        - (features.right_height_span as i32) * 12
+        - (features.left_surface_roughness as i32) * 4
 }
 
 fn build_safety_priority(features: &SprintBoardFeatures) -> i32 {
     -((features.cavity_cells as i32) * 30
-        + (features.blocked_well_cells as i32) * 25
+        + (features.six_three_well_blocked_cells as i32) * 25
         + (features.covered_cells as i32) * 12
         + (features.max_height as i32) * 6
         + ((features.deep_well_count.saturating_sub(1)) as i32) * 20)
@@ -469,6 +545,37 @@ fn recovery_safety_priority(features: &SprintBoardFeatures) -> i32 {
         + (features.blocked_well_cells as i32) * 22
         + (features.covered_cells as i32) * 14
         + (features.max_height as i32) * 8)
+}
+
+fn well_occupied_cells(board: &Board, column: usize) -> u32 {
+    (0..40)
+        .filter(|y| board.occupied(column as i32, *y))
+        .count() as u32
+}
+
+fn surface_roughness(heights: &[i32], start: usize, end_exclusive: usize) -> u32 {
+    if end_exclusive <= start + 1 {
+        return 0;
+    }
+
+    (start..end_exclusive - 1)
+        .map(|column| {
+            let left = heights[column].max(0);
+            let right = heights[column + 1].max(0);
+            (left - right).abs() as u32
+        })
+        .sum()
+}
+
+fn height_span(heights: &[i32], start: usize, end_exclusive: usize) -> u32 {
+    if start >= end_exclusive {
+        return 0;
+    }
+
+    let slice = &heights[start..end_exclusive];
+    let min_height = slice.iter().copied().min().unwrap_or_default().max(0);
+    let max_height = slice.iter().copied().max().unwrap_or_default().max(0);
+    (max_height - min_height) as u32
 }
 
 fn clean_well_depth_for_column(board: &Board, column: usize) -> u32 {
@@ -633,5 +740,77 @@ mod tests {
         let mut state = SprintState::default();
         register_lock_result(&mut state, &lock);
         assert_eq!(state.lines_cleared_fallback, 4);
+    }
+
+    #[test]
+    fn six_three_detection_uses_seventh_column_as_fixed_well() {
+        let mut field = [[false; 10]; 40];
+        for y in 0..4 {
+            for x in 0..10 {
+                if x != SIX_THREE_WELL_COLUMN {
+                    field[y][x] = true;
+                }
+            }
+        }
+
+        let features = analyze_board(&board_with_field(field));
+
+        assert_eq!(features.six_three_well_occupied_cells, 0);
+        assert_eq!(features.six_three_well_depth, 4);
+        assert_eq!(features.six_three_well_blocked_cells, 0);
+    }
+
+    #[test]
+    fn six_three_blocked_well_enters_recovery() {
+        let mut field = [[false; 10]; 40];
+
+        for x in 0..6 {
+            field[0][x] = true;
+        }
+        for x in 7..10 {
+            field[0][x] = true;
+        }
+
+        field[0][SIX_THREE_WELL_COLUMN] = true;
+
+        let features = analyze_board(&board_with_field(field));
+
+        assert_eq!(features.six_three_well_occupied_cells, 1);
+        assert_eq!(sprint_phase(&features, 32), SprintPhase::Recovery);
+    }
+
+    #[test]
+    fn six_three_shape_prefers_flat_three_side() {
+        let mut flat = [[false; 10]; 40];
+        let mut jagged = [[false; 10]; 40];
+
+        for x in [7usize, 8, 9] {
+            for y in 0..4 {
+                flat[y][x] = true;
+            }
+        }
+
+        for y in 0..2 {
+            jagged[y][7] = true;
+        }
+        for y in 0..4 {
+            jagged[y][8] = true;
+        }
+        for y in 0..6 {
+            jagged[y][9] = true;
+        }
+
+        let flat_features = analyze_board(&board_with_field(flat));
+        let jagged_features = analyze_board(&board_with_field(jagged));
+
+        assert!(
+            six_three_build_shape_priority(&flat_features)
+                > six_three_build_shape_priority(&jagged_features)
+        );
+    }
+
+    #[test]
+    fn speed_build_weights_penalize_move_time_aggressively() {
+        assert!(sprint_build_weights().move_time <= -20);
     }
 }

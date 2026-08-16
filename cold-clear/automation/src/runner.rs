@@ -3387,7 +3387,7 @@ mod tests {
         assert_eq!(weights.clear3, -200);
         assert_eq!(weights.clear4, 1300);
         assert_eq!(weights.wasted_t, 0);
-        assert_eq!(weights.move_time, -10);
+        assert_eq!(weights.move_time, -24);
         assert_eq!(weights.b2b_clear, 50);
         assert_eq!(weights.combo_garbage, 0);
     }

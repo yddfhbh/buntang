@@ -6875,6 +6875,7 @@ mod tests {
         let paths = test_paths("friendly-vs-dry-run-once");
         let mut app = LauncherApp::new(paths.clone());
         configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = false;
         app.start_bot();
         app.logs.clear();
         let now_ms = SystemTime::now()
@@ -7026,6 +7027,7 @@ mod tests {
         let paths = test_paths("friendly-vs-dry-run-retry");
         let mut app = LauncherApp::new(paths.clone());
         configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = false;
         app.start_bot();
         app.logs.clear();
         let now_ms = SystemTime::now()
@@ -7109,6 +7111,7 @@ mod tests {
         let paths = test_paths("friendly-vs-dry-run-null-userid");
         let mut app = LauncherApp::new(paths.clone());
         configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = false;
         app.start_bot();
         app.logs.clear();
         let now_ms = SystemTime::now()

@@ -66,13 +66,6 @@ impl FriendlyVsLiveLimit {
         }
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Twenty => "20 placements",
-            Self::Unlimited => "Unlimited",
-        }
-    }
-
     fn count_suffix(self) -> &'static str {
         match self {
             Self::Twenty => "20",
@@ -181,13 +174,6 @@ impl ZenithLivePieceLimit {
             }
             Self::Unlimited => Self::Unlimited,
             Self::Bounded(_) => Self::default(),
-        }
-    }
-
-    fn label(self) -> String {
-        match self {
-            Self::Bounded(value) => value.to_string(),
-            Self::Unlimited => "무제한".to_owned(),
         }
     }
 
@@ -1903,6 +1889,8 @@ impl LauncherApp {
         state.ensure_scanner_config_path();
         state.migrate_legacy_defaults();
         state.bot_enabled = false;
+        state.friendly_vs_live_limit = FriendlyVsLiveLimit::Unlimited;
+        state.friendly_vs_live_input_enabled = true;
         let (event_tx, event_rx) = mpsc::channel();
         Self {
             paths,
@@ -2215,14 +2203,11 @@ impl LauncherApp {
             && self.state.friendly_vs_live_input_enabled
     }
 
-    fn friendly_vs_live_limit_selector_locked(&self) -> bool {
-        self.local_tetrio_username_locked()
-    }
-
     fn friendly_vs_live_count_label(&self) -> String {
         self.friendly_vs_live.count_label(self.friendly_vs_live_limit())
     }
 
+    #[cfg(test)]
     fn friendly_vs_live_status_label(&self) -> String {
         if self.state.friendly_vs_live_input_enabled {
             format!(
@@ -2234,6 +2219,7 @@ impl LauncherApp {
         }
     }
 
+    #[cfg(test)]
     fn set_friendly_vs_live_input_enabled(&mut self, enabled: bool) {
         if self.state.friendly_vs_live_input_enabled == enabled {
             return;
@@ -5082,8 +5068,7 @@ impl eframe::App for LauncherApp {
                 }
             });
             if self.state.selected_mode == RuntimeMode::FriendlyVs {
-                ui.small(self.friendly_vs_live_status_label());
-            }
+                }
             ui.horizontal(|ui| {
                 ui.label(BOT_UI_VISIBLE_LABELS[0]);
                 ui.add_enabled_ui(!bot_locked, |ui| {
@@ -5144,70 +5129,7 @@ impl eframe::App for LauncherApp {
                     self.stop_bot();
                 }
             });
-            if self.state.selected_mode == RuntimeMode::Zenith {
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!bot_locked, |ui| {
-                        ui.checkbox(
-                            &mut self.state.zenith_live_input_enabled,
-                            "Zenith 실제 입력",
-                        );
-                    });
-                    ui.label(format!(
-                        "최대 자동 배치: {}",
-                        self.state.effective_zenith_live_max_pieces().label()
-                    ));
-                    ui.add_enabled_ui(!bot_locked, |ui| {
-                        egui::ComboBox::from_id_salt("zenith_live_max_pieces")
-                            .selected_text(self.state.effective_zenith_live_max_pieces().label())
-                            .show_ui(ui, |ui| {
-                                for option in ZENITH_LIVE_MAX_PIECE_OPTIONS {
-                                    ui.selectable_value(
-                                        &mut self.state.zenith_live_max_pieces,
-                                        ZenithLivePieceLimit::Bounded(*option),
-                                        option.to_string(),
-                                    );
-                                }
-                                ui.selectable_value(
-                                    &mut self.state.zenith_live_max_pieces,
-                                    ZenithLivePieceLimit::Unlimited,
-                                    "무제한",
-                                );
-                            });
-                    });
-                });
-                ui.small(
-                    "기본값은 OFF이며, 현재 단계에서는 Bot ON마다 최대 1피스만 실제 입력합니다.",
-                );
-            }
 
-            if self.state.selected_mode == RuntimeMode::FriendlyVs {
-                ui.small("Live input only changes dispatch permission. Capture and dry-run stay active.");
-                ui.horizontal(|ui| {
-                    ui.label("Live limit:");
-                    ui.add_enabled_ui(!self.friendly_vs_live_limit_selector_locked(), |ui| {
-                        ui.radio_value(
-                            &mut self.state.friendly_vs_live_limit,
-                            FriendlyVsLiveLimit::Twenty,
-                            FriendlyVsLiveLimit::Twenty.label(),
-                        );
-                        ui.radio_value(
-                            &mut self.state.friendly_vs_live_limit,
-                            FriendlyVsLiveLimit::Unlimited,
-                            FriendlyVsLiveLimit::Unlimited.label(),
-                        );
-                    });
-                });
-                ui.horizontal(|ui| {
-                    let mut friendly_vs_live_input_enabled = self.state.friendly_vs_live_input_enabled;
-                    let response =
-                        ui.checkbox(&mut friendly_vs_live_input_enabled, "Live input");
-                    if response.changed() {
-                        self.set_friendly_vs_live_input_enabled(friendly_vs_live_input_enabled);
-                    }
-                    ui.label(format!("Count: {}", self.friendly_vs_live_count_label()));
-                });
-                ui.small("Turning this ON or OFF does not restart capture, bridge, observer, or session state.");
-            }
 
 
             ui.separator();
@@ -5231,7 +5153,7 @@ impl eframe::App for LauncherApp {
                 });
         });
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+        ctx.request_repaint_after(Duration::from_millis(16));
     }
 }
 
@@ -6233,10 +6155,10 @@ mod tests {
 
         let paths = test_paths("friendly-vs-live-default-false");
         let app = LauncherApp::new(paths.clone());
-        assert!(!app.state.friendly_vs_live_input_enabled);
+        assert!(app.state.friendly_vs_live_input_enabled);
         assert_eq!(
             app.state.effective_friendly_vs_live_limit(),
-            FriendlyVsLiveLimit::Twenty
+            FriendlyVsLiveLimit::Unlimited
         );
         cleanup_test_paths(&paths);
     }
@@ -6295,7 +6217,7 @@ mod tests {
     }
 
     #[test]
-    fn friendly_vs_live_status_label_shows_active_limit_mode() {
+    fn friendly_vs_live_status_label_uses_unlimited_limit() {
         let paths = test_paths("friendly-vs-live-status-labels");
         let mut app = LauncherApp::new(paths.clone());
         app.state.friendly_vs_live_input_enabled = true;
@@ -6303,29 +6225,8 @@ mod tests {
 
         assert_eq!(
             app.friendly_vs_live_status_label(),
-            "Friendly VS: Live (7/20)"
-        );
-
-        app.state.friendly_vs_live_limit = FriendlyVsLiveLimit::Unlimited;
-        assert_eq!(
-            app.friendly_vs_live_status_label(),
             "Friendly VS: Live (7/Unlimited)"
         );
-
-        cleanup_test_paths(&paths);
-    }
-
-    #[test]
-    fn friendly_vs_live_limit_selector_lock_tracks_bot_state() {
-        let paths = test_paths("friendly-vs-live-limit-selector-lock");
-        let mut app = LauncherApp::new(paths.clone());
-        app.state.selected_mode = RuntimeMode::FriendlyVs;
-        assert!(!app.friendly_vs_live_limit_selector_locked());
-
-        configure_friendly_vs_runtime_ready(&mut app);
-        app.start_bot();
-
-        assert!(app.friendly_vs_live_limit_selector_locked());
 
         cleanup_test_paths(&paths);
     }
@@ -7080,6 +6981,7 @@ mod tests {
         let paths = test_paths("friendly-vs-live-off");
         let mut app = LauncherApp::new(paths.clone());
         configure_friendly_vs_runtime_ready(&mut app);
+        app.state.friendly_vs_live_input_enabled = false;
         assert!(!app.state.friendly_vs_live_input_enabled);
         app.start_bot();
         assert!(app
@@ -9136,6 +9038,7 @@ mod tests {
     fn zenith_live_max_pieces_serializes_unlimited_explicitly() {
         let mut state = LauncherState::default();
         state.zenith_live_max_pieces = ZenithLivePieceLimit::Unlimited;
+        state.zenith_live_input_enabled = true;
         let serialized = serde_json::to_value(state).unwrap();
         assert_eq!(
             serialized.get("zenith_live_max_pieces"),

@@ -1129,7 +1129,7 @@ export function armClosureCaptureWindow(
     resetClosureCaptureTiming(closureCaptureState, now);
     resetClosureCaptureScanWindowState(closureCaptureState, {
       nextAttemptAt: now,
-      cursor: createPausedScopeScanCursor()
+      cursor: null
     });
     closureCaptureState.windowSequence += 1;
   }
@@ -14982,6 +14982,10 @@ export async function exposeTetrioGameFromPausedCallFrames(
 export async function exposeTetrioGameViaLocatorHint(cdp, pausedEvent, locatorName) {
   let failureReason = "";
   for (const callFrame of pausedEvent.callFrames ?? []) {
+    if (!callFrame?.callFrameId) {
+      continue;
+    }
+
     const result = await cdp.send("Debugger.evaluateOnCallFrame", {
       callFrameId: callFrame.callFrameId,
       expression: pausedFrameExposureExpression(locatorName),

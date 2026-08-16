@@ -9282,13 +9282,7 @@ test("new arm resets stale paused scan budget attempt cursor and fast-path state
   assert.equal(closureCaptureState.scanBudgetExhausted, false);
   assert.equal(closureCaptureState.fastLocatorAttempted, false);
   assert.equal(closureCaptureState.nextAttemptAt, 20_000);
-  assert.deepEqual(closureCaptureState.pausedScopeScanCursor, {
-    frameIndex: 0,
-    scopeIndex: 0,
-    propertyIndex: 0,
-    completedScopeKeys: [],
-    seenCandidateKeys: []
-  });
+  assert.equal(closureCaptureState.pausedScopeScanCursor, null);
 });
 
 test("fresh arm prevents first full scan from exhausting before attempt logging", async () => {
@@ -11014,7 +11008,7 @@ test("carried pending interaction arms exactly once after game end confirmation"
   );
   assert.ok(
     logs.includes(
-      "[browser] closure window initialized reason=next_game_carried_interaction capture_attempts=0 full_scan_attempts=0 paused_used_ms=0 cursor=0:0:0 exhausted=false remaining_paused_ms=700"
+      "[browser] closure window initialized reason=next_game_carried_interaction capture_attempts=0 full_scan_attempts=0 paused_used_ms=0 cursor=none exhausted=false remaining_paused_ms=700"
     )
   );
 });

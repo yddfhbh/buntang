@@ -26,6 +26,7 @@ const DEFAULT_CAPTURE_COOLDOWN_MS = 2000;
 const DEFAULT_CAPTURE_ARMING_WINDOW_MS = 8000;
 const DEFAULT_CAPTURE_SKIP_LOG_INTERVAL_MS = 60000;
 const DEFAULT_CAPTURE_RETRY_SCHEDULE_MS = [750, 1000, 1500, 1500];
+const DEFAULT_CARRIED_RESTART_RETRY_SCHEDULE_MS = [350, 500, 750, 750];
 const DEFAULT_FULL_SCAN_PAUSE_BUDGET_MS = 350;
 const DEFAULT_FULL_SCAN_CUMULATIVE_BUDGET_MS = 700;
 const DEFAULT_FULL_SCAN_CONTINUATION_BACKOFF_MS = 100;
@@ -36,6 +37,7 @@ const DEFAULT_NEXT_GAME_FAST_LOCATOR_INTERVAL_MS = 350;
 const DEFAULT_NEXT_GAME_FAST_LOCATOR_MISS_LOG_INTERVAL_MS = 5000;
 const DEFAULT_NEXT_GAME_INTERACTION_POLL_MS = 75;
 const DEFAULT_NEXT_GAME_INTERACTION_BURST_DEDUPE_MS = 150;
+const DEFAULT_PRE_TRANSITION_RESTART_CARRY_WINDOW_MS = 1000;
 const DEFAULT_INITIAL_GAMEPLAY_SIGNAL_INTERVAL_MS = 350;
 const DEFAULT_NEXT_GAME_INTERACTION_CAPTURE_DELAY_MS = 300;
 const DEFAULT_TARGETED_PAUSED_PROBE_DELAY_MS = 450;
@@ -250,6 +252,8 @@ export function createClosureCaptureState() {
     fullScanAttemptsInWindow: 0,
     cumulativePausedScanBudgetUsedMs: 0,
     pausedScopeScanCursor: null,
+    pausedScopeScanCursorFrameIdentity: "",
+    pausedScopeScanFrameOrderHeadIdentity: "",
     windowSequence: 0,
     scanBudgetExhausted: false,
     fastLocatorAttempted: false,
@@ -259,6 +263,7 @@ export function createClosureCaptureState() {
     windowArmedAt: 0,
     windowFirstInteractionAt: 0,
     windowTargetedProbeAt: 0,
+    windowInteractionKind: "",
     soloClosureFingerprintPath: DEFAULT_SOLO_CLOSURE_FINGERPRINT_PATH,
     provisionalNonHeavyAttemptConsumed: false,
     initialGameplayProbeAt: 0,
@@ -454,6 +459,7 @@ export function initializeFreshClosureCaptureWindow(
   closureCaptureState.windowArmedAt = 0;
   closureCaptureState.windowFirstInteractionAt = 0;
   closureCaptureState.windowTargetedProbeAt = 0;
+  closureCaptureState.windowInteractionKind = "";
   closureCaptureState.provisionalNonHeavyAttemptConsumed = false;
   resetClosureCaptureTiming(closureCaptureState);
   resetClosureCaptureScanWindowState(closureCaptureState, {
@@ -832,6 +838,8 @@ function clearPausedScopeScanCursor(closureCaptureState) {
     return false;
   }
   closureCaptureState.pausedScopeScanCursor = null;
+  closureCaptureState.pausedScopeScanCursorFrameIdentity = "";
+  closureCaptureState.pausedScopeScanFrameOrderHeadIdentity = "";
   return true;
 }
 
@@ -845,6 +853,8 @@ function resetClosureCaptureScanWindowState(
   closureCaptureState.fullScanAttemptsInWindow = 0;
   closureCaptureState.cumulativePausedScanBudgetUsedMs = 0;
   closureCaptureState.pausedScopeScanCursor = cursor;
+  closureCaptureState.pausedScopeScanCursorFrameIdentity = "";
+  closureCaptureState.pausedScopeScanFrameOrderHeadIdentity = "";
   closureCaptureState.scanBudgetExhausted = false;
   closureCaptureState.fastLocatorAttempted = false;
   closureCaptureState.nextAttemptAt = nextAttemptAt;
@@ -1297,6 +1307,50 @@ export function isGameplayExpectedForClosureCapture({
   );
 }
 
+export function isPendingNextGameInteractionGenerationUnhandled(
+  nextGameReacquireState
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+
+  const pendingGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
+  );
+  const handledGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)
+  );
+
+  if (pendingGeneration <= 0) {
+    return false;
+  }
+
+  if (pendingGeneration > handledGeneration) {
+    return true;
+  }
+
+  if (pendingGeneration < handledGeneration) {
+    return false;
+  }
+
+  const baselineGeneration = Math.max(
+    0,
+    Number(nextGameReacquireState.interactionBaselineGeneration ?? 0)
+  );
+
+  return Boolean(
+    pendingGeneration === baselineGeneration &&
+    handledGeneration === baselineGeneration &&
+    String(nextGameReacquireState.pendingInteractionSource ?? "") ===
+      "post_game" &&
+    String(nextGameReacquireState.pendingInteractionKind ?? "") ===
+      "restart_key" &&
+    isEligibleCarriedPreTransitionRestart(nextGameReacquireState)
+  );
+}
+
 function hasUnhandledCarriedPostGameInteraction(nextGameReacquireState) {
   if (!nextGameReacquireState?.active) {
     return false;
@@ -1313,7 +1367,7 @@ function hasUnhandledCarriedPostGameInteraction(nextGameReacquireState) {
     nextGameReacquireState.interactionPhase ===
       NEXT_GAME_INTERACTION_PHASE_REACQUIRING &&
     String(nextGameReacquireState.pendingInteractionSource ?? "") === "post_game" &&
-    pendingGeneration > handledGeneration
+    isPendingNextGameInteractionGenerationUnhandled(nextGameReacquireState)
   );
 }
 
@@ -1323,6 +1377,60 @@ function isProvisionalClosureCaptureReason(reason = "") {
 
 function isCarriedClosureCaptureReason(reason = "") {
   return String(reason ?? "").startsWith("next_game_carried_interaction");
+}
+
+export function isCarriedRestartClosureCaptureWindow(closureCaptureState) {
+  return (
+    isCarriedClosureCaptureReason(closureCaptureState?.armedReason) &&
+    String(closureCaptureState?.windowInteractionKind ?? "") === "restart_key"
+  );
+}
+
+export function isFastNextGameReacquireClosureCaptureWindow(
+  closureCaptureState
+) {
+  return (
+    isCarriedRestartClosureCaptureWindow(closureCaptureState) ||
+    String(closureCaptureState?.armedReason ?? "") === "next_game_cheap_signal"
+  );
+}
+
+export function resolveClosureCapturePauseTimeoutMs(
+  closureCaptureState,
+  {
+    isAgainButtonProvisionalCapture = false,
+    allowBroadScan = true
+  } = {}
+) {
+  if (
+    (isAgainButtonProvisionalCapture && !allowBroadScan) ||
+    isFastNextGameReacquireClosureCaptureWindow(closureCaptureState)
+  ) {
+    return DEFAULT_FOLLOWUP_FAST_CAPTURE_TIMEOUT_MS;
+  }
+
+  return 900;
+}
+
+export function resolveClosureCaptureRetryScheduleMs(closureCaptureState) {
+  return isFastNextGameReacquireClosureCaptureWindow(closureCaptureState)
+    ? DEFAULT_CARRIED_RESTART_RETRY_SCHEDULE_MS
+    : DEFAULT_CAPTURE_RETRY_SCHEDULE_MS;
+}
+
+export function shouldArmNextGameCheapSignalFallback({
+  qualifiesForArm = false,
+  fallbackEligible = false,
+  reacquireActive = false,
+  waitingForNextGame = false
+} = {}) {
+  return Boolean(
+    qualifiesForArm &&
+      (
+        fallbackEligible ||
+        (reacquireActive && waitingForNextGame)
+      )
+  );
 }
 
 export function shouldLogClosureCaptureSkipped({
@@ -10323,6 +10431,7 @@ export function nextGameInteractionTrackerExpression() {
         key: null,
         interactionKind: null,
         timestamp: 0,
+        restartTimestamp: 0,
         targetTag: null,
         targetId: null,
         targetClass: null
@@ -10341,6 +10450,14 @@ export function nextGameInteractionTrackerExpression() {
             }
           }
           const now = Date.now();
+
+          if (
+            type === "keydown" &&
+            (String(event?.key || "") === "r" || String(event?.key || "") === "R")
+          ) {
+            state.restartTimestamp = now;
+          }
+
           if (
             now - Number(state.timestamp || 0) <= ${DEFAULT_NEXT_GAME_INTERACTION_BURST_DEDUPE_MS} &&
             (
@@ -10460,6 +10577,7 @@ function nextGameInteractionStateExpression() {
       key: state?.key || null,
       interactionKind: state?.interactionKind || null,
       timestamp: Math.max(0, Number(state?.timestamp || 0)),
+      restartTimestamp: Math.max(0, Number(state?.restartTimestamp || 0)),
       targetTag: state?.targetTag || null,
       targetId: state?.targetId || null,
       targetClass: state?.targetClass || null
@@ -10485,6 +10603,7 @@ export async function readNextGameInteractionState(
         key: null,
         interactionKind: null,
         timestamp: 0,
+        restartTimestamp: 0,
         targetTag: null,
         targetId: null,
         targetClass: null
@@ -10500,6 +10619,7 @@ export async function readNextGameInteractionState(
     key: null,
     interactionKind: null,
     timestamp: 0,
+    restartTimestamp: 0,
     targetTag: null,
     targetId: null,
     targetClass: null
@@ -10531,6 +10651,31 @@ export async function primeNextGameInteractionBaseline(
   return baselineGeneration;
 }
 
+export function isRecentPreTransitionRestartInteraction(
+  interaction,
+  now = Date.now(),
+  windowMs = DEFAULT_PRE_TRANSITION_RESTART_CARRY_WINDOW_MS
+) {
+  const generation = Math.max(0, Number(interaction?.generation ?? 0));
+  const timestamp = Math.max(0, Number(interaction?.timestamp ?? 0));
+  const currentNow = Math.max(0, Number(now ?? Date.now()));
+  const maxAgeMs = Math.max(0, Number(windowMs ?? 0));
+
+  if (
+    generation <= 0 ||
+    timestamp <= 0 ||
+    timestamp > currentNow
+  ) {
+    return false;
+  }
+
+  if (deriveInteractionKind(interaction) !== "restart_key") {
+    return false;
+  }
+
+  return currentNow - timestamp <= maxAgeMs;
+}
+
 export async function primePostGameInteractionWatchBaseline(
   cdp,
   postGameInteractionWatchState,
@@ -10557,6 +10702,75 @@ export async function primePostGameInteractionWatchBaseline(
     baselineGeneration,
     log
   });
+
+  const latchedRestartInteraction = {
+    generation: baselineGeneration,
+    type: "keydown",
+    key: "r",
+    interactionKind: "restart_key",
+    timestamp: Math.max(
+      0,
+      Number(interaction?.restartTimestamp ?? 0)
+    ),
+    targetTag: interaction?.targetTag ?? null,
+    targetId: interaction?.targetId ?? null,
+    targetClass: interaction?.targetClass ?? null
+  };
+
+  const carryPreTransitionInteraction =
+    isRecentPreTransitionRestartInteraction(interaction, now)
+      ? interaction
+      : (
+          isRecentPreTransitionRestartInteraction(
+            latchedRestartInteraction,
+            now
+          )
+            ? latchedRestartInteraction
+            : null
+        );
+
+  if (carryPreTransitionInteraction && postGameInteractionWatchState) {
+    postGameInteractionWatchState.pendingGeneration = baselineGeneration;
+    postGameInteractionWatchState.pendingTimestamp = Math.max(
+      0,
+      Number(carryPreTransitionInteraction?.timestamp ?? 0)
+    );
+    postGameInteractionWatchState.pendingType = String(
+      carryPreTransitionInteraction?.type ?? ""
+    );
+    postGameInteractionWatchState.pendingKey = String(
+      carryPreTransitionInteraction?.key ?? ""
+    );
+    postGameInteractionWatchState.pendingTargetTag = String(
+      carryPreTransitionInteraction?.targetTag ?? ""
+    );
+    postGameInteractionWatchState.pendingTargetId = String(
+      carryPreTransitionInteraction?.targetId ?? ""
+    );
+    postGameInteractionWatchState.pendingTargetClass = String(
+      carryPreTransitionInteraction?.targetClass ?? ""
+    );
+
+    if (typeof log === "function") {
+      const carriedFromLatch =
+        carryPreTransitionInteraction === latchedRestartInteraction;
+
+      log(
+        `[browser] pre-transition restart carried into post-game watch` +
+          ` generation=${baselineGeneration}` +
+          ` age_ms=${Math.max(
+            0,
+            Math.max(0, Number(now ?? Date.now())) -
+              Math.max(
+                0,
+                Number(carryPreTransitionInteraction?.timestamp ?? 0)
+              )
+          )}` +
+          (carriedFromLatch ? ` source=restart_latch` : "")
+      );
+    }
+  }
+
   setNextGameInteractionPhase(
     nextGameReacquireState,
     NEXT_GAME_INTERACTION_PHASE_POST_GAME_WATCH
@@ -10879,6 +11093,44 @@ function consumeNextGameInteractionWindow(
   return generation > 0;
 }
 
+export function isEligibleCarriedPreTransitionRestart(
+  nextGameReacquireState
+) {
+  if (!nextGameReacquireState) {
+    return false;
+  }
+
+  const pendingSource = String(
+    nextGameReacquireState.pendingInteractionSource ?? ""
+  );
+  const pendingKind = String(
+    nextGameReacquireState.pendingInteractionKind ?? ""
+  );
+  const pendingTimestamp = Math.max(
+    0,
+    Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)
+  );
+  const reacquireStartedAt = Math.max(
+    0,
+    Number(nextGameReacquireState.startedAt ?? 0)
+  );
+
+  if (
+    pendingSource !== "post_game" ||
+    pendingKind !== "restart_key" ||
+    pendingTimestamp <= 0 ||
+    reacquireStartedAt <= 0 ||
+    pendingTimestamp > reacquireStartedAt
+  ) {
+    return false;
+  }
+
+  return (
+    reacquireStartedAt - pendingTimestamp <=
+    DEFAULT_PRE_TRANSITION_RESTART_CARRY_WINDOW_MS
+  );
+}
+
 function armPendingNextGameInteractionWindow(
   closureCaptureState,
   nextGameReacquireState,
@@ -10901,13 +11153,38 @@ function armPendingNextGameInteractionWindow(
     Number(nextGameReacquireState.pendingInteractionGeneration ?? 0)
   );
   const pendingSource = String(nextGameReacquireState.pendingInteractionSource ?? "");
+  const carriedPreTransitionRestart =
+    isEligibleCarriedPreTransitionRestart(nextGameReacquireState);
+
+  const pendingGenerationUnhandled =
+    isPendingNextGameInteractionGenerationUnhandled(
+      nextGameReacquireState
+    );
+
   if (
-    pendingGeneration <=
-      Math.max(0, Number(nextGameReacquireState.lastInteractionGenerationHandled ?? 0)) ||
-    Math.max(0, Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)) <=
-      Math.max(0, Number(nextGameReacquireState.startedAt ?? 0))
+    !pendingGenerationUnhandled ||
+    (
+      !carriedPreTransitionRestart &&
+      Math.max(0, Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)) <=
+        Math.max(0, Number(nextGameReacquireState.startedAt ?? 0))
+    )
   ) {
     return { armed: false, reason: "already_handled_or_stale" };
+  }
+
+  if (carriedPreTransitionRestart && typeof log === "function") {
+    log(
+      `[browser] carried pre-transition restart passed stale guard` +
+        ` generation=${pendingGeneration}` +
+        ` lead_ms=${Math.max(
+          0,
+          Math.max(0, Number(nextGameReacquireState.startedAt ?? 0)) -
+            Math.max(
+              0,
+              Number(nextGameReacquireState.pendingInteractionTimestamp ?? 0)
+            )
+        )}`
+    );
   }
   if (!bootstrapReady) {
     nextGameReacquireState.pendingArmReason =
@@ -10947,6 +11224,9 @@ function armPendingNextGameInteractionWindow(
     }
     return { armed: false, reason: "arm_request_rejected" };
   }
+  closureCaptureState.windowInteractionKind = String(
+    nextGameReacquireState.pendingInteractionKind ?? ""
+  );
   nextGameReacquireState.lastInteractionGenerationHandled = pendingGeneration;
   nextGameReacquireState.pendingArmReason = "";
   clearPendingNextGameInteraction(nextGameReacquireState);
@@ -12103,6 +12383,116 @@ export function shouldAdvanceGameEpoch(state, waitingForNextGame) {
   return waitingForNextGame && isActiveTetrioGameState(state);
 }
 
+export function buildSoloGameTransitionMarkerPayload(
+  gameEpoch,
+  now = Date.now()
+) {
+  const normalizedEpoch = Math.max(
+    0,
+    Math.floor(Number(gameEpoch ?? 0))
+  );
+  const normalizedNow = Math.max(
+    0,
+    Math.floor(Number(now ?? Date.now()))
+  );
+
+  return {
+    version: 1,
+    reason: "playing_to_not_playing",
+    game_epoch: normalizedEpoch,
+    timestamp_ms: normalizedNow
+  };
+}
+
+export function soloGameTransitionMarkerPath(snapshotPath) {
+  const parsed = path.parse(String(snapshotPath ?? ""));
+  return path.join(
+    parsed.dir || ".",
+    `${parsed.name}.transition.json`
+  );
+}
+
+export function clearSoloGameTransitionMarker(markerPath) {
+  if (!markerPath) {
+    return false;
+  }
+
+  try {
+    rmSync(markerPath, { force: true });
+    rmSync(`${markerPath}.tmp`, { force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function writeSoloGameTransitionMarker(
+  markerPath,
+  {
+    gameEpoch,
+    now = Date.now(),
+    log = console.log
+  } = {}
+) {
+  if (!markerPath) {
+    return false;
+  }
+
+  const payload = buildSoloGameTransitionMarkerPayload(
+    gameEpoch,
+    now
+  );
+
+  if (
+    payload.game_epoch <= 0 ||
+    payload.timestamp_ms <= 0
+  ) {
+    return false;
+  }
+
+  const temporaryPath = `${markerPath}.tmp`;
+
+  try {
+    mkdirSync(path.dirname(markerPath), {
+      recursive: true
+    });
+
+    writeFileSync(
+      temporaryPath,
+      `${JSON.stringify(payload)}\n`,
+      "utf8"
+    );
+
+    rmSync(markerPath, { force: true });
+    renameSync(temporaryPath, markerPath);
+
+    if (typeof log === "function") {
+      log(
+        `[browser] solo game transition marker written` +
+          ` epoch=${payload.game_epoch}` +
+          ` timestamp_ms=${payload.timestamp_ms}`
+      );
+    }
+
+    return true;
+  } catch (error) {
+    try {
+      rmSync(temporaryPath, { force: true });
+    } catch {
+      // Best effort.
+    }
+
+    if (typeof log === "function") {
+      log(
+        `[browser] solo game transition marker write failed` +
+          ` error=${String(error?.message ?? error)}`
+      );
+    }
+
+    return false;
+  }
+}
+
 export function clearSnapshotFile(snapshotPath) {
   rmSync(snapshotPath, { force: true });
 }
@@ -12110,6 +12500,12 @@ export function clearSnapshotFile(snapshotPath) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const snapshotPath = args.snapshotPath ?? "automation/live-snapshot.json";
+  const soloTransitionMarkerPath =
+    soloGameTransitionMarkerPath(snapshotPath);
+
+  clearSoloGameTransitionMarker(
+    soloTransitionMarkerPath
+  );
   const url = args.url ?? DEFAULT_URL;
   const port = numberArg(args.port, DEFAULT_PORT);
   const targetHint = args.target ?? "TETR.IO";
@@ -12648,6 +13044,15 @@ async function main() {
         previousGameplayPhase === "playing" &&
         state?.playing !== true
       ) {
+        writeSoloGameTransitionMarker(
+          soloTransitionMarkerPath,
+          {
+            gameEpoch,
+            now: Date.now(),
+            log: (message) => console.log(message)
+          }
+        );
+
         await primePostGameInteractionWatchBaseline(cdp, postGameInteractionWatchState, {
           now: Date.now(),
           transientState,
@@ -12661,6 +13066,10 @@ async function main() {
         !waitingForNextGame &&
         state?.playing === true
       ) {
+        clearSoloGameTransitionMarker(
+          soloTransitionMarkerPath
+        );
+
         setNextGameInteractionPhase(
           nextGameReacquireState,
           NEXT_GAME_INTERACTION_PHASE_INACTIVE
@@ -14232,14 +14641,28 @@ export async function readTetrioState(cdp, options) {
               cheapSignal?.source ?? "unknown"
             )}`
           );
-          if (fallbackEligible) {
-            requestClosureCaptureArm(closureCaptureState, {
-              reason: "next_game_cheap_signal",
-              now,
-              bootstrapReady,
-              log
-            });
+        }
+
+        if (
+          shouldArmNextGameCheapSignalFallback({
+            qualifiesForArm,
+            fallbackEligible,
+            reacquireActive: nextGameReacquireState.active,
+            waitingForNextGame
+          })
+        ) {
+          if (!fallbackEligible) {
+            log(
+              "[browser] next-game cheap signal fallback armed with retained ended object"
+            );
           }
+
+          requestClosureCaptureArm(closureCaptureState, {
+            reason: "next_game_cheap_signal",
+            now,
+            bootstrapReady,
+            log
+          });
         }
         nextGameReacquireState.lastCheapSignalState = cheapSignalActive;
         nextGameReacquireState.lastCheapAggregateState = currentAggregate;
@@ -14490,10 +14913,13 @@ export async function readTetrioState(cdp, options) {
       closureCaptureState,
       log,
       requireActiveGame: isProvisionalCapture,
-      pauseTimeoutMs:
-        (isAgainButtonProvisionalCapture && !allowBroadScan)
-          ? DEFAULT_FOLLOWUP_FAST_CAPTURE_TIMEOUT_MS
-          : 900,
+      pauseTimeoutMs: resolveClosureCapturePauseTimeoutMs(
+        closureCaptureState,
+        {
+          isAgainButtonProvisionalCapture,
+          allowBroadScan
+        }
+      ),
       allowBroadScan,
       targetUrl: options.targetUrl ?? "",
       mainFrameId: options.mainFrameId ?? "",
@@ -14667,7 +15093,12 @@ export async function readTetrioState(cdp, options) {
           log
         });
       } else {
-        scheduleNextClosureCaptureAttempt(closureCaptureState, now, undefined, log);
+        scheduleNextClosureCaptureAttempt(
+          closureCaptureState,
+          now,
+          resolveClosureCaptureRetryScheduleMs(closureCaptureState),
+          log
+        );
       }
       state = {
         ...state,
@@ -14849,6 +15280,119 @@ export async function safeRuntimeEvaluate(
     }
     throw error;
   }
+}
+
+export function isKnownNonproductiveSoloPause(callFrames = []) {
+  const functionNames = (Array.isArray(callFrames) ? callFrames : [])
+    .map((callFrame) =>
+      String(callFrame?.functionName ?? "")
+        .trim()
+        .toLowerCase()
+    );
+
+  if (functionNames.some((name) => name === "_tick")) {
+    return false;
+  }
+
+  if (functionNames.length < 2) {
+    return false;
+  }
+
+  const allowed = new Set([
+    "",
+    "anonymous",
+    "t",
+    "sentrywrapped"
+  ]);
+
+  const onlyKnownWaitingFrames =
+    functionNames.every((name) => allowed.has(name));
+
+  const hasSentryWrapper =
+    functionNames.some((name) => name === "sentrywrapped");
+
+  const hasMinifiedWaitingFrame =
+    functionNames.some((name) => name === "t");
+
+  return (
+    onlyKnownWaitingFrames &&
+    hasSentryWrapper &&
+    hasMinifiedWaitingFrame
+  );
+}
+
+export function buildPausedCallFrameIdentity(callFrame) {
+  if (!callFrame) {
+    return "";
+  }
+
+  const location = callFrame.location ?? {};
+  const scopeShape = (callFrame.scopeChain ?? [])
+    .map((scope) => String(scope?.type ?? ""))
+    .join(",");
+
+  return [
+    String(callFrame.functionName ?? ""),
+    String(callFrame.url ?? ""),
+    String(location.scriptId ?? ""),
+    String(location.lineNumber ?? ""),
+    String(location.columnNumber ?? ""),
+    scopeShape
+  ].join("|");
+}
+
+export function shouldRestartPausedScopeScanContinuation({
+  callFrames = [],
+  frameOrder = [],
+  cursor = null,
+  savedCursorFrameIdentity = "",
+  savedFrameOrderHeadIdentity = ""
+} = {}) {
+  if (!cursor) {
+    return false;
+  }
+
+  // Old/unfingerprinted cursors are left alone for compatibility with
+  // synthetic tests and any in-flight state created by an older helper.
+  if (!savedCursorFrameIdentity && !savedFrameOrderHeadIdentity) {
+    return false;
+  }
+
+  const cursorFrameIndex = Number(cursor.frameIndex ?? -1);
+  const headFrameIndex = Number(frameOrder[0] ?? -1);
+
+  if (
+    !Number.isInteger(cursorFrameIndex) ||
+    cursorFrameIndex < 0 ||
+    cursorFrameIndex >= callFrames.length ||
+    !Number.isInteger(headFrameIndex) ||
+    headFrameIndex < 0 ||
+    headFrameIndex >= callFrames.length
+  ) {
+    return true;
+  }
+
+  const currentCursorFrameIdentity =
+    buildPausedCallFrameIdentity(callFrames[cursorFrameIndex]);
+
+  const currentFrameOrderHeadIdentity =
+    buildPausedCallFrameIdentity(callFrames[headFrameIndex]);
+
+  if (
+    savedCursorFrameIdentity &&
+    currentCursorFrameIdentity !== savedCursorFrameIdentity
+  ) {
+    return true;
+  }
+
+  if (
+    savedFrameOrderHeadIdentity &&
+    currentFrameOrderHeadIdentity !== savedFrameOrderHeadIdentity
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 export async function exposeTetrioGameFromPausedCallFrames(
@@ -15037,11 +15581,134 @@ export async function exposeTetrioGameViaPausedScopeScan(
         .join(",")}`
     );
   }
-  const persistedCursor =
-    closureCaptureState?.pausedScopeScanCursor ?? {
+  if (isKnownNonproductiveSoloPause(callFrames)) {
+    const frameIndex = frameOrder[0] ?? 0;
+
+    // This full-scan attempt was charged before the paused frame set was
+    // available. Refund it because no heavy scope scan is being performed.
+    if (closureCaptureState) {
+      closureCaptureState.fullScanAttemptsInWindow = Math.max(
+        0,
+        Number(closureCaptureState.fullScanAttemptsInWindow ?? 0) - 1
+      );
+
+      clearPausedScopeScanCursor(closureCaptureState);
+      closureCaptureState.scanBudgetExhausted = false;
+    }
+
+    const resumeCursor = {
+      ...createPausedScopeScanCursor(),
+      frameIndex
+    };
+
+    // Keep an identity for the lightweight continuation as well. If _tick
+    // appears on the next Debugger.paused event, the existing stale-cursor
+    // protection will discard this waiting-frame cursor automatically.
+    if (closureCaptureState) {
+      closureCaptureState.pausedScopeScanCursor = {
+        frameIndex: resumeCursor.frameIndex,
+        scopeIndex: resumeCursor.scopeIndex,
+        propertyIndex: resumeCursor.propertyIndex,
+        completedScopeKeys: [],
+        seenCandidateKeys: []
+      };
+
+      closureCaptureState.pausedScopeScanCursorFrameIdentity =
+        buildPausedCallFrameIdentity(callFrames[frameIndex]);
+
+      closureCaptureState.pausedScopeScanFrameOrderHeadIdentity =
+        buildPausedCallFrameIdentity(callFrames[frameOrder[0] ?? 0]);
+    }
+
+    if (typeof log === "function") {
+      const frameSet = callFrames
+        .map((callFrame) =>
+          String(callFrame?.functionName ?? "").trim() || "anonymous"
+        )
+        .join(",");
+
+      log(
+        `[browser] full closure scan skipped nonproductive_pause` +
+          ` frame_set=${frameSet}` +
+          ` full_scan_attempt_refunded=true` +
+          ` paused_budget_used_ms=${Math.max(
+            0,
+            Number(
+              closureCaptureState?.cumulativePausedScanBudgetUsedMs ?? 0
+            )
+          )}`
+      );
+    }
+
+    return {
+      ok: false,
+      reason: "TETR.IO gameplay _tick frame not visible yet",
+      outcome: "continuation_required",
+      continuationReason: "nonproductive_pause",
+      windowBudgetExhausted: false,
+      resumeCursor: formatScanCursor(resumeCursor)
+    };
+  }
+
+  const savedPausedScopeCursor =
+    closureCaptureState?.pausedScopeScanCursor ?? null;
+
+  let persistedCursor =
+    savedPausedScopeCursor ?? {
       ...createPausedScopeScanCursor(),
       frameIndex: frameOrder[0] ?? 0
     };
+
+  const restartStaleContinuation =
+    shouldRestartPausedScopeScanContinuation({
+      callFrames,
+      frameOrder,
+      cursor: savedPausedScopeCursor,
+      savedCursorFrameIdentity:
+        closureCaptureState?.pausedScopeScanCursorFrameIdentity ?? "",
+      savedFrameOrderHeadIdentity:
+        closureCaptureState?.pausedScopeScanFrameOrderHeadIdentity ?? ""
+    });
+
+  if (restartStaleContinuation) {
+    const oldCursorLabel = formatClosureCaptureCursorLabel(
+      savedPausedScopeCursor
+    );
+
+    const oldCursorIdentity =
+      closureCaptureState?.pausedScopeScanCursorFrameIdentity ?? "";
+
+    const oldHeadIdentity =
+      closureCaptureState?.pausedScopeScanFrameOrderHeadIdentity ?? "";
+
+    const freshFrameIndex = frameOrder[0] ?? 0;
+
+    const currentCursorFrameIdentity =
+      buildPausedCallFrameIdentity(
+        callFrames[Number(savedPausedScopeCursor?.frameIndex ?? -1)]
+      );
+
+    const currentHeadIdentity =
+      buildPausedCallFrameIdentity(callFrames[freshFrameIndex]);
+
+    if (typeof log === "function") {
+      log(
+        `[browser] stale paused scan cursor discarded cursor=${oldCursorLabel}` +
+          ` old_frame_identity=${oldCursorIdentity || "-"}` +
+          ` current_frame_identity=${currentCursorFrameIdentity || "-"}` +
+          ` old_head_identity=${oldHeadIdentity || "-"}` +
+          ` current_head_identity=${currentHeadIdentity || "-"}`
+      );
+    }
+
+    clearPausedScopeScanCursor(closureCaptureState);
+
+    persistedCursor = {
+      ...createPausedScopeScanCursor(),
+      frameIndex: freshFrameIndex
+    };
+  }
+
   const completedScopeKeys = new Set(persistedCursor.completedScopeKeys ?? []);
   const seenCandidateKeys = new Set(persistedCursor.seenCandidateKeys ?? []);
   const budgetUsedMs = Math.max(
@@ -15137,6 +15804,21 @@ export async function exposeTetrioGameViaPausedScopeScan(
         completedScopeKeys: Array.from(completedScopeKeys),
         seenCandidateKeys: Array.from(seenCandidateKeys)
       } : null;
+
+      closureCaptureState.pausedScopeScanCursorFrameIdentity =
+        resumeCursor
+          ? buildPausedCallFrameIdentity(
+              callFrames[resumeCursor.frameIndex]
+            )
+          : "";
+
+      closureCaptureState.pausedScopeScanFrameOrderHeadIdentity =
+        resumeCursor
+          ? buildPausedCallFrameIdentity(
+              callFrames[frameOrder[0] ?? 0]
+            )
+          : "";
+
       closureCaptureState.scanBudgetExhausted = windowBudgetExhausted;
     }
     return {

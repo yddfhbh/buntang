@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cold_clear::evaluation::{Evaluator, Standard, StandardReward, StandardValue};
@@ -302,6 +302,23 @@ where
                             };
                             match hard_drop_decision {
                                 HardDropDecision::Proceed => {
+                                    if stop.load(AtomicOrdering::Relaxed) {
+                                        log(format!(
+                                            "[automation] hard_drop_suppressed reason=stop_flag token={}",
+                                            snapshot.token
+                                        ));
+                                        continue;
+                                    }
+
+                                    if should_suppress_hard_drop_for_recent_game_transition(
+                                        config,
+                                        &snapshot,
+                                        &mut log,
+                                    ) {
+                                        thread::sleep(poll_delay);
+                                        continue;
+                                    }
+
                                     if let Err(error) = execute_hard_drop_action(
                                         driver,
                                         &prepared.execution_plan.movement_actions,
@@ -495,6 +512,115 @@ where
             }
         }
     }
+}
+
+const SOLO_GAME_TRANSITION_MARKER_MAX_AGE_MS: u128 = 2_000;
+
+fn browser_snapshot_epoch(token: &str) -> Option<u64> {
+    let remainder = token.strip_prefix("browser-")?;
+    let (epoch, _) = remainder.split_once('-')?;
+    epoch.parse::<u64>().ok()
+}
+
+fn should_suppress_hard_drop_for_recent_game_transition<F>(
+    config: &AutomationConfig,
+    snapshot: &GameSnapshot,
+    log: &mut F,
+) -> bool
+where
+    F: FnMut(String),
+{
+    if snapshot.source == "browser_ws_sim" {
+        return false;
+    }
+
+    let Some(snapshot_epoch) = browser_snapshot_epoch(&snapshot.token) else {
+        return false;
+    };
+
+    let marker_path =
+        config.snapshot_path.with_extension("transition.json");
+
+    let raw = match std::fs::read_to_string(&marker_path) {
+        Ok(raw) => raw,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return false;
+        }
+        Err(error) => {
+            log(format!(
+                "[automation] game_transition_marker_read_failed token={} error={:#}",
+                snapshot.token,
+                error
+            ));
+            return false;
+        }
+    };
+
+    let marker: serde_json::Value =
+        match serde_json::from_str(&raw) {
+            Ok(marker) => marker,
+            Err(error) => {
+                log(format!(
+                    "[automation] game_transition_marker_parse_failed token={} error={:#}",
+                    snapshot.token,
+                    error
+                ));
+                return false;
+            }
+        };
+
+    if marker
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        != Some("playing_to_not_playing")
+    {
+        return false;
+    }
+
+    let Some(marker_epoch) = marker
+        .get("game_epoch")
+        .and_then(serde_json::Value::as_u64)
+    else {
+        return false;
+    };
+
+    if marker_epoch != snapshot_epoch {
+        return false;
+    }
+
+    let Some(timestamp_ms) = marker
+        .get("timestamp_ms")
+        .and_then(serde_json::Value::as_u64)
+        .map(u128::from)
+    else {
+        return false;
+    };
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+
+    if timestamp_ms == 0 || timestamp_ms > now_ms {
+        return false;
+    }
+
+    let age_ms = now_ms - timestamp_ms;
+
+    if age_ms > SOLO_GAME_TRANSITION_MARKER_MAX_AGE_MS {
+        return false;
+    }
+
+    log(format!(
+        "[automation] hard_drop_suppressed_game_transition token={} epoch={} marker_age_ms={}",
+        snapshot.token,
+        snapshot_epoch,
+        age_ms
+    ));
+
+    true
 }
 
 fn maybe_finalize_hard_drop<D, F>(
@@ -4327,6 +4453,104 @@ mod tests {
             .any(|line| line.contains("pre_hard_drop_mismatch")));
 
         let _ = std::fs::remove_dir_all(&snapshot_dir);
+    }
+
+    #[test]
+    fn recent_game_transition_marker_suppresses_matching_epoch() {
+        let snapshot_dir =
+            temp_bridge_dir("transition-marker-match");
+
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+
+        let snapshot_path =
+            snapshot_dir.join("live-snapshot.json");
+
+        let marker_path =
+            snapshot_path.with_extension("transition.json");
+
+        let config = AutomationConfig {
+            snapshot_path: snapshot_path.clone(),
+            ..AutomationConfig::default()
+        };
+
+        let snapshot =
+            runner_test_snapshot("browser-7-3", 3);
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        std::fs::write(
+            &marker_path,
+            format!(
+                "{{\"version\":1,\"reason\":\"playing_to_not_playing\",\"game_epoch\":7,\"timestamp_ms\":{now_ms}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut logs = Vec::new();
+
+        assert!(
+            should_suppress_hard_drop_for_recent_game_transition(
+                &config,
+                &snapshot,
+                &mut |line| logs.push(line),
+            )
+        );
+
+        assert!(logs.iter().any(|line| {
+            line.contains(
+                "hard_drop_suppressed_game_transition"
+            ) && line.contains("epoch=7")
+        }));
+
+        let _ = std::fs::remove_dir_all(snapshot_dir);
+    }
+
+    #[test]
+    fn game_transition_marker_does_not_suppress_other_epoch() {
+        let snapshot_dir =
+            temp_bridge_dir("transition-marker-other-epoch");
+
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+
+        let snapshot_path =
+            snapshot_dir.join("live-snapshot.json");
+
+        let marker_path =
+            snapshot_path.with_extension("transition.json");
+
+        let config = AutomationConfig {
+            snapshot_path: snapshot_path.clone(),
+            ..AutomationConfig::default()
+        };
+
+        let snapshot =
+            runner_test_snapshot("browser-8-3", 3);
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        std::fs::write(
+            &marker_path,
+            format!(
+                "{{\"version\":1,\"reason\":\"playing_to_not_playing\",\"game_epoch\":7,\"timestamp_ms\":{now_ms}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            !should_suppress_hard_drop_for_recent_game_transition(
+                &config,
+                &snapshot,
+                &mut |_| {},
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(snapshot_dir);
     }
 
     #[test]

@@ -18,6 +18,7 @@ import {
   armClosureCaptureWindow,
   advanceGameStartSignalGeneration,
   buildQuickPlayRuntimeReport,
+  buildPausedCallFrameIdentity,
   buildSnapshotSignature,
   buildSnapshotToken,
   captureTetrioGame,
@@ -54,6 +55,11 @@ import {
   hasPendingClosureCaptureArm,
   isBootstrapReadyForClosureCapture,
   isClosureCaptureArmed,
+  isRecentPreTransitionRestartInteraction,
+  isEligibleCarriedPreTransitionRestart,
+  isPendingNextGameInteractionGenerationUnhandled,
+  buildSoloGameTransitionMarkerPayload,
+  isKnownNonproductiveSoloPause,
   isGameplayExpectedForClosureCapture,
   isTransientSnapshotPublishError,
   isZenithGameplayOptions,
@@ -96,7 +102,13 @@ import {
   safeRuntimeEvaluate,
   scheduleClosureCaptureContinuation,
   scheduleNextClosureCaptureAttempt,
+  isCarriedRestartClosureCaptureWindow,
+  isFastNextGameReacquireClosureCaptureWindow,
+  resolveClosureCapturePauseTimeoutMs,
+  resolveClosureCaptureRetryScheduleMs,
+  shouldArmNextGameCheapSignalFallback,
   shouldAttemptClosureCapture,
+  shouldRestartPausedScopeScanContinuation,
   shouldLogClosureCaptureSkipped,
   shouldLogStateReason,
   shouldAdvanceGameEpoch,
@@ -13571,4 +13583,773 @@ test("writeSnapshot preserves non-transient rename failures", () => {
     /missing target/
   );
   rmSync(dir, { recursive: true, force: true });
+});
+
+test("paused scan continuation rejects stale frame identity across pauses", () => {
+  const firstPauseFrames = [
+    {
+      functionName: "anonymous",
+      url: "",
+      location: {
+        scriptId: "10",
+        lineNumber: 100,
+        columnNumber: 0
+      },
+      scopeChain: [
+        { type: "local" },
+        { type: "closure" }
+      ]
+    },
+    {
+      functionName: "t",
+      url: "",
+      location: {
+        scriptId: "20",
+        lineNumber: 200,
+        columnNumber: 0
+      },
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    },
+    {
+      functionName: "sentryWrapped",
+      url: "",
+      location: {
+        scriptId: "30",
+        lineNumber: 300,
+        columnNumber: 0
+      },
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    }
+  ];
+
+  const secondPauseFrames = [
+    {
+      functionName: "anonymous",
+      url: "",
+      location: {
+        scriptId: "10",
+        lineNumber: 100,
+        columnNumber: 0
+      },
+      scopeChain: Array.from({ length: 5 }, () => ({ type: "closure" }))
+    },
+    {
+      functionName: "_tick",
+      url: "",
+      location: {
+        scriptId: "40",
+        lineNumber: 400,
+        columnNumber: 0
+      },
+      scopeChain: Array.from({ length: 7 }, () => ({ type: "closure" }))
+    },
+    {
+      functionName: "sentryWrapped",
+      url: "",
+      location: {
+        scriptId: "30",
+        lineNumber: 300,
+        columnNumber: 0
+      },
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    }
+  ];
+
+  const firstOrder = [0, 1, 2];
+  const secondOrder = [1, 2, 0];
+
+  // Exact failure seen in the live logs:
+  // numeric frame 1 survives, but t became _tick.
+  assert.equal(
+    shouldRestartPausedScopeScanContinuation({
+      callFrames: secondPauseFrames,
+      frameOrder: secondOrder,
+      cursor: {
+        frameIndex: 1,
+        scopeIndex: 5,
+        propertyIndex: 74
+      },
+      savedCursorFrameIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[1]),
+      savedFrameOrderHeadIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[firstOrder[0]])
+    }),
+    true
+  );
+
+  // frame 2 is still sentryWrapped, but a new higher-priority _tick frame
+  // appeared at the head. The old continuation must still be discarded.
+  assert.equal(
+    shouldRestartPausedScopeScanContinuation({
+      callFrames: secondPauseFrames,
+      frameOrder: secondOrder,
+      cursor: {
+        frameIndex: 2,
+        scopeIndex: 3,
+        propertyIndex: 0
+      },
+      savedCursorFrameIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[2]),
+      savedFrameOrderHeadIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[firstOrder[0]])
+    }),
+    true
+  );
+
+  // Stable pause identity remains eligible for continuation.
+  assert.equal(
+    shouldRestartPausedScopeScanContinuation({
+      callFrames: firstPauseFrames,
+      frameOrder: firstOrder,
+      cursor: {
+        frameIndex: 1,
+        scopeIndex: 5,
+        propertyIndex: 74
+      },
+      savedCursorFrameIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[1]),
+      savedFrameOrderHeadIdentity:
+        buildPausedCallFrameIdentity(firstPauseFrames[firstOrder[0]])
+    }),
+    false
+  );
+});
+
+test("known Solo waiting pause is nonproductive but _tick is productive", () => {
+  const waitingFrames = [
+    {
+      functionName: "",
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    },
+    {
+      functionName: "t",
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    },
+    {
+      functionName: "sentryWrapped",
+      scopeChain: Array.from({ length: 6 }, () => ({ type: "closure" }))
+    }
+  ];
+
+  assert.equal(
+    isKnownNonproductiveSoloPause(waitingFrames),
+    true
+  );
+
+  const gameplayFrames = [
+    waitingFrames[0],
+    {
+      functionName: "_tick",
+      scopeChain: Array.from({ length: 7 }, () => ({ type: "closure" }))
+    },
+    waitingFrames[2]
+  ];
+
+  assert.equal(
+    isKnownNonproductiveSoloPause(gameplayFrames),
+    false
+  );
+
+  // Unknown frame layouts retain the old broad-scan fallback.
+  assert.equal(
+    isKnownNonproductiveSoloPause([
+      {
+        functionName: "closureFrame0",
+        scopeChain: [{ type: "closure" }]
+      }
+    ]),
+    false
+  );
+});
+
+test("known nonproductive Solo pause preserves full-scan attempt and paused budget", async () => {
+  const closureCaptureState = createClosureCaptureState();
+
+  const pausedEvent = {
+    callFrames: [
+      {
+        callFrameId: "waiting-frame-0",
+        functionName: "",
+        location: {
+          scriptId: "10",
+          lineNumber: 1,
+          columnNumber: 0
+        },
+        scopeChain: Array.from({ length: 6 }, (_, index) => ({
+          type: index === 0 ? "local" : "closure",
+          object: {
+            objectId: `waiting-0-${index}`
+          }
+        }))
+      },
+      {
+        callFrameId: "waiting-frame-1",
+        functionName: "t",
+        location: {
+          scriptId: "20",
+          lineNumber: 2,
+          columnNumber: 0
+        },
+        scopeChain: Array.from({ length: 6 }, (_, index) => ({
+          type: index === 0 ? "local" : "closure",
+          object: {
+            objectId: `waiting-1-${index}`
+          }
+        }))
+      },
+      {
+        callFrameId: "waiting-frame-2",
+        functionName: "sentryWrapped",
+        location: {
+          scriptId: "30",
+          lineNumber: 3,
+          columnNumber: 0
+        },
+        scopeChain: Array.from({ length: 6 }, (_, index) => ({
+          type: index === 0 ? "local" : "closure",
+          object: {
+            objectId: `waiting-2-${index}`
+          }
+        }))
+      }
+    ]
+  };
+
+  let cdpCalls = 0;
+
+  const cdp = {
+    async send() {
+      cdpCalls += 1;
+      return { result: [] };
+    }
+  };
+
+  const beforeBudget =
+    closureCaptureState.cumulativePausedScanBudgetUsedMs;
+
+  const result = await exposeTetrioGameFromPausedCallFrames(
+    cdp,
+    pausedEvent,
+    {
+      closureCaptureState,
+      log: () => {}
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.outcome, "continuation_required");
+  assert.equal(result.continuationReason, "nonproductive_pause");
+
+  assert.equal(
+    closureCaptureState.fullScanAttemptsInWindow,
+    0
+  );
+
+  assert.equal(
+    closureCaptureState.cumulativePausedScanBudgetUsedMs,
+    beforeBudget
+  );
+
+  assert.equal(
+    closureCaptureState.scanBudgetExhausted,
+    false
+  );
+
+  // No Runtime.getProperties candidate walk should be required for the
+  // known waiting-frame set.
+  assert.equal(cdpCalls, 0);
+});
+
+test("recent pre-transition R is eligible for restart carry", () => {
+  const now = 10_000;
+
+  assert.equal(
+    isRecentPreTransitionRestartInteraction(
+      {
+        generation: 21,
+        type: "keydown",
+        key: "r",
+        interactionKind: "restart_key",
+        timestamp: now - 25
+      },
+      now
+    ),
+    true
+  );
+
+  assert.equal(
+    isRecentPreTransitionRestartInteraction(
+      {
+        generation: 21,
+        type: "keydown",
+        key: "r",
+        interactionKind: "restart_key",
+        timestamp: now - 1001
+      },
+      now
+    ),
+    false
+  );
+
+  assert.equal(
+    isRecentPreTransitionRestartInteraction(
+      {
+        generation: 22,
+        type: "keydown",
+        key: "Enter",
+        interactionKind: "other",
+        timestamp: now - 10
+      },
+      now
+    ),
+    false
+  );
+});
+
+test("post-game baseline carries same-generation active-game R into reacquire", async () => {
+  const postGameInteractionWatchState =
+    createPostGameInteractionWatchState();
+
+  const nextGameReacquireState =
+    createNextGameReacquireState();
+
+  const now = 20_000;
+
+  const baseline = await primePostGameInteractionWatchBaseline(
+    null,
+    postGameInteractionWatchState,
+    {
+      now,
+      nextGameReacquireState,
+      log: () => {},
+      readNextGameInteractionStateFn: async () => ({
+        generation: 39,
+        type: "keydown",
+        key: "r",
+        interactionKind: "restart_key",
+        timestamp: now - 30,
+        targetTag: "BODY",
+        targetId: "",
+        targetClass: ""
+      })
+    }
+  );
+
+  assert.equal(baseline, 39);
+  assert.equal(
+    postGameInteractionWatchState.interactionBaselineGeneration,
+    39
+  );
+
+  // Critical regression:
+  // generation == baseline must still be preserved when that interaction is
+  // the recent R that caused the current game to transition out of playing.
+  assert.equal(
+    postGameInteractionWatchState.pendingGeneration,
+    39
+  );
+  assert.equal(
+    postGameInteractionWatchState.pendingTimestamp,
+    now - 30
+  );
+  assert.equal(
+    postGameInteractionWatchState.pendingKey,
+    "r"
+  );
+
+  const carried = carryPendingPostGameInteractionIntoReacquire(
+    postGameInteractionWatchState,
+    nextGameReacquireState,
+    {
+      log: () => {}
+    }
+  );
+
+  assert.equal(carried, true);
+  assert.equal(
+    nextGameReacquireState.pendingInteractionGeneration,
+    39
+  );
+  assert.equal(
+    nextGameReacquireState.pendingInteractionKind,
+    "restart_key"
+  );
+  assert.equal(
+    nextGameReacquireState.pendingInteractionSource,
+    "post_game"
+  );
+});
+
+test("carried pre-transition R may predate reacquire start", () => {
+  const state = createNextGameReacquireState();
+
+  state.startedAt = 20_000;
+  state.pendingInteractionSource = "post_game";
+  state.pendingInteractionKind = "restart_key";
+  state.pendingInteractionTimestamp = 19_970;
+
+  assert.equal(
+    isEligibleCarriedPreTransitionRestart(state),
+    true
+  );
+});
+
+test("stale guard exception is limited to fresh carried restart_key", () => {
+  const state = createNextGameReacquireState();
+
+  state.startedAt = 20_000;
+  state.pendingInteractionTimestamp = 19_970;
+
+  // Same timing, but ordinary post-game interaction must not get the exception.
+  state.pendingInteractionSource = "post_game";
+  state.pendingInteractionKind = "again_button";
+
+  assert.equal(
+    isEligibleCarriedPreTransitionRestart(state),
+    false
+  );
+
+  // Same R, but too old relative to reacquire start.
+  state.pendingInteractionKind = "restart_key";
+  state.pendingInteractionTimestamp = 18_999;
+
+  assert.equal(
+    isEligibleCarriedPreTransitionRestart(state),
+    false
+  );
+
+  // R from a non-carried source must also retain the normal stale rule.
+  state.pendingInteractionTimestamp = 19_970;
+  state.pendingInteractionSource = "rearm";
+
+  assert.equal(
+    isEligibleCarriedPreTransitionRestart(state),
+    false
+  );
+
+  // An interaction occurring after reacquire start doesn't need this exception.
+  state.pendingInteractionSource = "post_game";
+  state.pendingInteractionTimestamp = 20_010;
+
+  assert.equal(
+    isEligibleCarriedPreTransitionRestart(state),
+    false
+  );
+});
+
+test("pending generation treats validated equal-generation carried R as unhandled", () => {
+  const state = createNextGameReacquireState();
+
+  state.active = true;
+  state.startedAt = 20_000;
+
+  state.interactionBaselineGeneration = 18;
+  state.lastInteractionGenerationHandled = 18;
+
+  state.pendingInteractionGeneration = 18;
+  state.pendingInteractionTimestamp = 19_980;
+  state.pendingInteractionSource = "post_game";
+  state.pendingInteractionKind = "restart_key";
+
+  // Regression:
+  // R itself became the post-game baseline, so pending == handled == baseline.
+  // It is still unhandled because it is the fresh pre-transition restart.
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    true
+  );
+
+  // Ordinary equal-generation interaction remains handled.
+  state.pendingInteractionKind = "again_button";
+
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    false
+  );
+
+  // Wrong source must not reopen equality.
+  state.pendingInteractionKind = "restart_key";
+  state.pendingInteractionSource = "rearm";
+
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    false
+  );
+
+  // Too-old pre-transition R must remain stale.
+  state.pendingInteractionSource = "post_game";
+  state.pendingInteractionTimestamp = 18_999;
+
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    false
+  );
+
+  // Normal newer generation still works exactly as before.
+  state.pendingInteractionTimestamp = 20_010;
+  state.pendingInteractionGeneration = 19;
+  state.pendingInteractionKind = "other";
+  state.pendingInteractionSource = "rearm";
+
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    true
+  );
+
+  // Older-than-handled generation remains rejected.
+  state.pendingInteractionGeneration = 17;
+
+  assert.equal(
+    isPendingNextGameInteractionGenerationUnhandled(state),
+    false
+  );
+});
+
+test("solo game transition marker payload is bound to game epoch", () => {
+  assert.deepEqual(
+    buildSoloGameTransitionMarkerPayload(
+      7,
+      123456
+    ),
+    {
+      version: 1,
+      reason: "playing_to_not_playing",
+      game_epoch: 7,
+      timestamp_ms: 123456
+    }
+  );
+
+  assert.deepEqual(
+    buildSoloGameTransitionMarkerPayload(
+      -1,
+      50
+    ),
+    {
+      version: 1,
+      reason: "playing_to_not_playing",
+      game_epoch: 0,
+      timestamp_ms: 50
+    }
+  );
+});
+
+
+test("carried restart capture uses short timeout and tighter retry schedule", () => {
+  const closureCaptureState = createClosureCaptureState();
+
+  closureCaptureState.armedReason = "next_game_carried_interaction";
+  closureCaptureState.windowInteractionKind = "restart_key";
+
+  assert.equal(
+    isCarriedRestartClosureCaptureWindow(closureCaptureState),
+    true
+  );
+
+  assert.equal(
+    resolveClosureCapturePauseTimeoutMs(closureCaptureState),
+    100
+  );
+
+  assert.deepEqual(
+    Array.from(resolveClosureCaptureRetryScheduleMs(closureCaptureState)),
+    [350, 500, 750, 750]
+  );
+
+  closureCaptureState.windowInteractionKind = "again_button";
+
+  assert.equal(
+    isCarriedRestartClosureCaptureWindow(closureCaptureState),
+    false
+  );
+
+  assert.equal(
+    resolveClosureCapturePauseTimeoutMs(closureCaptureState),
+    900
+  );
+
+  assert.deepEqual(
+    Array.from(resolveClosureCaptureRetryScheduleMs(closureCaptureState)),
+    [750, 1000, 1500, 1500]
+  );
+});
+
+
+test("cheap game signal can recover a missed restart interaction", () => {
+  assert.equal(
+    shouldArmNextGameCheapSignalFallback({
+      qualifiesForArm: true,
+      fallbackEligible: false,
+      reacquireActive: true,
+      waitingForNextGame: true
+    }),
+    true
+  );
+
+  assert.equal(
+    shouldArmNextGameCheapSignalFallback({
+      qualifiesForArm: false,
+      fallbackEligible: false,
+      reacquireActive: true,
+      waitingForNextGame: true
+    }),
+    false
+  );
+
+  assert.equal(
+    shouldArmNextGameCheapSignalFallback({
+      qualifiesForArm: true,
+      fallbackEligible: false,
+      reacquireActive: false,
+      waitingForNextGame: false
+    }),
+    false
+  );
+
+  // ?? object-released fallback? ??? ??.
+  assert.equal(
+    shouldArmNextGameCheapSignalFallback({
+      qualifiesForArm: true,
+      fallbackEligible: true,
+      reacquireActive: false,
+      waitingForNextGame: false
+    }),
+    true
+  );
+
+  const closureCaptureState = createClosureCaptureState();
+  closureCaptureState.armedReason = "next_game_cheap_signal";
+
+  assert.equal(
+    isFastNextGameReacquireClosureCaptureWindow(closureCaptureState),
+    true
+  );
+
+  assert.equal(
+    resolveClosureCapturePauseTimeoutMs(closureCaptureState),
+    100
+  );
+
+  assert.deepEqual(
+    Array.from(resolveClosureCaptureRetryScheduleMs(closureCaptureState)),
+    [350, 500, 750, 750]
+  );
+});
+
+
+test("interaction tracker preserves a restart latch after later Space input", () => {
+  const handlers = new Map();
+  const fakeWindow = {};
+  const fakeDocument = {
+    addEventListener(type, handler) {
+      handlers.set(type, handler);
+    }
+  };
+
+  const expression = nextGameInteractionTrackerExpression();
+  const install = new Function(
+    "window",
+    "document",
+    `return ${expression};`
+  );
+
+  const originalDateNow = Date.now;
+  let now = 10000;
+
+  try {
+    Date.now = () => now;
+
+    install(fakeWindow, fakeDocument);
+
+    const keydown = handlers.get("keydown");
+    assert.equal(typeof keydown, "function");
+
+    keydown({
+      type: "keydown",
+      key: "r",
+      repeat: false,
+      target: {
+        tagName: "BODY",
+        id: "",
+        className: ""
+      }
+    });
+
+    assert.equal(
+      fakeWindow.__fusionNextGameInteraction.restartTimestamp,
+      10000
+    );
+
+    // ??? ???? generic latest state? ??? Space? ??? ?.
+    now = 20000;
+
+    keydown({
+      type: "keydown",
+      key: " ",
+      repeat: false,
+      target: {
+        tagName: "BODY",
+        id: "",
+        className: ""
+      }
+    });
+
+    assert.equal(
+      fakeWindow.__fusionNextGameInteraction.key,
+      " "
+    );
+
+    // latest? Space?? R latch? ????? ?.
+    assert.equal(
+      fakeWindow.__fusionNextGameInteraction.restartTimestamp,
+      10000
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
+test("post-game baseline carries latched R when Space is the latest interaction", async () => {
+  const postGameInteractionWatchState =
+    createPostGameInteractionWatchState();
+
+  const nextGameReacquireState =
+    createNextGameReacquireState();
+
+  const now = 50000;
+
+  await primePostGameInteractionWatchBaseline(
+    null,
+    postGameInteractionWatchState,
+    {
+      now,
+      nextGameReacquireState,
+      log: () => {},
+      readNextGameInteractionStateFn: async () => ({
+        generation: 42,
+        type: "keydown",
+        key: " ",
+        interactionKind: "other",
+        timestamp: now - 5,
+        restartTimestamp: now - 20,
+        targetTag: "BODY",
+        targetId: "",
+        targetClass: ""
+      })
+    }
+  );
+
+  assert.equal(
+    postGameInteractionWatchState.pendingGeneration,
+    42
+  );
+
+  assert.equal(
+    postGameInteractionWatchState.pendingKey,
+    "r"
+  );
+
+  assert.equal(
+    postGameInteractionWatchState.pendingTimestamp,
+    now - 20
+  );
 });
